@@ -1,0 +1,6 @@
+{
+  "name": "iq-tables",
+  "version": "0.1.0",
+  "description": "IQ Tables: browse, draft and inscribe databases on IQ Labs tables",
+  "entry": "index.html"
+}

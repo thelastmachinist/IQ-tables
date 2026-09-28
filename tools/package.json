@@ -1,0 +1,16 @@
+{
+  "name": "iq-tables-devtools",
+  "private": true,
+  "description": "Reference fixtures and end-to-end tests. Not part of the app, which has no dependencies.",
+  "scripts": {
+    "fixtures": "node fixtures.cjs fixtures.json",
+    "e2e": "node e2e.cjs",
+    "qr": "node qrcheck.cjs"
+  },
+  "devDependencies": {
+    "@iqlabs-official/solana-sdk": "0.2.0",
+    "@solana/web3.js": "^1.99.0",
+    "jsqr": "1.4.0",
+    "playwright-core": "1.56.1"
+  }
+}

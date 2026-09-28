@@ -1,0 +1,19 @@
+[package]
+name = "iq_tables"
+version = "0.1.0"
+edition = "2021"
+description = "IQ Tables: a zero-dependency Rust/WebAssembly portal for IQ Labs on-chain tables"
+license = "MIT"
+
+# No dependencies on purpose: crypto, Solana transaction encoding, the IQ program
+# instructions, compression and the UI are all implemented in this crate.
+[dependencies]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
