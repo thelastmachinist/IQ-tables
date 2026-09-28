@@ -30,7 +30,16 @@ iqgit pages deploy
 
 `iqgit pages deploy` prints the live link (`browser.iqlabs.dev/<commit-table-address>`). Uploading the 790 KB page costs roughly 0.006 SOL. To give it a stable name, point a `.sol` domain at it (the CLI prints the steps). A dedicated domain also gives the portal its own browser origin, which matters because every IQ Pages site otherwise shares `browser.iqlabs.dev` — including its browser storage.
 
-To try it locally instead: `cd site && python3 -m http.server 8000` and open `http://localhost:8000` (wallet extensions don't run on `file://` pages).
+## Run it locally (PyCharm or any terminal)
+
+`run.py` (Python standard library only) serves the app at `http://localhost:8000` and opens your browser. If you've changed the Rust or web sources and Rust is installed, it rebuilds first. In PyCharm: right-click `run.py` → **Run 'run'**. Stop it with the red square.
+
+```bash
+python run.py              # rebuild if needed, then serve
+python run.py --no-build   # serve the committed build as is
+```
+
+Use `http://localhost`, not a `file://` path: wallet extensions like Phantom don't run on `file://` pages.
 
 ## Build
 
