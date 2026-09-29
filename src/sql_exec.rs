@@ -211,7 +211,9 @@ impl App {
                 );
                 one(Out::Rows { title, cols, rows: rows.into_iter().take(SHOW_MAX).collect(), note })
             }
-            Stmt::Insert { table, cols, src, ignore, replace, on_dup } => self.insert(key, &table, cols, src, ignore, replace, on_dup).map(|m| vec![Out::Msg(true, m)]),
+            Stmt::Insert { table, cols, src, ignore, replace, on_dup } => {
+                self.insert(key, &table, cols, src, ignore, replace, on_dup).map(|m| vec![Out::Msg(true, m)])
+            }
             Stmt::Update { from, sets, filter, order, limit } => self.update(key, from, sets, filter, order, limit).map(|m| vec![Out::Msg(true, m)]),
             Stmt::Delete { targets, from, filter, order, limit } => self.delete(key, targets, from, filter, order, limit).map(|m| vec![Out::Msg(true, m)]),
             Stmt::Explain(inner) => self.explain(key, *inner),
@@ -247,7 +249,10 @@ impl App {
                 for t in 0..n {
                     self.edit_tb(key, t, |tb, _| sheet::discard(tb));
                 }
-                one(Out::Msg(true, "Unsaved row changes discarded (Undo in the sheet brings them back). Structure changes stay — undo them with ALTER TABLE.".into()))
+                one(Out::Msg(
+                    true,
+                    "Unsaved row changes discarded (Undo in the sheet brings them back). Structure changes stay — undo them with ALTER TABLE.".into(),
+                ))
             }
             Stmt::Noop(m) => one(Out::Msg(true, m)),
             Stmt::Unsupported(m) => Err(m),
@@ -258,12 +263,23 @@ impl App {
     // ------------------------------------------------------------ INSERT
 
     #[allow(clippy::too_many_arguments)]
-    fn insert(&mut self, key: &str, table: &str, cols: Option<Vec<String>>, src: InsertSrc, ignore: bool, replace: bool, on_dup: Vec<(String, Expr)>) -> Result<String, String> {
+    fn insert(
+        &mut self,
+        key: &str,
+        table: &str,
+        cols: Option<Vec<String>>,
+        src: InsertSrc,
+        ignore: bool,
+        replace: bool,
+        on_dup: Vec<(String, Expr)>,
+    ) -> Result<String, String> {
         let t = self.tbl_writable(key, table)?;
         let tb = self.drafts[self.draft_idx(key).unwrap()].tables[t].clone();
         let n = tb.columns.len();
         let map: Vec<usize> = match (&cols, &src) {
-            (_, InsertSrc::Set(pairs)) => pairs.iter().map(|(c, _)| tb.col(c).ok_or_else(|| format!("Unknown column `{}` in {}", c, tb.title))).collect::<Result<_, _>>()?,
+            (_, InsertSrc::Set(pairs)) => {
+                pairs.iter().map(|(c, _)| tb.col(c).ok_or_else(|| format!("Unknown column `{}` in {}", c, tb.title))).collect::<Result<_, _>>()?
+            }
             (Some(cs), _) => cs.iter().map(|c| tb.col(c).ok_or_else(|| format!("Unknown column `{}` in {}", c, tb.title))).collect::<Result<_, _>>()?,
             (None, _) => (0..n).collect(),
         };
@@ -279,7 +295,12 @@ impl App {
                         continue;
                     }
                     if r.len() != map.len() {
-                        return Err(format!("{} value(s) for {} column(s){}", r.len(), map.len(), if cols.is_none() { format!(" ({} has: {})", tb.title, tb.columns.join(", ")) } else { String::new() }));
+                        return Err(format!(
+                            "{} value(s) for {} column(s){}",
+                            r.len(),
+                            map.len(),
+                            if cols.is_none() { format!(" ({} has: {})", tb.title, tb.columns.join(", ")) } else { String::new() }
+                        ));
                     }
                     let mut v = vec![];
                     for e in r {
@@ -306,7 +327,11 @@ impl App {
             }
         }
         let rows = self.sheet_rows(key, t);
-        let by_id: HashMap<String, SRow> = rows.iter().filter(|r| r.state != RowState::Deleted).map(|r| (r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default(), r.clone())).collect();
+        let by_id: HashMap<String, SRow> = rows
+            .iter()
+            .filter(|r| r.state != RowState::Deleted)
+            .map(|r| (r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default(), r.clone()))
+            .collect();
         let mut changes = vec![];
         let (mut skipped, mut dup_updates, mut replaced) = (0, 0, 0);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -330,7 +355,11 @@ impl App {
                     let mut set = vec![false; n];
                     for (c, e) in &on_dup {
                         let ci = tb.col(c).ok_or_else(|| format!("Unknown column `{}`", c))?;
-                        let v = if matches!(e, Expr::Default) { crate::constraints::default_value(&tb.meta[ci].ty, &tb.meta[ci].default)? } else { eng.eval_row(&cols, &nv, e)? };
+                        let v = if matches!(e, Expr::Default) {
+                            crate::constraints::default_value(&tb.meta[ci].ty, &tb.meta[ci].default)?
+                        } else {
+                            eng.eval_row(&cols, &nv, e)?
+                        };
                         nv[ci] = v;
                         set[ci] = true;
                     }
@@ -357,16 +386,17 @@ impl App {
                     skipped += 1;
                     continue;
                 }
-                return Err(format!("A row with {} = '{}' already exists — use UPDATE, REPLACE or INSERT … ON DUPLICATE KEY UPDATE", tb.columns[tb.id_col], id));
+                return Err(format!(
+                    "A row with {} = '{}' already exists — use UPDATE, REPLACE or INSERT … ON DUPLICATE KEY UPDATE",
+                    tb.columns[tb.id_col], id
+                ));
             }
-            if !id.is_empty() {
-                if !seen.insert(id.clone()) {
-                    if ignore {
-                        skipped += 1;
-                        continue;
-                    }
-                    return Err(format!("The value '{}' for {} appears twice in this INSERT", id, tb.columns[tb.id_col]));
+            if !id.is_empty() && !seen.insert(id.clone()) {
+                if ignore {
+                    skipped += 1;
+                    continue;
                 }
+                return Err(format!("The value '{}' for {} appears twice in this INSERT", id, tb.columns[tb.id_col]));
             }
             changes.push(Change::Insert { vals, given });
         }
@@ -417,14 +447,26 @@ impl App {
     // ------------------------------------------------------------ UPDATE
 
     #[allow(clippy::type_complexity)]
-    fn target_rows(&mut self, key: &str, targets: &[String], from: &From, filter: Option<&Expr>, order: &[Order], limit: Option<&Expr>) -> Result<(Rel, Vec<usize>, HashMap<String, (usize, usize)>), String> {
+    fn target_rows(
+        &mut self,
+        key: &str,
+        targets: &[String],
+        from: &From,
+        filter: Option<&Expr>,
+        order: &[Order],
+        limit: Option<&Expr>,
+    ) -> Result<(Rel, Vec<usize>, HashMap<String, (usize, usize)>), String> {
         let mut aliases: Vec<(String, String)> = vec![];
         collect_aliases(from, &mut aliases);
         let snap = self.snapshot(key);
         let eng = self.engine_for(key, &snap);
         let mut tmap: HashMap<String, (usize, usize)> = HashMap::new();
         for tname in targets {
-            let (alias, real) = aliases.iter().find(|(a, r)| a.eq_ignore_ascii_case(tname) || r.eq_ignore_ascii_case(tname)).cloned().ok_or_else(|| format!("`{}` isn't in the FROM list", tname))?;
+            let (alias, real) = aliases
+                .iter()
+                .find(|(a, r)| a.eq_ignore_ascii_case(tname) || r.eq_ignore_ascii_case(tname))
+                .cloned()
+                .ok_or_else(|| format!("`{}` isn't in the FROM list", tname))?;
             if snap.views.contains_key(&real.to_lowercase()) {
                 return Err(format!("{} is a view — change the table it reads from instead", real));
             }
@@ -434,7 +476,11 @@ impl App {
         }
         let rel = eng.from(from, None)?;
         for (alias, v) in tmap.iter_mut() {
-            v.1 = rel.cols.iter().position(|c| c.name == engine::RID && c.table.as_deref().map(|x| x.eq_ignore_ascii_case(alias)).unwrap_or(false)).ok_or("internal: row id missing")?;
+            v.1 = rel
+                .cols
+                .iter()
+                .position(|c| c.name == engine::RID && c.table.as_deref().map(|x| x.eq_ignore_ascii_case(alias)).unwrap_or(false))
+                .ok_or("internal: row id missing")?;
         }
         let mut hit: Vec<usize> = vec![];
         for (i, row) in rel.rows.iter().enumerate() {
@@ -467,7 +513,15 @@ impl App {
         Ok((rel, hit, tmap))
     }
 
-    fn update(&mut self, key: &str, from: From, sets: Vec<(Option<String>, String, Expr)>, filter: Option<Expr>, order: Vec<Order>, limit: Option<Expr>) -> Result<String, String> {
+    fn update(
+        &mut self,
+        key: &str,
+        from: From,
+        sets: Vec<(Option<String>, String, Expr)>,
+        filter: Option<Expr>,
+        order: Vec<Order>,
+        limit: Option<Expr>,
+    ) -> Result<String, String> {
         let mut aliases: Vec<(String, String)> = vec![];
         collect_aliases(&from, &mut aliases);
         for (_, real) in &aliases {
@@ -480,7 +534,11 @@ impl App {
         let mut plan: Vec<(String, usize, Expr)> = vec![]; // (alias, column index, expr)
         for (q, c, e) in &sets {
             let alias = match q {
-                Some(q) => aliases.iter().find(|(a, _)| a.eq_ignore_ascii_case(q)).map(|x| x.0.clone()).ok_or_else(|| format!("`{}` isn't in the UPDATE's table list", q))?,
+                Some(q) => aliases
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(q))
+                    .map(|x| x.0.clone())
+                    .ok_or_else(|| format!("`{}` isn't in the UPDATE's table list", q))?,
                 None => {
                     let mut owners = vec![];
                     for (a, real) in &aliases {
@@ -533,11 +591,17 @@ impl App {
                 let mut scope_row = row.clone();
                 for (a, ci, e) in plan.iter().filter(|p| &p.0 == alias) {
                     let sc = sql::Scope::row(&rel.cols, &scope_row, None);
-                    let v = if matches!(e, Expr::Default) { crate::constraints::default_value(&tb.meta[*ci].ty, &tb.meta[*ci].default)? } else { eng.eval(e, &sc)? };
+                    let v = if matches!(e, Expr::Default) {
+                        crate::constraints::default_value(&tb.meta[*ci].ty, &tb.meta[*ci].default)?
+                    } else {
+                        eng.eval(e, &sc)?
+                    };
                     vals[*ci] = v.clone();
                     set[*ci] = true;
                     if single {
-                        if let Some(p) = rel.cols.iter().position(|c| c.table.as_deref().map(|x| x.eq_ignore_ascii_case(a)).unwrap_or(false) && c.name.eq_ignore_ascii_case(&tb.columns[*ci])) {
+                        if let Some(p) = rel.cols.iter().position(|c| {
+                            c.table.as_deref().map(|x| x.eq_ignore_ascii_case(a)).unwrap_or(false) && c.name.eq_ignore_ascii_case(&tb.columns[*ci])
+                        }) {
                             scope_row[p] = v;
                         }
                     }
@@ -616,7 +680,13 @@ impl App {
         for (i, t) in tables.iter().enumerate() {
             let n = sql::Catalog::table(&snap, t).map(|r| r.rows.len()).unwrap_or(0);
             let kind = if snap.views.contains_key(&t.to_lowercase()) { "view" } else { "table" };
-            rows.push(vec![json::n(i + 1), json::s(t), json::s(kind), json::n(n), json::s(if i == 0 { "reads every row (they're all in memory)" } else { "joined with a hash lookup on = conditions, else row by row" })]);
+            rows.push(vec![
+                json::n(i + 1),
+                json::s(t),
+                json::s(kind),
+                json::n(n),
+                json::s(if i == 0 { "reads every row (they're all in memory)" } else { "joined with a hash lookup on = conditions, else row by row" }),
+            ]);
         }
         Ok(vec![Out::Rows {
             title: "plan".into(),

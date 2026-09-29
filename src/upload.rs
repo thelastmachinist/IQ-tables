@@ -97,6 +97,8 @@ pub struct Batch {
     pub started: f64,
     /// Signature of one landed part (reported as the step's signature).
     pub last_sig: Option<String>,
+    /// Tells this batch's replies from those of an earlier one with the same key.
+    pub gen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -140,12 +142,18 @@ impl Batch {
             resent: 0,
             started: host::now_ms(),
             last_sig: None,
+            gen: 0,
         }
     }
 
     /// Parts this batch sends.
     pub fn total(&self) -> usize {
         self.chunks.len() - self.from
+    }
+
+    /// Stopped, with nothing in flight: safe to drop.
+    pub fn idle(&self) -> bool {
+        self.stop && self.halted && self.in_flight == 0
     }
 
     pub fn same_upload(&self, seq: u64, chunks: &[String]) -> bool {
@@ -179,7 +187,8 @@ fn rate_limited(status: u32, text: &str) -> bool {
 }
 
 impl App {
-    pub fn up_begin(&mut self, key: &str, b: Batch) {
+    pub fn up_begin(&mut self, key: &str, mut b: Batch) {
+        b.gen = self.nid();
         self.uploads.insert(key.to_string(), b);
         self.up_pump(key);
     }
@@ -208,8 +217,10 @@ impl App {
         let mut want_hash = false;
         let mut want_poll = false;
         let mut want_timer: Option<u32> = None;
+        let tag: String;
         {
             let Some(b) = self.uploads.get_mut(key) else { return };
+            tag = format!("{}@{}", key, b.gen);
             if stopping {
                 b.stop = true;
             }
@@ -269,18 +280,22 @@ impl App {
         }
         if want_hash {
             let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
-            self.rpc("getLatestBlockhash", params, P::Up(key.to_string(), UpOp::Hash));
+            self.rpc("getLatestBlockhash", params, P::Up(tag.clone(), UpOp::Hash));
         }
         for (k, sig, raw) in sends {
-            let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"skipPreflight\":true,\"preflightCommitment\":\"confirmed\",\"maxRetries\":3}}]", raw)).unwrap();
+            let params = json::parse(&format!(
+                "[\"{}\",{{\"encoding\":\"base64\",\"skipPreflight\":true,\"preflightCommitment\":\"confirmed\",\"maxRetries\":3}}]",
+                raw
+            ))
+            .unwrap();
             let _ = sig;
-            self.rpc("sendTransaction", params, P::Up(key.to_string(), UpOp::Sent(k)));
+            self.rpc("sendTransaction", params, P::Up(tag.clone(), UpOp::Sent(k)));
         }
         if want_poll {
-            self.timer(700, P::Up(key.to_string(), UpOp::Tick));
+            self.timer(700, P::Up(tag.clone(), UpOp::Tick));
         }
         if let Some(ms) = want_timer {
-            self.timer(ms, P::Up(format!("{}#pump", key), UpOp::Tick));
+            self.timer(ms, P::Up(format!("{}#pump", tag), UpOp::Tick));
         }
         self.up_report(key);
     }
@@ -330,17 +345,22 @@ impl App {
         }
     }
 
-    pub fn up_async(&mut self, key: String, op: UpOp, ok: bool, status: u32, data: Vec<u8>) -> bool {
-        if let Some(k) = key.strip_suffix("#pump") {
-            if let Some(b) = self.uploads.get_mut(k) {
+    pub fn up_async(&mut self, tag: String, op: UpOp, ok: bool, status: u32, data: Vec<u8>) -> bool {
+        let (tag, pump) = match tag.strip_suffix("#pump") {
+            Some(t) => (t.to_string(), true),
+            None => (tag, false),
+        };
+        // a reply for a batch that has since finished or been replaced is ignored
+        let Some((key, gen)) = tag.split_once('@').and_then(|(k, g)| Some((k.to_string(), g.parse::<u32>().ok()?))) else { return false };
+        if self.uploads.get(&key).map(|b| b.gen) != Some(gen) {
+            return false;
+        }
+        if pump {
+            if let Some(b) = self.uploads.get_mut(&key) {
                 b.timer = false;
             }
-            let k = k.to_string();
-            self.up_pump(&k);
+            self.up_pump(&key);
             return true;
-        }
-        if !self.uploads.contains_key(&key) {
-            return false;
         }
         let text = String::from_utf8_lossy(&data).into_owned();
         let http_ok = ok && (200..300).contains(&status);
@@ -368,7 +388,7 @@ impl App {
                         let wait = 1000 * b.bh_errors;
                         if !b.timer {
                             b.timer = true;
-                            self.timer(wait, P::Up(format!("{}#pump", key), UpOp::Tick));
+                            self.timer(wait, P::Up(format!("{}#pump", tag), UpOp::Tick));
                         }
                         return true;
                     }
@@ -432,7 +452,7 @@ impl App {
                     b.polling = false;
                 } else {
                     let params = Json::Arr(vec![Json::Arr(sigs), json::obj(vec![("searchTransactionHistory", Json::Bool(false))])]);
-                    self.rpc("getSignatureStatuses", params, P::Up(key.clone(), UpOp::Status(idx)));
+                    self.rpc("getSignatureStatuses", params, P::Up(tag.clone(), UpOp::Status(idx)));
                     return false;
                 }
             }
@@ -456,7 +476,14 @@ impl App {
                                 b.last_sig = Some(sig);
                             } else if st.is_null() && now - at > RESEND_AFTER_MS {
                                 if tries + 1 >= MAX_TRIES {
-                                    self.up_fail(&key, format!("Part {} never landed after {} tries — the RPC may be dropping transactions. Try a different RPC in Settings.", k + 1, MAX_TRIES));
+                                    self.up_fail(
+                                        &key,
+                                        format!(
+                                            "Part {} never landed after {} tries — the RPC may be dropping transactions. Try a different RPC in Settings.",
+                                            k + 1,
+                                            MAX_TRIES
+                                        ),
+                                    );
                                     return true;
                                 }
                                 b.resent += 1;
@@ -475,7 +502,7 @@ impl App {
                 }
                 if !b.done() && b.parts.iter().any(|p| matches!(p, Part::Sent { .. })) {
                     b.polling = true;
-                    self.timer(1000, P::Up(key.clone(), UpOp::Tick));
+                    self.timer(1000, P::Up(tag.clone(), UpOp::Tick));
                 }
             }
         }

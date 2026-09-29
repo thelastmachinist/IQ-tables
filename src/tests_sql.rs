@@ -39,7 +39,9 @@ fn rows(app: &mut App, q: &str) -> Vec<Vec<String>> {
     let out = run(app, q);
     for o in out.iter().rev() {
         match o {
-            Out::Rows { rows, .. } => return rows.iter().map(|r| r.iter().map(|v| if v.is_null() { "NULL".to_string() } else { v.cell_text() }).collect()).collect(),
+            Out::Rows { rows, .. } => {
+                return rows.iter().map(|r| r.iter().map(|v| if v.is_null() { "NULL".to_string() } else { v.cell_text() }).collect()).collect()
+            }
             Out::Msg(false, m) => panic!("{} → {}", q, m),
             _ => {}
         }
@@ -125,10 +127,14 @@ fn select_joins_groups_and_subqueries() {
     assert_eq!(r[0], vec!["B-1", "Brazos Bolt"]);
     let r = rows(&mut a, "SELECT p.sku, s.name FROM parts p LEFT JOIN suppliers s ON s.id = p.supplier_id WHERE s.id IS NULL");
     assert_eq!(r, vec![vec!["W-1", "NULL"]]);
-    let r = rows(&mut a, "SELECT s.name, COUNT(p.sku) AS n FROM parts p RIGHT JOIN suppliers s ON s.id = p.supplier_id GROUP BY s.name ORDER BY n DESC, s.name");
+    let r =
+        rows(&mut a, "SELECT s.name, COUNT(p.sku) AS n FROM parts p RIGHT JOIN suppliers s ON s.id = p.supplier_id GROUP BY s.name ORDER BY n DESC, s.name");
     assert_eq!(r, vec![vec!["Brazos Bolt", "2"], vec!["Lone Star", "2"], vec!["Gulf Coast", "0"]]);
     // GROUP BY / HAVING / aggregates
-    let r = rows(&mut a, "SELECT kind, COUNT(*) n, SUM(qty) total, ROUND(AVG(price), 3) avgp, MIN(added), MAX(name) FROM parts GROUP BY kind HAVING total > 50 ORDER BY 3 DESC");
+    let r = rows(
+        &mut a,
+        "SELECT kind, COUNT(*) n, SUM(qty) total, ROUND(AVG(price), 3) avgp, MIN(added), MAX(name) FROM parts GROUP BY kind HAVING total > 50 ORDER BY 3 DESC",
+    );
     assert_eq!(r, vec![vec!["nut", "2", "315", "0.19", "2026-01-20", "Wing nut"], vec!["bolt", "2", "160", "0.325", "2026-01-05", "Hex bolt"]]);
     assert_eq!(one(&mut a, "SELECT GROUP_CONCAT(sku ORDER BY sku DESC SEPARATOR '/') FROM parts WHERE kind = 'nut'"), "N-2/N-1");
     assert_eq!(one(&mut a, "SELECT COUNT(DISTINCT kind) FROM parts"), "3");
@@ -156,7 +162,10 @@ fn select_joins_groups_and_subqueries() {
     assert_eq!(r.last().unwrap(), &vec!["NULL".to_string(), "475".to_string()]);
     // DISTINCT, LIMIT/OFFSET, CASE, IN list, BETWEEN, LIKE, REGEXP
     assert_eq!(col(&mut a, "SELECT DISTINCT kind FROM parts ORDER BY kind LIMIT 1, 2"), vec!["nut", "washer"]);
-    assert_eq!(col(&mut a, "SELECT CASE WHEN qty = 0 THEN 'out' WHEN qty < 50 THEN 'low' ELSE 'ok' END FROM parts ORDER BY sku"), vec!["ok", "low", "ok", "low", "out"]);
+    assert_eq!(
+        col(&mut a, "SELECT CASE WHEN qty = 0 THEN 'out' WHEN qty < 50 THEN 'low' ELSE 'ok' END FROM parts ORDER BY sku"),
+        vec!["ok", "low", "ok", "low", "out"]
+    );
     assert_eq!(col(&mut a, "SELECT sku FROM parts WHERE name REGEXP '^(hex|lock) ' ORDER BY sku"), vec!["B-1", "N-1"]);
     assert_eq!(col(&mut a, "SELECT sku FROM parts WHERE added BETWEEN '2026-02-01' AND '2026-03-10' ORDER BY sku"), vec!["B-2", "W-1"]);
     assert!(err(&mut a, "SELECT name FROM parts p JOIN suppliers s ON s.id = p.supplier_id").contains("ambiguous"));
@@ -279,9 +288,13 @@ fn alter_table() {
     ok(&mut a, "ALTER TABLE parts DROP COLUMN notes, COMMENT = 'Fasteners we stock', RENAME TO stock");
     assert!(err(&mut a, "SELECT * FROM parts").contains("No table"));
     assert_eq!(one(&mut a, "SELECT COUNT(*) FROM stock"), "5");
-    assert!(one(&mut a, "SHOW CREATE TABLE stock").is_empty() == false);
+    assert!(!one(&mut a, "SHOW CREATE TABLE stock").is_empty());
     let ddl = rows(&mut a, "SHOW CREATE TABLE stock")[0][1].clone();
-    assert!(ddl.contains("PRIMARY KEY (`title`)") && ddl.contains("COMMENT='Fasteners we stock'") && ddl.contains("CONSTRAINT `fk_sup` FOREIGN KEY"), "{}", ddl);
+    assert!(
+        ddl.contains("PRIMARY KEY (`title`)") && ddl.contains("COMMENT='Fasteners we stock'") && ddl.contains("CONSTRAINT `fk_sup` FOREIGN KEY"),
+        "{}",
+        ddl
+    );
     ok(&mut a, "ALTER TABLE suppliers AUTO_INCREMENT = 100; INSERT INTO suppliers (name) VALUES ('Permian')");
     assert_eq!(one(&mut a, "SELECT id FROM suppliers WHERE name = 'Permian'"), "100");
     // CHECK constraints follow renames and are verified when added
@@ -326,7 +339,7 @@ fn views_truncate_drop_grant() {
     // privileges
     let w = crate::solana::b58(&crate::solana::Keypair::from_seed([7; 32]).pubkey);
     ok(&mut a, &format!("GRANT INSERT, UPDATE ON suppliers TO '{}'@'%'", w));
-    assert!(one(&mut a, "SHOW GRANTS FOR suppliers").is_empty() == false);
+    assert!(!one(&mut a, "SHOW GRANTS FOR suppliers").is_empty());
     let tb = a.drafts[0].tables.iter().find(|t| t.title == "suppliers").unwrap().clone();
     assert_eq!(tb.writers, vec![w.clone()]);
     ok(&mut a, "GRANT INSERT ON suppliers TO PUBLIC");
@@ -388,15 +401,39 @@ fn structure_records_on_chain() {
         time: None,
         schema: Schema { cols: vec!["id".into()], id: 0 },
         recs: vec![],
-        meta: Some(Doc { cols: cols.into_iter().map(|(n, m)| (n.to_string(), m)).collect(), pk: pk.into(), keys: Default::default(), clear, dropped: false, snap: vec![], crowd: None }.to_json()),
+        meta: Some(
+            Doc {
+                cols: cols.into_iter().map(|(n, m)| (n.to_string(), m)).collect(),
+                pk: pk.into(),
+                keys: Default::default(),
+                clear,
+                dropped: false,
+                snap: vec![],
+                crowd: None,
+            }
+            .to_json(),
+        ),
     };
     let p1 = data("t1", &["id", "sku", "qty"], 0, vec![vec!["1", "A", "5"], vec!["2", "B", "7"]]);
-    let d1 = doc(vec![("id", ColMeta::plain("id")), ("sku", ColMeta::plain("sku")), ("count", ColMeta::typed("qty", Ty::Int(crate::schema::IntKind::Int, false))), ("bin", ColMeta { fill: Json::Str("A1".into()), ..ColMeta::plain("bin") })], "id", false);
+    let d1 = doc(
+        vec![
+            ("id", ColMeta::plain("id")),
+            ("sku", ColMeta::plain("sku")),
+            ("count", ColMeta::typed("qty", Ty::Int(crate::schema::IntKind::Int, false))),
+            ("bin", ColMeta { fill: Json::Str("A1".into()), ..ColMeta::plain("bin") }),
+        ],
+        "id",
+        false,
+    );
     let (m, d) = pack::merge_events(&[p1.clone(), d1.clone()], &|s| s == "OWNER", &|_| true);
     let d = d.unwrap();
     let metas: Vec<ColMeta> = d.cols.iter().map(|c| c.1.clone()).collect();
     let v = crate::schema::align(&metas, &m[0].vals);
-    assert_eq!(v, vec![Json::Str("1".into()), Json::Str("A".into()), Json::Num("5".into()), Json::Str("A1".into())], "renamed column keeps its values; the new one reads its fill");
+    assert_eq!(
+        v,
+        vec![Json::Str("1".into()), Json::Str("A".into()), Json::Num("5".into()), Json::Str("A1".into())],
+        "renamed column keeps its values; the new one reads its fill"
+    );
     // re-key by sku, then a record keyed by sku updates the right row
     let d2 = doc(vec![("id", ColMeta::plain("id")), ("sku", ColMeta::plain("sku"))], "sku", false);
     let p2 = data("t2", &["id", "sku", "qty"], 1, vec![vec!["2", "B", "70"]]);
@@ -458,9 +495,19 @@ fn sheet_and_sql_share_rules() {
     let r = rows.iter().find(|r| r.vals[0].cell_text() == "B-1").unwrap().clone();
     let mut v = r.vals.clone();
     v[2] = Json::Str("many".into());
-    let e = a.apply_changes("k", t, vec![crate::constraints::Change::Update { row: r.clone(), vals: v, set: vec![true; 7] }], &crate::constraints::Opts { strict: false, fk_checks: true });
+    let e = a.apply_changes(
+        "k",
+        t,
+        vec![crate::constraints::Change::Update { row: r.clone(), vals: v, set: vec![true; 7] }],
+        &crate::constraints::Opts { strict: false, fk_checks: true },
+    );
     assert!(e.unwrap_err().contains("whole number"));
-    let e = a.apply_changes("k", t, vec![crate::constraints::Change::Insert { vals: vec![Json::Str("Q-1".into())], given: vec![true] }], &crate::constraints::Opts { strict: false, fk_checks: true });
+    let e = a.apply_changes(
+        "k",
+        t,
+        vec![crate::constraints::Change::Insert { vals: vec![Json::Str("Q-1".into())], given: vec![true] }],
+        &crate::constraints::Opts { strict: false, fk_checks: true },
+    );
     assert!(e.is_ok(), "a half-filled row is fine in the sheet");
     assert!(a.row_problems("k", t).iter().any(|p| p.contains("name can't be empty")));
 }
@@ -495,7 +542,8 @@ fn checkpoints_and_chunked_writes() {
     use crate::schema::{ColMeta, Doc};
     let schema = Schema { cols: vec!["id".into(), "v".into()], id: 0 };
     let data = |id: &str, signer: &str, vals: Vec<(&str, &str)>, dels: Vec<&str>| {
-        let mut recs: Vec<Record> = vals.iter().map(|(k, v)| Record { vals: vec![Json::Str(k.to_string()), Json::Str(v.to_string())], deleted: false }).collect();
+        let mut recs: Vec<Record> =
+            vals.iter().map(|(k, v)| Record { vals: vec![Json::Str(k.to_string()), Json::Str(v.to_string())], deleted: false }).collect();
         recs.extend(dels.iter().map(|k| Record { vals: vec![Json::Str(k.to_string()), Json::Null], deleted: true }));
         SourcePack { id: id.into(), tx: id.into(), signer: signer.into(), time: None, schema: schema.clone(), recs, meta: None }
     };
@@ -506,7 +554,18 @@ fn checkpoints_and_chunked_writes() {
         time: None,
         schema: Schema { cols: vec!["id".into()], id: 0 },
         recs: vec![],
-        meta: Some(Doc { cols: vec![("id".into(), ColMeta::plain("id")), ("v".into(), ColMeta::plain("v"))], pk: "id".into(), keys: Default::default(), clear: false, dropped: false, snap: snap.into_iter().map(String::from).collect(), crowd: None }.to_json()),
+        meta: Some(
+            Doc {
+                cols: vec![("id".into(), ColMeta::plain("id")), ("v".into(), ColMeta::plain("v"))],
+                pk: "id".into(),
+                keys: Default::default(),
+                clear: false,
+                dropped: false,
+                snap: snap.into_iter().map(String::from).collect(),
+                crowd: None,
+            }
+            .to_json(),
+        ),
     };
     let history = vec![
         data("p1", "O", vec![("A", "1"), ("B", "2")], vec![]),
@@ -538,12 +597,19 @@ fn checkpoints_and_chunked_writes() {
     assert!(m3.iter().any(|r| r.key == "E"), "no valid checkpoint: everything replays");
 
     // cheapest write: 1 pack direct; many packs → one chunked pack
-    let recs: Vec<Record> = (0..3000).map(|i| Record { vals: vec![Json::Str(format!("K{:05}", i)), Json::Str(format!("value {} {}", i * 7919 % 10007, i * 31))], deleted: false }).collect();
+    let recs: Vec<Record> = (0..3000)
+        .map(|i| Record { vals: vec![Json::Str(format!("K{:05}", i)), Json::Str(format!("value {} {}", i * 7919 % 10007, i * 31))], deleted: false })
+        .collect();
     let small = pack::plan_best(&schema, &recs[..5], crate::iq::INLINE_CAP_V1, crate::iq::CHUNK_SIZE_V1, true).unwrap();
     assert_eq!((small.len(), small[0].chunks), (1, 0));
     let direct = pack::plan(&schema, &recs, crate::iq::INLINE_CAP_V1, true).unwrap();
     let best = pack::plan_best(&schema, &recs, crate::iq::INLINE_CAP_V1, crate::iq::CHUNK_SIZE_V1, true).unwrap();
-    assert!(direct.len() >= 4 && best.len() == 1 && best[0].chunks >= 2, "{} direct packs vs {:?}", direct.len(), best.iter().map(|p| p.chunks).collect::<Vec<_>>());
+    assert!(
+        direct.len() >= 4 && best.len() == 1 && best[0].chunks >= 2,
+        "{} direct packs vs {:?}",
+        direct.len(),
+        best.iter().map(|p| p.chunks).collect::<Vec<_>>()
+    );
     assert!(best[0].cost() < direct.iter().map(|p| p.cost()).sum::<u64>());
     // a record bigger than one transaction is fine now
     let mut x: u64 = 88172645463325252;
@@ -620,7 +686,15 @@ fn crowdfunded_manifest_and_pieces() {
         d.set("crowd", m.to_json());
         d
     };
-    let structure = |signer: &str, m: &Manifest, t: i64| SourcePack { id: format!("~s{}", t), tx: format!("tx{}", t), signer: signer.into(), time: Some(t), schema: crate::pack::Schema { cols: vec!["id".into()], id: 0 }, recs: vec![], meta: Some(meta(m)) };
+    let structure = |signer: &str, m: &Manifest, t: i64| SourcePack {
+        id: format!("~s{}", t),
+        tx: format!("tx{}", t),
+        signer: signer.into(),
+        time: Some(t),
+        schema: crate::pack::Schema { cols: vec!["id".into()], id: 0 },
+        recs: vec![],
+        meta: Some(meta(m)),
+    };
     let reg = |signer: &str, i: usize, sha: &str, tx: &str, t: i64| {
         let (schema, recs, meta) = crate::pack::decode_any(&crowd::registration_payload(i, sha, tx)).unwrap();
         assert!(meta.is_none());
@@ -646,14 +720,17 @@ fn crowdfunded_manifest_and_pieces() {
     assert_eq!(c.iter().map(|x| x.len()).collect::<Vec<_>>(), vec![1, 0, 1], "a registration with the wrong hash doesn't count");
     assert_eq!(c[0][0].tx, txa);
     let extra = crowd::Reg { piece: 1, sha256: hashes[1].clone(), tx: "3".repeat(88), signer: "me".into(), time: None };
-    assert_eq!(s.candidates(&[extra.clone()], &[]).iter().filter(|x| !x.is_empty()).count(), 3);
-    assert_eq!(s.candidates(&[extra], &[txa.clone()]).iter().filter(|x| !x.is_empty()).count(), 2, "a copy found not to match counts as missing");
+    assert_eq!(s.candidates(std::slice::from_ref(&extra), &[]).iter().filter(|x| !x.is_empty()).count(), 3);
+    assert_eq!(s.candidates(&[extra], std::slice::from_ref(&txa)).iter().filter(|x| !x.is_empty()).count(), 2, "a copy found not to match counts as missing");
     assert!(crowd::looks_crowd(&packs.iter().collect::<Vec<_>>()));
     assert!(crowd::scan(&packs, &|x| x == "nobody").is_none());
     // a 1 MB piece: a session write (0.005 + deposit + a network fee per part) plus its row
     let cost = crowd::piece_cost(1 << 20, false);
     let parts = ((1u64 << 20).div_ceil(3) * 4).div_ceil(3600);
-    assert_eq!(cost, crate::iq::FEE_SESSION_WRITE + crate::iq::SESSION_RENT_ESTIMATE + (parts + 1) * crate::iq::TX_FEE + crate::iq::FEE_DIRECT_WRITE + crate::iq::TX_FEE);
+    assert_eq!(
+        cost,
+        crate::iq::FEE_SESSION_WRITE + crate::iq::SESSION_RENT_ESTIMATE + (parts + 1) * crate::iq::TX_FEE + crate::iq::FEE_DIRECT_WRITE + crate::iq::TX_FEE
+    );
     assert!(crowd::piece_cost(100, false) < 3_000_000, "a tiny piece is a direct write");
     let _ = Json::Null;
     // IQ's upload profiles

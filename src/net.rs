@@ -47,12 +47,7 @@ pub fn parse_dbroots(v: &Json) -> Vec<DbRootInfo> {
                     if pda.is_empty() || tables.iter().any(|x| x.pda == pda) {
                         continue;
                     }
-                    tables.push(TableRef {
-                        label: t.get("label").str().map(String::from),
-                        hex: t.get("hex").str_or(""),
-                        pda,
-                        public,
-                    });
+                    tables.push(TableRef { label: t.get("label").str().map(String::from), hex: t.get("hex").str_or(""), pda, public });
                 }
             }
             DbRootInfo {
@@ -70,7 +65,7 @@ pub fn parse_dbroots(v: &Json) -> Vec<DbRootInfo> {
 }
 
 pub fn sort_roots(v: &mut [DbRootInfo]) {
-    v.sort_by(|a, b| (a.id.is_none(), a.name().to_lowercase()).cmp(&(b.id.is_none(), b.name().to_lowercase())));
+    v.sort_by_key(|a| (a.id.is_none(), a.name().to_lowercase()));
 }
 
 /// A table hint stored in a DbRoot → (readable name, table seed). Names are
@@ -110,13 +105,7 @@ pub fn dbroot_info(pda: &str, r: &crate::iq::DbRoot) -> DbRootInfo {
 }
 
 pub fn rpc_body(method: &str, params: Json) -> String {
-    json::obj(vec![
-        ("jsonrpc", json::s("2.0")),
-        ("id", json::n(1)),
-        ("method", json::s(method)),
-        ("params", params),
-    ])
-    .to_string()
+    json::obj(vec![("jsonrpc", json::s("2.0")), ("id", json::n(1)), ("method", json::s(method)), ("params", params)]).to_string()
 }
 
 /// Returns the `result` field, or a readable error (including program logs
@@ -128,7 +117,7 @@ pub fn rpc_result(text: &str) -> Result<Json, String> {
         let mut msg = err.get("message").str_or("RPC error");
         let logs: Vec<String> = err.get("data").get("logs").arr().iter().filter_map(|l| l.str().map(String::from)).collect();
         if !logs.is_empty() {
-            msg.push_str("\n");
+            msg.push('\n');
             msg.push_str(&logs.iter().rev().take(8).rev().cloned().collect::<Vec<_>>().join("\n"));
         }
         return Err(msg);

@@ -141,7 +141,8 @@ impl Ty {
                 w != "ZEROFILL" && w != "SIGNED"
             }
         });
-        let name = if words.len() >= 2 && words[0] == "DOUBLE" && words[1] == "PRECISION" { "DOUBLE".to_string() } else { words.first().cloned().unwrap_or_default() };
+        let name =
+            if words.len() >= 2 && words[0] == "DOUBLE" && words[1] == "PRECISION" { "DOUBLE".to_string() } else { words.first().cloned().unwrap_or_default() };
         let mut args = vec![];
         if !rest.is_empty() {
             let b: Vec<char> = rest.chars().collect();
@@ -225,9 +226,27 @@ impl Ty {
             }
             .into(),
             Ty::Date => "DATE".into(),
-            Ty::DateTime(f) => if *f > 0 { format!("DATETIME({})", f) } else { "DATETIME".into() },
-            Ty::Timestamp(f) => if *f > 0 { format!("TIMESTAMP({})", f) } else { "TIMESTAMP".into() },
-            Ty::Time(f) => if *f > 0 { format!("TIME({})", f) } else { "TIME".into() },
+            Ty::DateTime(f) => {
+                if *f > 0 {
+                    format!("DATETIME({})", f)
+                } else {
+                    "DATETIME".into()
+                }
+            }
+            Ty::Timestamp(f) => {
+                if *f > 0 {
+                    format!("TIMESTAMP({})", f)
+                } else {
+                    "TIMESTAMP".into()
+                }
+            }
+            Ty::Time(f) => {
+                if *f > 0 {
+                    format!("TIME({})", f)
+                } else {
+                    "TIME".into()
+                }
+            }
             Ty::Year => "YEAR".into(),
             Ty::Json => "JSON".into(),
             Ty::Enum(v) => format!("ENUM({})", list(v)),
@@ -485,7 +504,11 @@ pub fn numeric_text(v: &Json) -> Option<String> {
             None => (body, None),
         };
         let groups: Vec<&str> = int.split(',').collect();
-        let ok = groups.len() > 1 && !groups[0].is_empty() && groups[0].len() <= 3 && groups[1..].iter().all(|g| g.len() == 3) && groups.iter().all(|g| g.bytes().all(|c| c.is_ascii_digit()));
+        let ok = groups.len() > 1
+            && !groups[0].is_empty()
+            && groups[0].len() <= 3
+            && groups[1..].iter().all(|g| g.len() == 3)
+            && groups.iter().all(|g| g.bytes().all(|c| c.is_ascii_digit()));
         if !ok {
             return None;
         }
@@ -607,7 +630,17 @@ pub struct ColMeta {
 
 impl ColMeta {
     pub fn plain(key: &str) -> ColMeta {
-        ColMeta { key: key.to_string(), ty: Ty::Any, not_null: false, default: None, on_update_now: false, auto_inc: false, comment: String::new(), fill: Json::Null, auto_added: false }
+        ColMeta {
+            key: key.to_string(),
+            ty: Ty::Any,
+            not_null: false,
+            default: None,
+            on_update_now: false,
+            auto_inc: false,
+            comment: String::new(),
+            fill: Json::Null,
+            auto_added: false,
+        }
     }
     pub fn typed(key: &str, ty: Ty) -> ColMeta {
         ColMeta { ty, ..ColMeta::plain(key) }
@@ -841,7 +874,12 @@ impl Doc {
         }
         let strs = |x: &Json| -> Vec<String> { x.arr().iter().filter_map(|s| s.str().map(String::from)).collect() };
         let keys = TableKeys {
-            indexes: v.get("ix").arr().iter().map(|i| Index { name: i.get("n").str_or(""), cols: strs(i.get("c")), unique: i.get("u").u64().unwrap_or(0) != 0 }).collect(),
+            indexes: v
+                .get("ix")
+                .arr()
+                .iter()
+                .map(|i| Index { name: i.get("n").str_or(""), cols: strs(i.get("c")), unique: i.get("u").u64().unwrap_or(0) != 0 })
+                .collect(),
             fks: v
                 .get("fk")
                 .arr()
@@ -862,7 +900,15 @@ impl Doc {
         };
         let pk = v.get("pk").str().map(String::from).or_else(|| cols.first().map(|c| c.1.key.clone())).unwrap_or_default();
         let crowd = Some(v.get("crowd").clone()).filter(|c| !c.is_null());
-        Some(Doc { cols, pk, keys, clear: v.get("clr").u64().unwrap_or(0) != 0, dropped: v.get("drop").u64().unwrap_or(0) != 0, snap: strs(v.get("snap")), crowd })
+        Some(Doc {
+            cols,
+            pk,
+            keys,
+            clear: v.get("clr").u64().unwrap_or(0) != 0,
+            dropped: v.get("drop").u64().unwrap_or(0) != 0,
+            snap: strs(v.get("snap")),
+            crowd,
+        })
     }
 
     /// Nothing beyond plain, untyped columns: no record needed on chain.

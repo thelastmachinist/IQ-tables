@@ -74,11 +74,7 @@ fn tx_request(sig: &str, id: usize) -> Json {
             "params",
             Json::Arr(vec![
                 json::s(sig),
-                json::obj(vec![
-                    ("encoding", json::s("base64")),
-                    ("maxSupportedTransactionVersion", json::n(1)),
-                    ("commitment", json::s("confirmed")),
-                ]),
+                json::obj(vec![("encoding", json::s("base64")), ("maxSupportedTransactionVersion", json::n(1)), ("commitment", json::s("confirmed"))]),
             ]),
         ),
     ])
@@ -420,7 +416,9 @@ impl App {
                 };
                 match (&mut c.kind, r) {
                     (ChunkKind::Linked { next, parts }, Ok(v)) => {
-                        let found = decode(&v).and_then(|tx| tx.ixs.iter().find_map(|(p, _, data)| (tx.keys.get(*p) == Some(&pid)).then(|| iq::decode_send_code(data)).flatten()));
+                        let found = decode(&v).and_then(|tx| {
+                            tx.ixs.iter().find_map(|(p, _, data)| (tx.keys.get(*p) == Some(&pid)).then(|| iq::decode_send_code(data)).flatten())
+                        });
                         match found {
                             Some((code, before)) if parts.len() < 1000 => {
                                 parts.insert(0, code);

@@ -262,9 +262,7 @@ impl<'a> Parser<'a> {
             Some(c) if *c == b'-' || c.is_ascii_digit() => {
                 let st = self.i;
                 self.i += 1;
-                while self.i < self.b.len()
-                    && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                {
+                while self.i < self.b.len() && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
                     self.i += 1;
                 }
                 Ok(Json::Num(String::from_utf8_lossy(&self.b[st..self.i]).into_owned()))
@@ -309,10 +307,7 @@ impl<'a> Parser<'a> {
                         b't' => out.push(b'\t'),
                         b'u' => {
                             let mut cp = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&cp)
-                                && self.b.get(self.i) == Some(&b'\\')
-                                && self.b.get(self.i + 1) == Some(&b'u')
-                            {
+                            if (0xD800..0xDC00).contains(&cp) && self.b.get(self.i) == Some(&b'\\') && self.b.get(self.i + 1) == Some(&b'u') {
                                 let save = self.i;
                                 self.i += 2;
                                 let lo = self.hex4()?;

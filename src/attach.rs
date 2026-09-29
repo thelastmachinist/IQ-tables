@@ -133,7 +133,7 @@ pub fn inline_image(ft: &str) -> bool {
 
 fn looks_b64(s: &str) -> bool {
     let t = s.trim();
-    !t.is_empty() && t.len() % 4 == 0 && t.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
+    !t.is_empty() && t.len().is_multiple_of(4) && t.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
 }
 
 /// Build the viewer contents from a file's metadata and data string.
@@ -245,7 +245,7 @@ impl App {
         }
         let (Some(i), Ok(t), Ok(r)) = (self.draft_idx(p[0]), p[1].parse::<usize>(), p[2].parse::<usize>()) else { return };
         let key = p[0].to_string();
-        if self.attach_status.is_some() {
+        if self.attach_status.is_some() || self.crowd.work.as_ref().map(|w| !w.finished).unwrap_or(false) {
             self.err("Another file is still being inscribed — wait for it to finish.");
             return;
         }
@@ -263,7 +263,7 @@ impl App {
             return;
         };
         if self.keypair(&wallet).is_none() {
-            self.err("Log in with the account that holds this database's wallet.");
+            self.err("Sign in with the wallet that owns this database.");
             return;
         }
         let v = match json::parse(val) {
@@ -317,6 +317,12 @@ impl App {
     /// Upload a piece of a crowdfunded file from `wallet`, then record it in
     /// the project's table.
     pub fn attach_crowd_piece(&mut self, wallet: String, filename: String, bytes: &[u8], piece: CrowdPiece) {
+        if self.attach_status.is_some() {
+            return self.crowd_piece_failed("Another file is being inscribed from this tab — try again when it's done.");
+        }
+        if self.keypair(&wallet).is_none() {
+            return self.crowd_piece_failed("Sign in with your wallet to upload pieces.");
+        }
         let data = base64_encode(bytes);
         let ftype = "application/octet-stream".to_string();
         let metadata = iq::file_metadata(&ftype, &filename, &data);
@@ -348,7 +354,7 @@ impl App {
         self.attach_status = Some((job.cell(), msg.to_string()));
     }
 
-    fn attach_fail(&mut self, msg: impl Into<String>) {
+    pub fn attach_fail(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         let crowd = self.attach_status.as_ref().map(|(c, _)| c.starts_with("crowd:")).unwrap_or(false);
         self.attach_status = None;
@@ -360,7 +366,11 @@ impl App {
     }
 
     fn attach_check(&mut self, job: Job) {
-        let user = parse_pk(&job.wallet).unwrap();
+        let Some(user) = parse_pk(&job.wallet) else {
+            // (signed out mid-way)
+            self.attach_status = Some((job.cell(), String::new()));
+            return self.attach_fail("Sign in with the wallet that owns this database.");
+        };
         let mint = solana::pk(iq::IQ_MINT_STR);
         let addrs = [
             iq::user_inventory_pda(&user),
@@ -458,7 +468,7 @@ impl App {
 
     fn attach_batch_start(&mut self, job: Job) {
         let (Some(seq), Some(kp)) = (job.seq, self.keypair(&job.wallet)) else {
-            return self.attach_fail("Log in with the account that holds this database's wallet.");
+            return self.attach_fail("Sign in with the wallet that owns this database.");
         };
         let same = self.uploads.get("attach").map(|b| b.kp.pubkey == kp.pubkey && b.same_upload(seq, &job.chunks)).unwrap_or(false);
         if same {
@@ -522,7 +532,8 @@ impl App {
     }
 
     fn tx_from_chain(&mut self, sig: &str) {
-        let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"maxSupportedTransactionVersion\":1,\"commitment\":\"confirmed\"}}]", sig)).unwrap();
+        let params =
+            json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"maxSupportedTransactionVersion\":1,\"commitment\":\"confirmed\"}}]", sig)).unwrap();
         self.rpc("getTransaction", params, P::TxView(sig.to_string(), true));
     }
 
@@ -778,7 +789,13 @@ impl App {
                                         if default_name && filetype == "application/octet-stream" {
                                             return None;
                                         }
-                                        Some(Asset { sig: a.get("signature").str_or(""), filename, filetype, time: a.get("blockTime").u64().map(|t| t as i64), chunks })
+                                        Some(Asset {
+                                            sig: a.get("signature").str_or(""),
+                                            filename,
+                                            filetype,
+                                            time: a.get("blockTime").u64().map(|t| t as i64),
+                                            chunks,
+                                        })
                                     })
                                     .collect(),
                             )

@@ -19,7 +19,6 @@ mod ffi {
         pub fn copy(p: *const u8, l: usize);
         pub fn timer(id: u32, ms: u32);
         pub fn set_hash(p: *const u8, l: usize);
-        pub fn passkey(id: u32, p: *const u8, l: usize);
         pub fn tz() -> i32;
         pub fn file_read(id: u32, fid: u32, start: f64, len: f64);
         pub fn fetch_bytes(id: u32, up: *const u8, ul: usize, start: f64, len: f64);
@@ -49,9 +48,7 @@ mod imp {
         unsafe { ffi::render(s.as_ptr(), s.len()) }
     }
     pub fn fetch(id: u32, method: &str, url: &str, body: &str, ctype: &str) {
-        unsafe {
-            ffi::fetch(id, method.as_ptr(), method.len(), url.as_ptr(), url.len(), body.as_ptr(), body.len(), ctype.as_ptr(), ctype.len())
-        }
+        unsafe { ffi::fetch(id, method.as_ptr(), method.len(), url.as_ptr(), url.len(), body.as_ptr(), body.len(), ctype.as_ptr(), ctype.len()) }
     }
     pub fn storage_get(k: &str) -> Option<String> {
         let n = unsafe { ffi::storage_get(k.as_ptr(), k.len()) };
@@ -82,11 +79,6 @@ mod imp {
     pub fn set_hash(s: &str) {
         unsafe { ffi::set_hash(s.as_ptr(), s.len()) }
     }
-    /// Create or use a passkey (WebAuthn with the PRF extension); the result
-    /// JSON arrives through on_async.
-    pub fn passkey(id: u32, req: &str) {
-        unsafe { ffi::passkey(id, req.as_ptr(), req.len()) }
-    }
     /// Read `len` bytes at `start` of a file the page keeps open; the bytes
     /// arrive through on_async.
     pub fn file_read(id: u32, fid: u32, start: u64, len: u64) {
@@ -113,7 +105,7 @@ mod imp {
 mod imp {
     use std::cell::RefCell;
     thread_local! {
-        pub static OUT: RefCell<Vec<String>> = RefCell::new(vec![]);
+        pub static OUT: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
         pub static STORE: RefCell<std::collections::HashMap<String, String>> = RefCell::new(Default::default());
     }
     pub fn log(s: &str) {
@@ -150,9 +142,6 @@ mod imp {
     pub fn copy(_s: &str) {}
     pub fn timer(_id: u32, _ms: u32) {}
     pub fn set_hash(_s: &str) {}
-    pub fn passkey(id: u32, req: &str) {
-        OUT.with(|o| o.borrow_mut().push(format!("passkey:{}:{}", id, req)));
-    }
     pub fn file_read(id: u32, fid: u32, start: u64, len: u64) {
         OUT.with(|o| o.borrow_mut().push(format!("file_read:{}:{}:{}:{}", id, fid, start, len)));
     }

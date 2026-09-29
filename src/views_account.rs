@@ -1,11 +1,10 @@
-//! Views for the account: the header button, the account page (log in,
-//! create, wallets), "My tables", and the database-wallet card in drafts.
+//! Views for the account: the header button, the account page (sign in with
+//! a key, make a wallet, wallets), "My tables", and the database-wallet card
+//! in drafts.
 
 use crate::account::Kind;
-use crate::app::{App, Load, Route, K_ACCOUNT};
-use crate::host;
+use crate::app::{App, Load, Route};
 use crate::iq;
-use crate::json;
 use crate::net;
 use crate::solana::{self, b58};
 use crate::ui::{self, addr, esc};
@@ -32,7 +31,7 @@ pub fn rpc_hint(app: &App) -> String {
     });
     match bad {
         Some(e) => format!(
-            "<div class=\"card warnbox small\"><b>Balances and transactions need a Solana RPC that accepts browser requests.</b> {} → set one in <a href=\"#/settings\">Settings</a> (a free Helius, QuickNode or Triton key works). Reading tables still works through IQ's gateway.</div>",
+            "<div class=\"card warnbox small\"><b>The Solana RPC didn't answer.</b> {} → try another one in <a href=\"#/settings\">Settings</a> (a free Helius, QuickNode or Triton key works). Reading tables still works through IQ's gateway.</div>",
             esc(&e.chars().take(140).collect::<String>())
         ),
         None => String::new(),
@@ -76,14 +75,14 @@ pub fn account_button(app: &App, h: &mut String) {
             ));
             if app.account_menu {
                 h.push_str(&format!(
-                    "<div class=\"menu\"><div><b>{}</b><div class=\"muted small\">Balance {}</div></div><button class=\"btn wide\" data-a=\"add-funds\">Add funds</button><a class=\"btn wide\" href=\"#/account\">Account</a><a class=\"btn wide\" href=\"#/mine\">My tables</a><button class=\"btn wide\" data-a=\"logout\">Sign out</button></div>",
+                    "<div class=\"menu\"><div><b class=\"mono\">{}</b><div class=\"muted small\">Balance {}</div></div><button class=\"btn wide\" data-a=\"add-funds\">Add funds</button><a class=\"btn wide\" href=\"#/account\">Account</a><a class=\"btn wide\" href=\"#/mine\">My tables</a><button class=\"btn wide\" data-a=\"logout\">Sign out</button></div>",
                     esc(&a.name),
                     esc(&bal)
                 ));
             }
         }
         (None, Some(_)) => h.push_str("<a class=\"btn primary\" href=\"#/account\">Unlock</a>"),
-        (None, None) => h.push_str("<a class=\"btn\" href=\"#/account\">Sign in</a> <a class=\"btn primary\" href=\"#/account\">Create account</a>"),
+        (None, None) => h.push_str("<a class=\"btn primary\" href=\"#/account\">Sign in</a>"),
     }
     h.push_str("</div>");
 }
@@ -99,43 +98,43 @@ pub fn account(app: &App, h: &mut String) {
 
 fn keys_import(h: &mut String, app: &App) {
     h.push_str(&format!(
-        "<details><summary>Import existing keys</summary><p class=\"small muted\">Drop or choose a Solana CLI keypair (<code>id.json</code>), a JSON list of them, or a text file with one base58 secret key per line (optionally <code>label: key</code>). You can also paste them here:</p><textarea id=\"keys-text\" rows=\"4\" placeholder=\"treasury: 4Nd1m…\" data-in=\"form\" data-arg=\"keys-text\" spellcheck=\"false\" autocomplete=\"off\">{}</textarea><div class=\"row\"><button class=\"btn\" data-a=\"import-keys-text\">Import pasted keys</button><label class=\"btn\">Choose key file…<input type=\"file\" data-file=\"import-keys\" hidden></label></div></details>",
+        "<details><summary>Add another wallet's key</summary><p class=\"small muted\">Drop or choose a Solana key file (<code>id.json</code>) or a text file with base58 secret keys (one per line, optionally <code>label: key</code>), or paste them here. They're kept for this session only.</p><textarea id=\"keys-text\" rows=\"3\" placeholder=\"treasury: 4Nd1m…\" data-in=\"form\" data-arg=\"keys-text\" spellcheck=\"false\" autocomplete=\"off\">{}</textarea><div class=\"row\"><button class=\"btn\" data-a=\"import-keys-text\">Add pasted keys</button><label class=\"btn\">Choose key file…<input type=\"file\" data-file=\"import-keys\" hidden></label></div></details>",
         esc(form(app, "keys-text"))
     ));
 }
 
+/// An account an earlier version saved in this browser: offer it as a file,
+/// then to remove it.
+fn legacy(h: &mut String) {
+    let Some((name, key)) = crate::accounts_flow::legacy_account() else { return };
+    h.push_str(&format!(
+        "<section class=\"card warnbox\"><b>This browser still holds an account from an earlier version of IQ Tables (“{}”).</b> IQ Tables no longer keeps accounts in the browser. Download it as a file (then drop it here to sign in), and remove it from the browser.<div class=\"row\"><button class=\"btn primary\" data-a=\"legacy-download\" data-arg=\"{k}\">Download it</button><button class=\"btn\" data-a=\"legacy-delete\" data-arg=\"{k}\">Remove it from this browser</button></div></section>",
+        esc(&name),
+        k = esc(key)
+    ));
+}
+
 fn logged_out(app: &App, h: &mut String) {
-    let device = host::storage_get(crate::accounts_flow::K_DEVICE).filter(|s| !s.is_empty()).is_some();
-    let pk_here = host::storage_get(crate::accounts_flow::K_PK_HINT).as_deref() == Some("1");
+    legacy(h);
     if let Some((name, _)) = &app.locked {
-        h.push_str(&format!("<section class=\"card narrow\"><h2>Unlock “{}”</h2><p class=\"small muted\">This backup file is protected by its passphrase.</p>", esc(name)));
+        h.push_str(&format!(
+            "<section class=\"card narrow\"><h2>Unlock “{}”</h2><p class=\"small muted\">This file is protected by its passphrase.</p>",
+            esc(name)
+        ));
         h.push_str("<div class=\"row\"><input id=\"unlock-pass\" type=\"password\" placeholder=\"passphrase\" autocomplete=\"current-password\" data-in=\"form\" data-arg=\"unlock-pass\" data-enter=\"unlock-account\" aria-label=\"Passphrase\"><button class=\"btn primary\" data-a=\"unlock-account\">Unlock</button></div></section>");
     }
-    h.push_str("<section class=\"card welcome\"><h1>Your free account</h1><p>Make one with a single tap — your face, fingerprint or Windows Hello is the login. No password, no app to install.</p>");
-    h.push_str("<div class=\"row\"><button class=\"btn primary big\" data-a=\"passkey-create\">Create account</button>");
-    h.push_str(&format!("<button class=\"btn big{}\" data-a=\"passkey-signin\">Sign in</button></div>", if pk_here { " primary-soft" } else { "" }));
-    if device {
-        h.push_str("<p><button class=\"link\" data-a=\"device-signin\">Continue with the account saved in this browser</button></p>");
-    }
-    h.push_str("<p class=\"small muted\">Your login works on your other devices too when they share the same Apple, Google or Microsoft account.</p></section>");
-    h.push_str("<details class=\"adv\"><summary>Other ways to sign in</summary><div class=\"cols2\">");
-    let remembered = host::storage_get(K_ACCOUNT).filter(|s| !s.is_empty()).and_then(|s| json::parse(&s).ok());
-    h.push_str("<section class=\"card\"><h3>Backup file</h3>");
-    if let Some(v) = remembered {
-        h.push_str(&format!("<p class=\"small muted\">This browser remembers the backup “{}”.</p>", esc(&v.get("name").str_or("Account"))));
-        h.push_str("<div class=\"row\"><input id=\"unlock-pass2\" type=\"password\" placeholder=\"passphrase\" autocomplete=\"current-password\" data-in=\"form\" data-arg=\"unlock-pass\" data-enter=\"unlock-remembered\" aria-label=\"Passphrase\"><button class=\"btn\" data-a=\"unlock-remembered\">Unlock</button></div><p class=\"small\"><button class=\"link danger\" data-a=\"forget-device\">Forget it on this device</button></p>");
-    }
-    h.push_str("<label class=\"drop\"><span class=\"big\">Drop your backup file</span><span class=\"muted small\">anywhere on this page — or click to choose it. Solana key files work too.</span><input type=\"file\" data-file=\"account-file\" hidden></label>");
-    keys_import(h, app);
-    h.push_str("</section><section class=\"card\"><h3>Without a passkey</h3><p class=\"small\">Keep the account in this browser only. Quick, but clearing the browser's data loses it — download a backup once it holds money.</p><button class=\"btn\" data-a=\"browser-account\">Use this browser</button>");
-    h.push_str("<h3 style=\"margin-top:1rem\">Password-protected file</h3><div class=\"formgrid\">");
-    h.push_str(&format!("<label>Account name<input id=\"acct-name\" value=\"{}\" placeholder=\"e.g. parts-catalog\" data-in=\"form\" data-arg=\"acct-name\" maxlength=\"40\"></label>", esc(form(app, "acct-name"))));
-    h.push_str("<label>Passphrase (10+ characters)<input id=\"pass1\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass1\"></label>");
-    h.push_str("<label>Repeat passphrase<input id=\"pass2\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass2\" data-enter=\"create-account\"></label>");
-    h.push_str("</div><div class=\"row\"><button class=\"btn\" data-a=\"create-account\">Create with a file</button></div><p class=\"small muted\">Downloads an encrypted file (the IQ SDK's own <code>passwordEncrypt</code> scheme). The file plus passphrase is the login.</p></section></div></details>");
+    h.push_str("<section class=\"card welcome\"><h1>Sign in with your wallet</h1><p>Your wallet is your account. Drop its key file anywhere on this page — a Solana key file like <code>id.json</code>, or a text file with the secret key — or paste the secret key below.</p>");
+    h.push_str("<label class=\"drop\"><span class=\"big\">Drop your key file</span><span class=\"muted small\">or click to choose it</span><input type=\"file\" data-file=\"account-file\" hidden></label>");
+    h.push_str(&format!(
+        "<div class=\"row\"><input id=\"keys-text\" type=\"password\" class=\"grow\" placeholder=\"…or paste your secret key\" value=\"{}\" data-in=\"form\" data-arg=\"keys-text\" data-enter=\"import-keys-text\" spellcheck=\"false\" autocomplete=\"off\" aria-label=\"Secret key\"><button class=\"btn primary\" data-a=\"import-keys-text\">Sign in</button></div>",
+        esc(form(app, "keys-text"))
+    ));
+    h.push_str("<p class=\"small muted\">Your key stays in this tab's memory and never leaves your browser: saves are signed right here. Nothing is stored — closing the tab signs you out.</p></section>");
+    h.push_str("<section class=\"card\"><h3>No wallet yet?</h3><p class=\"small\">Make one here. Its key is downloaded as a file — the same kind the Solana command-line tools and IQ's git tool use. That file is the only way into the wallet, so keep a copy somewhere safe.</p><div class=\"row\"><button class=\"btn\" data-a=\"make-wallet\">Make a new wallet</button></div></section>");
 }
 
 fn logged_in(app: &App, h: &mut String) {
+    legacy(h);
     let a = app.account.as_ref().unwrap();
     let Some(main) = a.main() else {
         advanced(app, h);
@@ -185,34 +184,11 @@ fn logged_in(app: &App, h: &mut String) {
         h.push_str("</div>");
     }
     h.push_str("</section>");
-    // protecting the account
-    match &a.origin {
-        crate::account::Origin::Browser => {
-            h.push_str("<section class=\"card warnbox\"><b>This account lives only in this browser.</b> If the browser's data is cleared, it's gone — including its money. Download a backup (protected by a passphrase you choose) and keep it somewhere safe.");
-            backup_form(app, h);
-            h.push_str("</section>");
-        }
-        crate::account::Origin::Passkey { .. } => {
-            h.push_str("<details class=\"adv\"><summary>Download a backup</summary><p class=\"small\">Your passkey is your login. A backup file is a second way in — useful if you ever lose access to your passkey.</p>");
-            backup_form(app, h);
-            h.push_str("</details>");
-        }
-        crate::account::Origin::File => {}
-    }
     h.push_str("<p><a href=\"#/mine\">Your tables and files →</a></p>");
-    h.push_str("<details class=\"adv\"><summary>Advanced: wallets, keys and backup file</summary>");
+    h.push_str("<details class=\"adv\"><summary>Advanced: wallets and keys</summary>");
     advanced(app, h);
     h.push_str("</details>");
     h.push_str("<p><button class=\"btn\" data-a=\"logout\">Sign out</button></p>");
-}
-
-fn backup_form(app: &App, h: &mut String) {
-    let a = app.account.as_ref().unwrap();
-    if a.seal.is_some() {
-        h.push_str("<div class=\"row\"><button class=\"btn primary\" data-a=\"save-account\">Download backup</button></div>");
-        return;
-    }
-    h.push_str("<div class=\"formgrid\"><label>Choose a passphrase (10+ characters)<input id=\"bk-pass1\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass1\"></label><label>Repeat it<input id=\"bk-pass2\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass2\" data-enter=\"set-passphrase\"></label></div><div class=\"row\"><button class=\"btn primary\" data-a=\"set-passphrase\">Download backup</button></div>");
 }
 
 fn advanced(app: &App, h: &mut String) {
@@ -224,22 +200,10 @@ fn advanced(app: &App, h: &mut String) {
         a.wallets.len(),
         esc(&total),
         match &a.origin {
-            crate::account::Origin::Passkey { .. } => "signed in with a passkey".to_string(),
-            crate::account::Origin::Browser => "saved in this browser".to_string(),
-            crate::account::Origin::File => if a.seal.is_some() { "<span class=\"good\">encrypted account file</span>".to_string() } else { "<span class=\"warn\">no passphrase yet</span>".to_string() },
+            crate::account::Origin::Keys => "signed in with a key · kept in this tab only",
+            crate::account::Origin::File => "signed in with a passphrase-protected file · kept in this tab only",
         }
     ));
-    if a.origin == crate::account::Origin::File && (a.dirty || app.unsaved_keys) {
-        h.push_str(&format!(
-            "<div class=\"card warnbox\"><b>Save your account file.</b> {} <button class=\"btn primary\" data-a=\"save-account\" {}>Save account file</button></div>",
-            if app.unsaved_keys {
-                "Imported keys live only in the file — until you save it, they exist only in this tab."
-            } else {
-                "New wallets can always be recovered from the file you have, but labels and notes are only kept once you save."
-            },
-            if a.seal.is_none() { "disabled" } else { "" }
-        ));
-    }
     // wallets
     h.push_str("<section class=\"card\"><div class=\"tablehead\"><h3>Wallets</h3><span class=\"grow\"></span><button class=\"link\" data-a=\"refresh-balances\">refresh balances</button></div>");
     h.push_str("<div class=\"scroll\"><table class=\"grid\"><thead><tr><th>Label</th><th>Address</th><th class=\"num\">Balance</th><th>Used by</th><th></th></tr></thead><tbody>");
@@ -253,13 +217,20 @@ fn advanced(app: &App, h: &mut String) {
             .chain(
                 app.dbroots
                     .ready()
-                    .map(|rs| rs.iter().filter(|r| r.creator == ad && !app.drafts.iter().any(|d| d.name == r.name())).map(|r| format!("<a href=\"#/db/{}\">{}</a>", esc(&r.pda), esc(&r.name()))).collect::<Vec<_>>())
+                    .map(|rs| {
+                        rs.iter()
+                            .filter(|r| r.creator == ad && !app.drafts.iter().any(|d| d.name == r.name()))
+                            .map(|r| format!("<a href=\"#/db/{}\">{}</a>", esc(&r.pda), esc(&r.name())))
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default(),
             )
             .collect();
         let kind = match w.kind {
-            Kind::Derived(i) => format!("<span class=\"muted small\" title=\"Derived from the account's master secret\">#{}</span>", i),
-            Kind::Imported => "<span class=\"pill\" title=\"Imported key, stored in the account\">imported</span>".into(),
+            Kind::Derived(i) => {
+                format!("<span class=\"muted small\" title=\"Made from your main key — dropping that key in again brings it back\">#{}</span>", i)
+            }
+            Kind::Imported => "<span class=\"pill\" title=\"A key you dropped in\">key</span>".into(),
         };
         h.push_str(&format!(
             "<tr><td><input id=\"wl-{a}\" class=\"inline\" value=\"{}\" data-in=\"wallet-label\" data-arg=\"{a}\" aria-label=\"Wallet label\"> {}</td><td><span class=\"addr\" title=\"{a}\">{}</span> <button class=\"link\" data-a=\"copy\" data-arg=\"{a}\">copy</button></td><td class=\"num\">{}</td><td class=\"small\">{}</td><td>",
@@ -276,7 +247,13 @@ fn advanced(app: &App, h: &mut String) {
             .filter(|o| o.address() != ad)
             .map(|o| {
                 let oa = o.address();
-                format!("<option value=\"{}\" {}>{} ({})</option>", esc(&oa), if form(app, &format!("to:{}", ad)) == oa { "selected" } else { "" }, esc(&o.label), esc(&solana::short(&oa)))
+                format!(
+                    "<option value=\"{}\" {}>{} ({})</option>",
+                    esc(&oa),
+                    if form(app, &format!("to:{}", ad)) == oa { "selected" } else { "" },
+                    esc(&o.label),
+                    esc(&solana::short(&oa))
+                )
             })
             .collect();
         h.push_str(&format!(
@@ -297,37 +274,23 @@ fn advanced(app: &App, h: &mut String) {
             h.push_str(&format!("<button class=\"link\" data-a=\"reveal-key\" data-arg=\"{}\">Show secret key</button>", esc(&ad)));
         }
         if w.kind == Kind::Imported {
-            h.push_str(&format!(" · <button class=\"link danger\" data-a=\"wallet-remove\" data-arg=\"{}\">remove from account</button>", esc(&ad)));
+            h.push_str(&format!(" · <button class=\"link danger\" data-a=\"wallet-remove\" data-arg=\"{}\">remove from this session</button>", esc(&ad)));
         }
         h.push_str("</details></td></tr>");
     }
     h.push_str("</tbody></table></div>");
     h.push_str(&format!(
-        "<div class=\"row\"><input id=\"wlabel\" placeholder=\"label for a new wallet, e.g. db: fasteners\" value=\"{}\" data-in=\"form\" data-arg=\"wlabel\" data-enter=\"new-wallet\"><button class=\"btn primary\" data-a=\"new-wallet\">New wallet</button></div><p class=\"small muted\">New wallets are derived from your account's secret, so they can't be lost: signing in again finds them.</p>",
+        "<div class=\"row\"><input id=\"wlabel\" placeholder=\"label for a new wallet, e.g. db: fasteners\" value=\"{}\" data-in=\"form\" data-arg=\"wlabel\" data-enter=\"new-wallet\"><button class=\"btn primary\" data-a=\"new-wallet\">New wallet</button></div><p class=\"small muted\">New wallets are made from your main key, so they can't be lost: signing in with that key again finds them.</p>",
         esc(form(app, "wlabel"))
     ));
     keys_import(h, app);
     h.push_str("</section>");
-    // file
-    h.push_str("<section class=\"card\"><h3>Backup file</h3>");
+    // an optional passphrase-protected copy of the keys
+    h.push_str("<section class=\"card\"><h3>Passphrase-protected copy</h3><p class=\"small\">Download every wallet here as one file encrypted with a passphrase — the IQ SDK's <code>passwordEncrypt</code> scheme (PBKDF2-SHA256 × 250,000 → AES-256-GCM). Dropping it in later asks for the passphrase. Optional: your key file works on its own.</p>");
     if a.seal.is_some() {
-        h.push_str("<p class=\"small\">Encrypted with your passphrase — the IQ SDK's <code>passwordEncrypt</code> scheme (PBKDF2-SHA256 × 250,000 → AES-256-GCM).</p>");
-        h.push_str("<div class=\"row\"><button class=\"btn primary\" data-a=\"save-account\">Download backup file</button></div>");
-        h.push_str("<details><summary>Change passphrase</summary>");
-    } else {
-        h.push_str("<p class=\"small\">Set a passphrase to download an encrypted backup.</p><div>");
+        h.push_str("<div class=\"row\"><button class=\"btn\" data-a=\"save-account\">Download it again</button></div>");
     }
-    h.push_str("<div class=\"formgrid\"><label>New passphrase (10+ characters)<input id=\"pass1\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass1\"></label><label>Repeat<input id=\"pass2\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass2\" data-enter=\"set-passphrase\"></label></div><div class=\"row\"><button class=\"btn primary\" data-a=\"set-passphrase\">Set passphrase &amp; download</button></div>");
-    h.push_str(if a.seal.is_some() { "</details>" } else { "</div>" });
-    if a.origin == crate::account::Origin::File {
-        h.push_str(&format!(
-            "<label class=\"check\"><input type=\"checkbox\" data-in=\"remember\" {} {}> Keep the encrypted file in this browser, so next time only the passphrase is needed</label>",
-            if app.remember { "checked" } else { "" },
-            if a.seal.is_none() { "disabled" } else { "" }
-        ));
-    }
-    h.push_str("<details><summary>Export without encryption</summary><p class=\"small warn\">An unencrypted file gives anyone who sees it control of every wallet in it.</p><button class=\"btn\" data-a=\"save-account\" data-arg=\"plain\">Download unencrypted file</button></details>");
-    h.push_str("</section>");
+    h.push_str("<div class=\"formgrid\"><label>Passphrase (10+ characters)<input id=\"pass1\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass1\"></label><label>Repeat<input id=\"pass2\" type=\"password\" autocomplete=\"new-password\" data-in=\"form\" data-arg=\"pass2\" data-enter=\"set-passphrase\"></label></div><div class=\"row\"><button class=\"btn\" data-a=\"set-passphrase\">Download protected copy</button></div></section>");
 }
 
 // ---------------------------------------------------------------- my tables
@@ -340,7 +303,7 @@ pub fn mine(app: &App, h: &mut String) {
             "<p>Everything you've made — {} across your account. <a href=\"#/account\">Account →</a></p></section>",
             esc(&total_balance(app).map(ui::sol).unwrap_or_default())
         )),
-        None => h.push_str("<p>Sign in to see the databases, tables and files you've made. Drafts in this browser are listed below either way.</p><a class=\"btn primary\" href=\"#/account\">Create account or sign in</a></section>"),
+        None => h.push_str("<p>Sign in to see the databases, tables and files you've made. Drafts in this browser are listed below either way.</p><a class=\"btn primary\" href=\"#/account\">Sign in with your wallet</a></section>"),
     }
     h.push_str(&rpc_hint(app));
     // on chain
@@ -362,7 +325,12 @@ pub fn mine(app: &App, h: &mut String) {
                 } else {
                     h.push_str("<div class=\"scroll\"><table class=\"grid\"><thead><tr><th>Database</th><th>Tables</th><th>Owner wallet</th><th class=\"num\">Wallet balance</th><th></th></tr></thead><tbody>");
                     for r in &own {
-                        let tables: Vec<String> = r.tables.iter().take(8).map(|t| format!("<a href=\"#/t/{}/{}\">{}</a>", esc(&r.pda), esc(&t.pda), esc(&net::label_of(t)))).collect();
+                        let tables: Vec<String> = r
+                            .tables
+                            .iter()
+                            .take(8)
+                            .map(|t| format!("<a href=\"#/t/{}/{}\">{}</a>", esc(&r.pda), esc(&t.pda), esc(&net::label_of(t))))
+                            .collect();
                         let more = if r.tables.len() > 8 { format!(" +{}", r.tables.len() - 8) } else { String::new() };
                         let draft = app.drafts.iter().find(|d| d.name == r.name());
                         h.push_str(&format!(
@@ -374,7 +342,11 @@ pub fn mine(app: &App, h: &mut String) {
                             who(app, &r.creator),
                             balance_text(app, &r.creator),
                             match draft {
-                                Some(d) => format!("<a class=\"small\" href=\"#/ws/{}\">draft{}</a>", esc(&d.key), if d.ghosts() > 0 { format!(" · {} unsaved", d.ghosts()) } else { String::new() }),
+                                Some(d) => format!(
+                                    "<a class=\"small\" href=\"#/ws/{}\">draft{}</a>",
+                                    esc(&d.key),
+                                    if d.ghosts() > 0 { format!(" · {} unsaved", d.ghosts()) } else { String::new() }
+                                ),
                                 None => String::new(),
                             }
                         ));
@@ -458,7 +430,11 @@ pub fn mine(app: &App, h: &mut String) {
                 }
             }
             if rows.is_empty() {
-                h.push_str(if loading > 0 { "<div class=\"loading\">Loading files…</div>" } else { "<p class=\"muted\">No files yet. Put one in a cell with 📎 File in the Editor.</p>" });
+                h.push_str(if loading > 0 {
+                    "<div class=\"loading\">Loading files…</div>"
+                } else {
+                    "<p class=\"muted\">No files yet. Put one in a cell with 📎 File in the Editor.</p>"
+                });
             } else {
                 h.push_str("<div class=\"scroll\"><table class=\"grid\"><thead><tr><th>File</th><th>Type</th><th>Wallet</th><th>Time</th><th></th></tr></thead><tbody>");
                 h.push_str(&rows);
@@ -509,15 +485,19 @@ pub fn draft_wallet(app: &App, key: &str, h: &mut String) {
             if let Some(w) = w {
                 h.push_str(&format!("<p class=\"small\">This draft uses {}.</p>", addr(w)));
             }
-            h.push_str("<a class=\"btn primary\" href=\"#/account\">Log in to continue</a>");
+            h.push_str("<a class=\"btn primary\" href=\"#/account\">Sign in with your wallet to continue</a>");
         }
         (Some(_), None, _) => {
-            h.push_str("<p>Every database has a wallet that creates it on chain, signs its <em>official</em> rows and pays for them. Its address is also a public donation address, so a dedicated wallet per database keeps its funds and history separate.</p>");
-            h.push_str(&format!("<div class=\"row\"><button class=\"btn primary\" data-a=\"draft-new-wallet\" data-arg=\"{}\">Create a dedicated wallet for “{}”</button></div>", esc(key), esc(&d.name)));
-            pick(h, "…or use one of your wallets");
+            h.push_str("<p>Every database has a wallet that creates it on chain, signs its <em>official</em> rows and pays for them. Its address is also a public donation address.</p>");
+            pick(h, "Use one of your wallets");
+            h.push_str(&format!("<div class=\"row\"><button class=\"link\" data-a=\"draft-new-wallet\" data-arg=\"{}\">or make a separate wallet for “{}” (from your key, so it can't be lost)</button></div>", esc(key), esc(&d.name)));
         }
         (Some(_), Some(w), None) => {
-            h.push_str(&format!("<p class=\"warn\">This draft's wallet {} isn't in the account you're logged in with. Log in with the account that holds it{}.</p>", addr(w), if can_change { ", or pick another wallet" } else { "" }));
+            h.push_str(&format!(
+                "<p class=\"warn\">This draft belongs to wallet {}, which you're not signed in with. Sign in with that wallet's key{}.</p>",
+                addr(w),
+                if can_change { ", or pick one of yours" } else { "" }
+            ));
             if can_change {
                 pick(h, "Use one of your wallets");
             }
@@ -535,7 +515,11 @@ pub fn draft_wallet(app: &App, key: &str, h: &mut String) {
                 esc(&ui::solscan_account(w, &app.settings.cluster)),
                 a = esc(w)
             ));
-            h.push_str(&format!("<p class=\"big\">{} <button class=\"link\" data-a=\"balance\" data-arg=\"{}\">refresh</button></p>", balance_text(app, w), esc(w)));
+            h.push_str(&format!(
+                "<p class=\"big\">{} <button class=\"link\" data-a=\"balance\" data-arg=\"{}\">refresh</button></p>",
+                balance_text(app, w),
+                esc(w)
+            ));
             h.push_str(&crate::qr::svg(&format!("solana:{}", w)).unwrap_or_default());
             // top up from another account wallet
             if let Some(a) = app.account.as_ref() {
@@ -569,7 +553,7 @@ pub fn draft_wallet(app: &App, key: &str, h: &mut String) {
             if can_change {
                 h.push_str("<details><summary>Use a different wallet</summary>");
                 pick(h, "Wallet");
-                h.push_str(&format!("<button class=\"link\" data-a=\"draft-new-wallet\" data-arg=\"{}\">or create a new dedicated one</button></details>", esc(key)));
+                h.push_str(&format!("<button class=\"link\" data-a=\"draft-new-wallet\" data-arg=\"{}\">or make a separate wallet for it (from your key, so it can't be lost)</button></details>", esc(key)));
             }
         }
     }

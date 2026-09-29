@@ -139,10 +139,7 @@ fn ix(accounts: Vec<AccountMeta>, data: Vec<u8>) -> Instruction {
 }
 
 pub fn initialize_db_root(signer: &Pubkey, db_id: &[u8]) -> Instruction {
-    ix(
-        vec![AccountMeta::w(db_root_pda(db_id)), AccountMeta::ws(*signer), AccountMeta::r(SYSTEM_PROGRAM)],
-        Borsh::new(&IX_INITIALIZE_DB_ROOT).bytes(db_id).0,
-    )
+    ix(vec![AccountMeta::w(db_root_pda(db_id)), AccountMeta::ws(*signer), AccountMeta::r(SYSTEM_PROGRAM)], Borsh::new(&IX_INITIALIZE_DB_ROOT).bytes(db_id).0)
 }
 
 pub fn manage_table_creators(signer: &Pubkey, db_id: &[u8], creators: &[Pubkey], ext: &[Pubkey]) -> Instruction {
@@ -200,7 +197,14 @@ pub fn update_table(signer: &Pubkey, t: &TableSpec) -> Instruction {
     let root = db_root_pda(t.db_id);
     let cols: Vec<Vec<u8>> = t.columns.iter().map(|c| c.as_bytes().to_vec()).collect();
     let ext: Vec<Vec<u8>> = t.ext_keys.iter().map(|c| c.as_bytes().to_vec()).collect();
-    let mut b = Borsh::new(&IX_UPDATE_TABLE).bytes(t.db_id).bytes(t.table_seed).bytes(t.name.as_bytes()).vec_bytes(&cols).bytes(t.id_col.as_bytes()).vec_bytes(&ext).u8(0);
+    let mut b = Borsh::new(&IX_UPDATE_TABLE)
+        .bytes(t.db_id)
+        .bytes(t.table_seed)
+        .bytes(t.name.as_bytes())
+        .vec_bytes(&cols)
+        .bytes(t.id_col.as_bytes())
+        .vec_bytes(&ext)
+        .u8(0);
     b = match t.writers {
         Some(w) => b.u8(1).vec_pk(w),
         None => b.u8(0),
@@ -233,10 +237,7 @@ pub fn user_initialize(user: &Pubkey) -> Instruction {
 }
 
 pub fn realloc_account(payer: &Pubkey, target: &Pubkey, new_size: u64) -> Instruction {
-    ix(
-        vec![AccountMeta::ws(*payer), AccountMeta::w(*target), AccountMeta::r(SYSTEM_PROGRAM)],
-        Borsh::new(&IX_REALLOC_ACCOUNT).u64(new_size).0,
-    )
+    ix(vec![AccountMeta::ws(*payer), AccountMeta::w(*target), AccountMeta::r(SYSTEM_PROGRAM)], Borsh::new(&IX_REALLOC_ACCOUNT).u64(new_size).0)
 }
 
 /// `db_code_in` on the direct (inline) path: the whole row travels inside the
@@ -251,20 +252,14 @@ pub fn db_code_in_inline(user: &Pubkey, db_id: &[u8], table_seed: &[u8], metadat
             AccountMeta::w(user_inventory_pda(user)),
             AccountMeta::r(SYSTEM_PROGRAM),
             AccountMeta::w(fee_receiver()),
-            AccountMeta::r(p),                        // session: None
-            AccountMeta::r(iq_ata.unwrap_or(p)),      // iq_ata
+            AccountMeta::r(p),                   // session: None
+            AccountMeta::r(iq_ata.unwrap_or(p)), // iq_ata
             AccountMeta::r(root),
             AccountMeta::w(table_pda(&root, table_seed)),
-            AccountMeta::r(p),                        // signer_ata: None (ungated table)
-            AccountMeta::r(p),                        // metadata_account: None
+            AccountMeta::r(p), // signer_ata: None (ungated table)
+            AccountMeta::r(p), // metadata_account: None
         ],
-        Borsh::new(&IX_DB_CODE_IN)
-            .bytes(db_id)
-            .bytes(table_seed)
-            .string("")
-            .string(metadata)
-            .u8(0)
-            .0,
+        Borsh::new(&IX_DB_CODE_IN).bytes(db_id).bytes(table_seed).string("").string(metadata).u8(0).0,
     )
 }
 
@@ -345,10 +340,7 @@ pub fn create_session(user: &Pubkey, seq: u64) -> Instruction {
 }
 
 pub fn post_chunk(user: &Pubkey, seq: u64, index: u32, chunk: &str) -> Instruction {
-    ix(
-        vec![AccountMeta::s(*user), AccountMeta::w(session_pda(user, seq))],
-        Borsh::new(&IX_POST_CHUNK).u32(index).string(chunk).u8(0).u8(0).0,
-    )
+    ix(vec![AccountMeta::s(*user), AccountMeta::w(session_pda(user, seq))], Borsh::new(&IX_POST_CHUNK).u32(index).string(chunk).u8(0).u8(0).0)
 }
 
 /// `db_code_in` for data that went out in chunks (or inline, like
@@ -417,7 +409,8 @@ fn finish_session(b: Borsh, path: &ChunkPath) -> Borsh {
 
 /// Metadata for data sent in chunks: everything but the data itself.
 pub fn chunked_metadata(filetype: &str, filename: &str, total_chunks: usize) -> String {
-    json::obj(vec![("filetype", json::s(filetype)), ("method", json::n(0)), ("filename", json::s(filename)), ("total_chunks", json::n(total_chunks))]).to_string()
+    json::obj(vec![("filetype", json::s(filetype)), ("method", json::n(0)), ("filename", json::s(filename)), ("total_chunks", json::n(total_chunks))])
+        .to_string()
 }
 
 /// `send_code` arguments (code, before_tx) from a transaction.
@@ -601,16 +594,7 @@ pub fn decode_db_root(data: &[u8]) -> Option<DbRoot> {
     let ext_creators = r.vec_pk().unwrap_or_default();
     let _ = r.u64();
     let _ = r.u8();
-    Some(DbRoot {
-        creator,
-        table_seeds,
-        global_table_seeds,
-        id,
-        table_creators,
-        ext_creators,
-        used: r.i,
-        account_len: data.len(),
-    })
+    Some(DbRoot { creator, table_seeds, global_table_seeds, id, table_creators, ext_creators, used: r.i, account_len: data.len() })
 }
 
 /// If a new table hint of `hint_len` bytes won't fit in the DbRoot account
@@ -702,8 +686,7 @@ pub const FEATURE_PROGRAM_STR: &str = "Feature1111111111111111111111111111111111
 /// Whether a `getMultipleAccounts` entry for the feature gate says v1 is live
 /// (owned by the Feature program, `Option<u64>` activation slot is `Some`).
 pub fn v1_active(acc: &json::Json) -> bool {
-    acc.get("owner").str() == Some(FEATURE_PROGRAM_STR)
-        && crate::net::account_data(acc).map(|d| d.first() == Some(&1)).unwrap_or(false)
+    acc.get("owner").str() == Some(FEATURE_PROGRAM_STR) && crate::net::account_data(acc).map(|d| d.first() == Some(&1)).unwrap_or(false)
 }
 
 pub fn rent_exempt(bytes: usize) -> u64 {

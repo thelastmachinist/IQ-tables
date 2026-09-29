@@ -395,7 +395,10 @@ impl<'c> Engine<'c> {
                 if eval::is_aggregate_name(&c.name) {
                     return self.aggregate(c, sc);
                 }
-                if matches!(c.name.as_str(), "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "PERCENT_RANK" | "CUME_DIST") {
+                if matches!(
+                    c.name.as_str(),
+                    "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "PERCENT_RANK" | "CUME_DIST"
+                ) {
                     return Err(format!("{}() needs OVER (…)", c.name));
                 }
                 let mut args = vec![];
@@ -832,8 +835,16 @@ impl<'c> Engine<'c> {
         let mut rc = r.cols.clone();
         let mut using_pairs: Vec<(usize, usize)> = vec![];
         for u in using {
-            let li = l.cols.iter().position(|c| !c.hidden && c.name.eq_ignore_ascii_case(u)).ok_or_else(|| format!("USING ({}): the left side has no such column", u))?;
-            let ri = r.cols.iter().position(|c| !c.hidden && c.name.eq_ignore_ascii_case(u)).ok_or_else(|| format!("USING ({}): the right side has no such column", u))?;
+            let li = l
+                .cols
+                .iter()
+                .position(|c| !c.hidden && c.name.eq_ignore_ascii_case(u))
+                .ok_or_else(|| format!("USING ({}): the left side has no such column", u))?;
+            let ri = r
+                .cols
+                .iter()
+                .position(|c| !c.hidden && c.name.eq_ignore_ascii_case(u))
+                .ok_or_else(|| format!("USING ({}): the right side has no such column", u))?;
             rc[ri].hidden = true;
             using_pairs.push((li, ri));
         }
@@ -1009,7 +1020,8 @@ impl<'c> Engine<'c> {
             }
         }
         let exprs: Vec<&Expr> = plan.iter().filter_map(|p| p.as_ref().err().copied()).collect();
-        let grouped = !s.group.is_empty() || exprs.iter().any(|e| has_agg(e)) || s.having.as_ref().map(has_agg).unwrap_or(false) || order.iter().any(|o| has_agg(&o.e));
+        let grouped =
+            !s.group.is_empty() || exprs.iter().any(|e| has_agg(e)) || s.having.as_ref().map(has_agg).unwrap_or(false) || order.iter().any(|o| has_agg(&o.e));
         // candidates: (representative row, member rows)
         let mut cands: Vec<(Vec<Json>, Vec<usize>)> = vec![];
         if grouped {
@@ -1113,7 +1125,14 @@ impl<'c> Engine<'c> {
             let mut keys: Vec<Vec<Json>> = vec![];
             for (i, cand) in kept.iter().enumerate() {
                 let g = Group { rows: &rows, idx: &cand.1 };
-                let sc = Scope { cols, row: &cand.0, group: if grouped { Some(&g) } else { None }, aliases: Some((&labels, &projected[i])), win: Some((&win, i)), outer };
+                let sc = Scope {
+                    cols,
+                    row: &cand.0,
+                    group: if grouped { Some(&g) } else { None },
+                    aliases: Some((&labels, &projected[i])),
+                    win: Some((&win, i)),
+                    outer,
+                };
                 let mut k = vec![];
                 for o in order {
                     k.push(match &o.e {
@@ -1142,7 +1161,8 @@ impl<'c> Engine<'c> {
 
     fn rollup(&self, cands: Vec<(Vec<Json>, Vec<usize>)>, gkeys: &[Vec<Json>], group_exprs: &[Expr], cols: &[Col]) -> R<Vec<(Vec<Json>, Vec<usize>)>> {
         let n = group_exprs.len();
-        let simple: Vec<Option<usize>> = group_exprs.iter().map(|g| if let Expr::Col(t, c) = g { self.find(cols, t.as_deref(), c).ok().flatten() } else { None }).collect();
+        let simple: Vec<Option<usize>> =
+            group_exprs.iter().map(|g| if let Expr::Col(t, c) = g { self.find(cols, t.as_deref(), c).ok().flatten() } else { None }).collect();
         let mut out = vec![];
         let blank = |rep: &[Json], level: usize| -> Vec<Json> {
             let mut r = rep.to_vec();

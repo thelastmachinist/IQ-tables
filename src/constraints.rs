@@ -17,10 +17,19 @@ use crate::state::{DraftTable, GhostRow};
 #[derive(Clone, Debug)]
 pub enum Change {
     /// A new row; `given[c]` = the value for column c was supplied (else its default applies).
-    Insert { vals: Vec<Json>, given: Vec<bool> },
+    Insert {
+        vals: Vec<Json>,
+        given: Vec<bool>,
+    },
     /// New values for an existing row; `set[c]` = column c was assigned explicitly.
-    Update { row: SRow, vals: Vec<Json>, set: Vec<bool> },
-    Delete { row: SRow },
+    Update {
+        row: SRow,
+        vals: Vec<Json>,
+        set: Vec<bool>,
+    },
+    Delete {
+        row: SRow,
+    },
 }
 
 pub struct Opts {
@@ -184,12 +193,12 @@ impl App {
         if let Some(c) = ai_col {
             let mut mx = 0u64;
             for r in &rows {
-                if let Some(v) = r.vals.get(c).and_then(|v| eval::num(v)) {
+                if let Some(v) = r.vals.get(c).and_then(eval::num) {
                     if v > 0.0 {
                         mx = mx.max(v as u64);
                     }
                 }
-                if let Some(v) = r.base.as_ref().and_then(|b| b.get(c)).and_then(|v| eval::num(v)) {
+                if let Some(v) = r.base.as_ref().and_then(|b| b.get(c)).and_then(eval::num) {
                     if v > 0.0 {
                         mx = mx.max(v as u64);
                     }
@@ -333,7 +342,12 @@ impl App {
                 for v in live.values() {
                     if let Some(k) = key_of(v, local) {
                         if !have.contains(&k) {
-                            return Err(format!("{} refers to a {} that doesn't exist (link {})", show_row_id(&tb, v), local.iter().map(|&c| tb.columns[c].clone()).collect::<Vec<_>>().join(","), fk.name));
+                            return Err(format!(
+                                "{} refers to a {} that doesn't exist (link {})",
+                                show_row_id(&tb, v),
+                                local.iter().map(|&c| tb.columns[c].clone()).collect::<Vec<_>>().join(","),
+                                fk.name
+                            ));
                         }
                     }
                 }
@@ -383,7 +397,14 @@ impl App {
         Ok(())
     }
 
-    fn fk_rules(&self, tb: &DraftTable, vals: &[Json], fk_sets: &[(usize, Vec<usize>, HashSet<String>, String)], _live: &HashMap<usize, Vec<Json>>, _new: &[Vec<Json>]) -> Result<(), String> {
+    fn fk_rules(
+        &self,
+        tb: &DraftTable,
+        vals: &[Json],
+        fk_sets: &[(usize, Vec<usize>, HashSet<String>, String)],
+        _live: &HashMap<usize, Vec<Json>>,
+        _new: &[Vec<Json>],
+    ) -> Result<(), String> {
         for (fi, local, allowed, label) in fk_sets {
             if tb.keys.fks[*fi].table == tb.name {
                 continue; // checked after the batch
@@ -391,7 +412,13 @@ impl App {
             if let Some(k) = key_of(vals, local) {
                 if !allowed.contains(&k) {
                     let v: Vec<String> = local.iter().map(|&c| vals[c].cell_text()).collect();
-                    return Err(format!("“{}” isn't in {} — {} must match an existing row there (link {})", v.join(", "), label, local.iter().map(|&c| tb.columns[c].clone()).collect::<Vec<_>>().join(","), tb.keys.fks[*fi].name));
+                    return Err(format!(
+                        "“{}” isn't in {} — {} must match an existing row there (link {})",
+                        v.join(", "),
+                        label,
+                        local.iter().map(|&c| tb.columns[c].clone()).collect::<Vec<_>>().join(","),
+                        tb.keys.fks[*fi].name
+                    ));
                 }
             }
         }
@@ -399,7 +426,15 @@ impl App {
     }
 
     /// ON DELETE / ON UPDATE for other tables' foreign keys that point at `tb`.
-    fn referencing_actions(&mut self, key: &str, tb: &DraftTable, deleted: &[Vec<Json>], changed: &[(Vec<Json>, Vec<Json>)], o: &Opts, applied: &mut Applied) -> Result<(), String> {
+    fn referencing_actions(
+        &mut self,
+        key: &str,
+        tb: &DraftTable,
+        deleted: &[Vec<Json>],
+        changed: &[(Vec<Json>, Vec<Json>)],
+        o: &Opts,
+        applied: &mut Applied,
+    ) -> Result<(), String> {
         let di = self.draft_idx(key).ok_or("No such database")?;
         let nt = self.drafts[di].tables.len();
         for ct in 0..nt {

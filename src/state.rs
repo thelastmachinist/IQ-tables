@@ -25,10 +25,19 @@ pub struct Settings {
     pub upload_speed: String,
 }
 
+/// Default RPCs: ones that answer requests from web pages. Solana's own
+/// mainnet endpoint refuses browsers; PublicNode's free one takes writes,
+/// balances and account reads (not the full history "Solana directly"
+/// reading needs — that takes an RPC such as Helius).
+pub const RPC_MAINNET: &str = "https://solana-rpc.publicnode.com";
+pub const RPC_DEVNET: &str = "https://api.devnet.solana.com";
+/// Solana's own mainnet endpoint, the default of earlier versions.
+const RPC_MAINNET_OLD: &str = "https://api.mainnet-beta.solana.com";
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            rpc: "https://api.mainnet-beta.solana.com".into(),
+            rpc: RPC_MAINNET.into(),
             gateway: "https://gateway.iqlabs.dev".into(),
             cluster: "mainnet".into(),
             tx_format: TxFormat::Auto,
@@ -63,7 +72,7 @@ impl Settings {
     pub fn from_json(v: &Json) -> Self {
         let d = Settings::default();
         Settings {
-            rpc: v.get("rpc").str().filter(|s| !s.is_empty()).map(String::from).unwrap_or(d.rpc),
+            rpc: v.get("rpc").str().filter(|s| !s.is_empty() && *s != RPC_MAINNET_OLD).map(String::from).unwrap_or(d.rpc),
             gateway: v.get("gateway").str().filter(|s| !s.is_empty()).map(String::from).unwrap_or(d.gateway),
             cluster: v.get("cluster").str().map(String::from).unwrap_or(d.cluster),
             tx_format: match v.get("tx").str() {
@@ -191,7 +200,8 @@ impl DraftTable {
     /// A rename or a change of writers waits to be saved.
     pub fn meta_changed(&self, db_wallet: Option<&str>) -> bool {
         self.created.is_some()
-            && (self.chain_title.as_ref().map(|t| *t != self.title).unwrap_or(false) || self.chain_writers.as_ref().map(|w| *w != self.desired_writers(db_wallet)).unwrap_or(false))
+            && (self.chain_title.as_ref().map(|t| *t != self.title).unwrap_or(false)
+                || self.chain_writers.as_ref().map(|w| *w != self.desired_writers(db_wallet)).unwrap_or(false))
     }
     /// Before changing the name or writers of a saved table, remember what the chain has.
     pub fn remember_chain_meta(&mut self, db_wallet: Option<&str>) {
@@ -246,7 +256,8 @@ impl DraftTable {
         let new_keys: Vec<String> = d.cols.iter().map(|(_, m)| m.key.clone()).collect();
         if old_keys != new_keys {
             for r in self.rows.iter_mut() {
-                let vals: Vec<Json> = new_keys.iter().map(|k| old_keys.iter().position(|o| o == k).and_then(|p| r.vals.get(p).cloned()).unwrap_or(Json::Null)).collect();
+                let vals: Vec<Json> =
+                    new_keys.iter().map(|k| old_keys.iter().position(|o| o == k).and_then(|p| r.vals.get(p).cloned()).unwrap_or(Json::Null)).collect();
                 r.vals = vals;
             }
         }
@@ -414,11 +425,7 @@ pub fn drafts_from_json(v: &Json) -> Vec<Draft> {
                             .get("rows")
                             .arr()
                             .iter()
-                            .map(|r| GhostRow {
-                                vals: r.get("v").arr().to_vec(),
-                                deleted: r.get("d").bool().unwrap_or(false),
-                                sig: ostr(r.get("s")),
-                            })
+                            .map(|r| GhostRow { vals: r.get("v").arr().to_vec(), deleted: r.get("d").bool().unwrap_or(false), sig: ostr(r.get("s")) })
                             .collect(),
                         chain_doc: ostr(t.get("chainDoc")),
                         chain_title: ostr(t.get("chainTitle")),

@@ -80,6 +80,7 @@ pub fn commits_pda(owner: &str, repo: &str) -> String {
 /// look-alike table elsewhere isn't mistaken for the repository.
 pub fn repo_of(pda: &str, name: &str) -> Option<(String, String)> {
     let (owner, repo) = name.strip_prefix("git_commits:")?.split_once(':')?;
+    crate::solana::parse_pk(owner)?;
     (commits_pda(owner, repo) == pda).then(|| (owner.to_string(), repo.to_string()))
 }
 
@@ -101,7 +102,7 @@ pub fn parse_commits(rows: &[Json], owner: &str) -> Vec<Commit> {
             })
         })
         .collect();
-    v.sort_by(|a, b| b.time_ms.cmp(&a.time_ms));
+    v.sort_by_key(|c| std::cmp::Reverse(c.time_ms));
     v
 }
 
@@ -284,7 +285,12 @@ pub fn pinned_link(repo: &str, c: &Commit) -> String {
 pub fn tree_html(files: &[(String, String)], h: &mut String) {
     h.push_str(&format!("<p class=\"small\"><span class=\"pill\">IQ git</span> a commit's files ({})</p><ul class=\"files\">", files.len()));
     for (path, tx) in files {
-        h.push_str(&format!("<li><button class=\"link file\" data-a=\"open-tx\" data-arg=\"{}\" data-val=\"{}\">📄 {}</button></li>", esc(tx), esc(path), esc(path)));
+        h.push_str(&format!(
+            "<li><button class=\"link file\" data-a=\"open-tx\" data-arg=\"{}\" data-val=\"{}\">📄 {}</button></li>",
+            esc(tx),
+            esc(path),
+            esc(path)
+        ));
     }
     h.push_str("</ul>");
 }
@@ -376,7 +382,8 @@ impl App {
                 if let Some(Load::Ready(Some(r))) = self.git.repos.get_mut(&pda) {
                     r.busy = false;
                     r.at = host::now_ms();
-                    let got = if http_ok { json::parse(&text).map(|v| parse_commits(v.get("rows").arr(), &r.owner)) } else { Err(fetch_err(ok, status, &text)) };
+                    let got =
+                        if http_ok { json::parse(&text).map(|v| parse_commits(v.get("rows").arr(), &r.owner)) } else { Err(fetch_err(ok, status, &text)) };
                     match got {
                         Ok(v) => r.commits = Load::Ready(v),
                         // keep what was shown if a refresh fails

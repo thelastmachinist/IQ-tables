@@ -75,7 +75,7 @@ impl Qr {
             return vec![];
         }
         let na = ver / 7 + 2;
-        let step = ((ver * 4 + 4) + (na * 2 - 2) - 1) / (na * 2 - 2) * 2;
+        let step = (ver * 4 + 4).div_ceil(na * 2 - 2) * 2;
         let mut res = vec![6];
         let mut pos = self.size - 7;
         let mut rest = vec![];
@@ -109,7 +109,8 @@ impl Qr {
         let n = pos.len();
         for i in 0..n {
             for j in 0..n {
-                if (i == 0 && j == 0) || (i == 0 && j == n - 1) || (i == n - 1 && j == 0) {
+                // the three corners hold finder patterns, not alignment patterns
+                if (i == 0 && (j == 0 || j == n - 1)) || (i == n - 1 && j == 0) {
                     continue;
                 }
                 for dy in -2i32..=2 {
@@ -137,7 +138,7 @@ impl Qr {
     }
 
     fn format_bits(&mut self, mask: u32) {
-        let data = (0u32 << 3) | mask; // level M = 0b00
+        let data = mask; // error-correction level M is 0b00, so only the mask bits are set
         let mut rem = data;
         for _ in 0..10 {
             rem = (rem << 1) ^ ((rem >> 9) * 0x537);
@@ -289,7 +290,7 @@ pub fn encode(text: &str) -> Option<Vec<Vec<bool>>> {
     }
     let term = (cap * 8 - bits.len()).min(4);
     push(0, term, &mut bits);
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push(false);
     }
     let mut data: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b as u8)).collect();

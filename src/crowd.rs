@@ -22,6 +22,9 @@ use crate::ui::{self, esc};
 pub const SMALL_PIECE: u64 = 1 << 20;
 pub const BIG_PIECE: u64 = 4 << 20;
 pub const MAX_SIZE: u64 = 8 << 30;
+/// Piece sizes a manifest may use (IQ Tables makes 1 MB and 4 MB ones).
+const MIN_PIECE: u64 = 64 << 10;
+const MAX_PIECE: u64 = 8 << 20;
 
 /// Pieces of 1 MB for files up to 16 MB (so even small files have several
 /// pieces to share out), 4 MB above that (fewer uploads, so fewer IQ fees).
@@ -82,10 +85,13 @@ impl Manifest {
             sha256: v.get("sha256").str()?.to_ascii_lowercase(),
             piece: v.get("piece").u64().filter(|p| *p > 0)?,
             hashes: v.get("hashes").arr().iter().filter_map(|h| h.str().map(|s| s.to_ascii_lowercase())).collect(),
-            source: v.get("source").str_or(""),
+            // only a web address is ever used as a source
+            source: v.get("source").str().filter(|u| u.starts_with("https://") || u.starts_with("http://")).unwrap_or("").to_string(),
             note: v.get("note").str_or(""),
         };
-        let ok = m.size > 0 && is_hash(&m.sha256) && m.hashes.len() as u64 == m.size.div_ceil(m.piece) && m.hashes.iter().all(|h| is_hash(h));
+        // pieces a browser can hold (a manifest is anyone's JSON)
+        let sane = (MIN_PIECE..=MAX_PIECE).contains(&m.piece) && m.size <= MAX_SIZE;
+        let ok = sane && m.size > 0 && is_hash(&m.sha256) && m.hashes.len() as u64 == m.size.div_ceil(m.piece) && m.hashes.iter().all(|h| is_hash(h));
         ok.then_some(m)
     }
 
@@ -153,7 +159,11 @@ pub fn scan(packs: &[SourcePack], official: &dyn Fn(&str) -> bool) -> Option<Sca
         let pos = |k: &str| p.schema.cols.iter().position(|c| c == k);
         let (Some(pi), Some(ph), Some(pt)) = (pos("piece"), pos("sha256"), pos("tx")) else { continue };
         for r in p.recs.iter().filter(|r| !r.deleted) {
-            let (Some(piece), Some(sha), Some(tx)) = (r.vals.get(pi).and_then(|v| v.u64()), r.vals.get(ph).and_then(|v| v.str()), r.vals.get(pt).and_then(|v| v.str())) else { continue };
+            let (Some(piece), Some(sha), Some(tx)) =
+                (r.vals.get(pi).and_then(|v| v.u64()), r.vals.get(ph).and_then(|v| v.str()), r.vals.get(pt).and_then(|v| v.str()))
+            else {
+                continue;
+            };
             regs.push(Reg { piece: piece as usize, sha256: sha.to_ascii_lowercase(), tx: tx.to_string(), signer: p.signer.clone(), time: p.time });
         }
     }
@@ -263,6 +273,10 @@ pub struct Dl {
     bid: u32,
     whole: Option<Sha256>,
     pub skipped: usize,
+    /// Attempts at reading the current copy (network hiccups are retried).
+    tries: u32,
+    /// A copy of the current piece couldn't be read at all.
+    unreadable: Option<String>,
     pub err: Option<String>,
     pub done: bool,
 }
@@ -295,9 +309,13 @@ fn safe_table_name(file: &str) -> String {
 }
 
 impl App {
-    /// The crowdfunded view of the open explorer table, if it is one.
+    /// The crowdfunded view of the open explorer table, if it is one — only
+    /// once its whole history is read, since the first manifest is what counts.
     pub fn crowd_scan(&self) -> Option<Scan> {
         let tv = self.table.as_ref()?;
+        if !tv.done || tv.cut {
+            return None;
+        }
         let creator = tv.creator.clone()?;
         let packs: Vec<SourcePack> = tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
         scan(&packs, &|s| s == creator)
@@ -314,7 +332,12 @@ impl App {
                 if let Some(f) = self.crowd_file(val) {
                     let want = self.crowd_scan().map(|s| s.manifest.size);
                     if want.is_some() && want != Some(f.size) {
-                        self.err(format!("{} is {}, but the file being uploaded is {} — it isn't the same file.", f.name, ui::bytes(f.size as usize), ui::bytes(want.unwrap_or(0) as usize)));
+                        self.err(format!(
+                            "{} is {}, but the file being uploaded is {} — it isn't the same file.",
+                            f.name,
+                            ui::bytes(f.size),
+                            ui::bytes(want.unwrap_or(0))
+                        ));
                     } else {
                         self.ok(format!("Using {} — each piece is checked against its fingerprint before it's uploaded.", f.name));
                     }
@@ -344,7 +367,12 @@ impl App {
 
     fn crowd_file(&mut self, val: &str) -> Option<LocalFile> {
         let v = json::parse(val).ok()?;
-        let f = LocalFile { fid: v.get("fid").u64()? as u32, name: v.get("name").str_or("file"), size: v.get("size").u64()?, ftype: v.get("type").str_or("application/octet-stream") };
+        let f = LocalFile {
+            fid: v.get("fid").u64()? as u32,
+            name: v.get("name").str_or("file"),
+            size: v.get("size").u64()?,
+            ftype: v.get("type").str_or("application/octet-stream"),
+        };
         self.crowd.files.retain(|x| !(x.size == f.size && x.name == f.name));
         self.crowd.files.push(f.clone());
         Some(f)
@@ -355,7 +383,7 @@ impl App {
     fn crowd_new(&mut self, key: &str, val: &str) {
         let Some(f) = self.crowd_file(val) else { return self.err("Couldn't open that file") };
         if f.size == 0 || f.size > MAX_SIZE {
-            return self.err(format!("Files from 1 byte to {} can be crowdfunded here.", ui::bytes(MAX_SIZE as usize)));
+            return self.err(format!("Files from 1 byte to {} can be crowdfunded here.", ui::bytes(MAX_SIZE)));
         }
         if self.crowd.prep.as_ref().map(|p| !p.done() && p.err.is_none()).unwrap_or(false) {
             return self.err("Still fingerprinting the other file — wait for it or cancel it first.");
@@ -410,7 +438,7 @@ impl App {
         let mut tb = crate::state::DraftTable::typed(&name, cols, 0);
         tb.open = true;
         tb.compress = false;
-        tb.keys.comment = format!("Crowdfunded upload of {} ({})", m.name, ui::bytes(m.size as usize));
+        tb.keys.comment = format!("Crowdfunded upload of {} ({})", m.name, ui::bytes(m.size));
         tb.crowd = Some(m.to_json());
         self.drafts[di].tables.push(tb);
         let t = self.drafts[di].tables.len() - 1;
@@ -459,14 +487,23 @@ impl App {
             let r = u32::from_le_bytes([rnd[i * 4], rnd[i * 4 + 1], rnd[i * 4 + 2], rnd[i * 4 + 3]]) as usize % (i + 1);
             missing.swap(i, r);
         }
-        let want = match self.form.get("crowd:count").map(|s| s.as_str()) {
-            Some("all") => missing.len(),
-            Some(n) => n.parse::<usize>().unwrap_or(1).max(1),
-            None => 1,
-        };
+        let (_, want) = pick_count(self.form.get("crowd:count").map(|s| s.as_str()), missing.len());
         missing.truncate(want);
         let total = missing.len();
-        self.crowd.work = Some(Work { pda, manifest: m, db_id, table, src, queue: missing.into_iter().collect(), total, done: 0, current: None, err: None, stop: false, finished: false });
+        self.crowd.work = Some(Work {
+            pda,
+            manifest: m,
+            db_id,
+            table,
+            src,
+            queue: missing.into_iter().collect(),
+            total,
+            done: 0,
+            current: None,
+            err: None,
+            stop: false,
+            finished: false,
+        });
         if let Some(main) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) {
             self.fetch_balance(&main);
         }
@@ -540,7 +577,20 @@ impl App {
             host::blob_drop(old.bid);
         }
         let bid = self.nid();
-        self.crowd.dl = Some(Dl { pda, manifest: s.manifest, cands, i: 0, k: 0, bid, whole: Some(Sha256::new()), skipped: 0, err: None, done: false });
+        self.crowd.dl = Some(Dl {
+            pda,
+            manifest: s.manifest,
+            cands,
+            i: 0,
+            k: 0,
+            bid,
+            whole: Some(Sha256::new()),
+            skipped: 0,
+            tries: 0,
+            unreadable: None,
+            err: None,
+            done: false,
+        });
         self.crowd_dl_fetch();
     }
 
@@ -584,7 +634,12 @@ impl App {
                 let mut bytes = data;
                 if !ok || !(200..300).contains(&status) {
                     let e = if from_url {
-                        format!("Couldn't read piece {} from {}: {}. The server has to let browsers read it (CORS); otherwise choose the file from your computer.", i + 1, w.manifest.source, fetch_err(ok, status, &String::from_utf8_lossy(&bytes)))
+                        format!(
+                            "Couldn't read piece {} from {}: {}. The server has to let browsers read it (CORS); otherwise choose the file from your computer.",
+                            i + 1,
+                            w.manifest.source,
+                            fetch_err(ok, status, &String::from_utf8_lossy(&bytes))
+                        )
                     } else {
                         format!("Couldn't read piece {} of your file: {}", i + 1, String::from_utf8_lossy(&bytes))
                     };
@@ -598,9 +653,17 @@ impl App {
                 let hash = sha256_hex(&bytes);
                 if bytes.len() as u64 != len || hash != w.manifest.hashes[i] {
                     let e = if from_url {
-                        format!("The file at {} doesn't match piece {}'s fingerprint — it's a different version. Nothing was uploaded.", w.manifest.source, i + 1)
+                        format!(
+                            "The file at {} doesn't match piece {}'s fingerprint — it's a different version. Nothing was uploaded.",
+                            w.manifest.source,
+                            i + 1
+                        )
                     } else {
-                        format!("Your file doesn't match piece {}'s fingerprint — it's a different version of {}. Nothing was uploaded.", i + 1, w.manifest.name)
+                        format!(
+                            "Your file doesn't match piece {}'s fingerprint — it's a different version of {}. Nothing was uploaded.",
+                            i + 1,
+                            w.manifest.name
+                        )
                     };
                     self.crowd_fail(e);
                     return true;
@@ -611,11 +674,13 @@ impl App {
                 let filename = format!("{} (piece {} of {})", name, i + 1, count);
                 self.attach_crowd_piece(wallet, filename, &bytes, piece);
             }
+            P::CrowdDlNext => self.crowd_dl_fetch(),
             P::CrowdDl(i, k) => {
                 let Some(d) = self.crowd.dl.as_ref().filter(|d| d.i == i && d.k == k && d.err.is_none()) else { return false };
                 let text = String::from_utf8_lossy(&data).into_owned();
                 let want = d.manifest.hashes[i].clone();
-                let got = if ok && (200..300).contains(&status) {
+                let read = ok && (200..300).contains(&status);
+                let got = if read {
                     json::parse(&text).ok().map(|v| match v.get("data") {
                         Json::Str(s) => base64_decode(s.trim()).unwrap_or_else(|| s.as_bytes().to_vec()),
                         _ => vec![],
@@ -625,6 +690,30 @@ impl App {
                 };
                 let good = got.filter(|b| sha256_hex(b) == want);
                 let d = self.crowd.dl.as_mut().unwrap();
+                if !read {
+                    // the gateway hiccuped: try the same copy again, then the next one
+                    d.tries += 1;
+                    if d.tries < 4 {
+                        let wait = 1000 * d.tries;
+                        self.timer(wait, P::CrowdDlNext);
+                        return false;
+                    }
+                    d.unreadable = Some(fetch_err(ok, status, &text));
+                    d.tries = 0;
+                    d.k += 1;
+                    if d.k >= d.cands[i].len() {
+                        let e = d.unreadable.clone().unwrap_or_default();
+                        self.crowd_dl_fail(format!(
+                            "Couldn't read piece {} from IQ's gateway ({}). Nothing was saved — try Download again in a moment.",
+                            i + 1,
+                            e
+                        ));
+                        return true;
+                    }
+                    self.crowd_dl_fetch();
+                    return true;
+                }
+                d.tries = 0;
                 match good {
                     Some(b) => {
                         host::blob_part(d.bid, &b);
@@ -633,6 +722,7 @@ impl App {
                         }
                         d.i += 1;
                         d.k = 0;
+                        d.unreadable = None;
                         if d.i == d.cands.len() {
                             let whole = hex32(d.whole.take().unwrap().finish());
                             if whole != d.manifest.sha256 {
@@ -659,7 +749,11 @@ impl App {
                             self.crowd.bad.push(bad_tx);
                         }
                         if exhausted {
-                            self.crowd_dl_fail(format!("No copy of piece {} on the blockchain matches its fingerprint, so it's shown as missing again — it can be uploaded from the file.", i + 1));
+                            let msg = match d.unreadable.clone() {
+                                Some(e) => format!("Piece {}: one copy couldn't be read ({}) and the others don't match its fingerprint. Nothing was saved — try Download again in a moment.", i + 1, e),
+                                None => format!("No copy of piece {} on the blockchain matches its fingerprint, so it's shown as missing again — it can be uploaded from the file.", i + 1),
+                            };
+                            self.crowd_dl_fail(msg);
                             return true;
                         }
                     }
@@ -676,8 +770,19 @@ impl App {
 
 /// The crowdfunding card on a table's page in the explorer.
 pub fn card(app: &App, h: &mut String) {
-    let Some(s) = app.crowd_scan() else { return };
     let Some(tv) = app.table.as_ref() else { return };
+    let Some(s) = app.crowd_scan() else {
+        let packs: Vec<&SourcePack> = tv.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).collect();
+        if !tv.done && looks_crowd(&packs) {
+            let note = if tv.rows.len() >= 20_000 && !tv.loading {
+                "This table has too many rows to read here, so its file description can't be checked."
+            } else {
+                "Reading the table's whole history (the file's description is its oldest record)…"
+            };
+            h.push_str(&format!("<section class=\"card crowd\"><h3>📦 Crowdfunded upload</h3><p class=\"small muted\">{}</p></section>", note));
+        }
+        return;
+    };
     let m = &s.manifest;
     let extra = app.crowd_extra(&tv.pda);
     let cands = s.candidates(&extra, &app.crowd.bad);
@@ -693,10 +798,10 @@ pub fn card(app: &App, h: &mut String) {
     }
     h.push_str(&format!(
         "<div class=\"kv\"><div><span>Size</span><span>{} in {} piece{} of {}</span></div><div><span>SHA-256</span><span class=\"mono small hash\">{}</span></div><div><span>Organizer</span><span>{}</span></div>{}</div>",
-        ui::bytes(m.size as usize),
+        ui::bytes(m.size),
         n,
         if n == 1 { "" } else { "s" },
-        ui::bytes(m.piece as usize),
+        ui::bytes(m.piece),
         esc(&m.sha256),
         crate::views_account::who(app, &s.organizer),
         if m.source.is_empty() { String::new() } else { format!("<div><span>Source</span><span><a href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\">{0}</a></span></div>", esc(&m.source)) }
@@ -734,9 +839,14 @@ pub fn card(app: &App, h: &mut String) {
     if let Some(w) = work {
         match (&w.err, w.finished) {
             (Some(e), _) => h.push_str(&format!("<p class=\"bad small\">{} <button class=\"link\" data-a=\"crowd-dismiss\">OK</button></p>", esc(e))),
-            (None, true) => h.push_str(&format!("<p class=\"ok small\">You uploaded {} piece{}. Thank you! <button class=\"link\" data-a=\"crowd-dismiss\">OK</button></p>", w.done, if w.done == 1 { "" } else { "s" })),
+            (None, true) => h.push_str(&format!(
+                "<p class=\"ok small\">You uploaded {} piece{}. Thank you! <button class=\"link\" data-a=\"crowd-dismiss\">OK</button></p>",
+                w.done,
+                if w.done == 1 { "" } else { "s" }
+            )),
             (None, false) => {
-                let st = app.attach_status.as_ref().filter(|(c, _)| c.starts_with("crowd:")).map(|(_, m)| m.clone()).unwrap_or_else(|| "Reading the piece…".into());
+                let st =
+                    app.attach_status.as_ref().filter(|(c, _)| c.starts_with("crowd:")).map(|(_, m)| m.clone()).unwrap_or_else(|| "Reading the piece…".into());
                 h.push_str(&format!(
                     "<p class=\"small\">Uploading piece {} ({} of {} done) — {}</p><div class=\"row\"><button class=\"btn\" data-a=\"crowd-stop\"{}>Stop after this piece</button></div>",
                     w.current.map(|c| (c + 1).to_string()).unwrap_or_default(),
@@ -753,11 +863,8 @@ pub fn card(app: &App, h: &mut String) {
         let missing = n - have;
         let per = piece_cost(m.piece.min(m.size), legacy);
         let all: u64 = (0..n).filter(|&i| cands[i].is_empty()).map(|i| piece_cost(m.range(i).1, legacy)).sum();
-        let count = app.form.get("crowd:count").cloned().unwrap_or_else(|| "1".into());
-        let chosen = match count.as_str() {
-            "all" => missing,
-            c => c.parse::<usize>().unwrap_or(1).min(missing),
-        };
+        let opts = count_options(missing);
+        let (count, chosen) = pick_count(app.form.get("crowd:count").map(|s| s.as_str()), missing);
         let file = app.crowd.files.iter().rev().find(|f| f.size == m.size);
         h.push_str("<h4>Help put it on the blockchain</h4>");
         h.push_str(&format!(
@@ -767,13 +874,6 @@ pub fn card(app: &App, h: &mut String) {
             if missing == 1 { "" } else { "s" },
             ui::sol(all)
         ));
-        let mut opts = vec![("1", "1 piece".to_string())];
-        for k in [5usize, 10, 50] {
-            if k < missing {
-                opts.push((["5", "10", "50"][[5, 10, 50].iter().position(|x| *x == k).unwrap()], format!("{} pieces", k)));
-            }
-        }
-        opts.push(("all", format!("all {} missing", missing)));
         h.push_str("<div class=\"row\"><label>Upload<select data-in=\"form\" data-arg=\"crowd:count\">");
         for (v, l) in &opts {
             h.push_str(&format!("<option value=\"{}\" {}>{}</option>", v, if *v == count.as_str() { "selected" } else { "" }, esc(l)));
@@ -805,6 +905,30 @@ pub fn card(app: &App, h: &mut String) {
     h.push_str("</section>");
 }
 
+/// How many missing pieces to upload: (option value, label) choices.
+fn count_options(missing: usize) -> Vec<(String, String)> {
+    let mut o = vec![];
+    if missing > 1 {
+        o.push(("1".to_string(), "1 piece".to_string()));
+    }
+    for k in [5usize, 10, 50] {
+        if k < missing {
+            o.push((k.to_string(), format!("{} pieces", k)));
+        }
+    }
+    o.push(("all".to_string(), if missing == 1 { "the missing piece".to_string() } else { format!("all {} missing", missing) }));
+    o
+}
+
+/// The chosen option (falling back to the first when the saved choice isn't
+/// offered any more) and how many pieces it means.
+pub fn pick_count(saved: Option<&str>, missing: usize) -> (String, usize) {
+    let opts = count_options(missing);
+    let v = saved.filter(|v| opts.iter().any(|(o, _)| o == v)).map(String::from).unwrap_or_else(|| opts[0].0.clone());
+    let n = if v == "all" { missing } else { v.parse::<usize>().unwrap_or(1).min(missing) };
+    (v, n)
+}
+
 /// The organizer's card in the Editor (a database's Structure tab).
 pub fn editor_card(app: &App, key: &str, h: &mut String) {
     h.push_str("<section class=\"card crowd\"><h3>Crowdfund a big file</h3><p class=\"small muted\">Put a big file on the blockchain together: you publish its fingerprints (one per piece), anyone can pay to upload pieces from their own balance, and everyone who downloads it gets exactly this file back — any piece that doesn't match is ignored. Only share files you have the right to share: nothing on the blockchain can be taken down.</p>");
@@ -814,29 +938,41 @@ pub fn editor_card(app: &App, key: &str, h: &mut String) {
     };
     let n = p.count();
     if let Some(e) = &p.err {
-        h.push_str(&format!("<p class=\"bad small\">{}</p><div class=\"row\"><button class=\"btn\" data-a=\"crowd-cancel\">OK</button></div></section>", esc(e)));
+        h.push_str(&format!(
+            "<p class=\"bad small\">{}</p><div class=\"row\"><button class=\"btn\" data-a=\"crowd-cancel\">OK</button></div></section>",
+            esc(e)
+        ));
         return;
     }
     if !p.done() {
         h.push_str(&format!(
             "<p class=\"small\">Fingerprinting {} ({})… {} of {} pieces.</p><div class=\"row\"><button class=\"btn\" data-a=\"crowd-cancel\">Cancel</button></div></section>",
             esc(&p.file.name),
-            ui::bytes(p.file.size as usize),
+            ui::bytes(p.file.size),
             p.hashes.len(),
             n
         ));
         return;
     }
     let legacy = app.settings.tx_format == crate::state::TxFormat::Legacy;
-    let m = Manifest { name: p.file.name.clone(), size: p.file.size, ftype: p.file.ftype.clone(), sha256: p.sha256.clone(), piece: p.piece, hashes: p.hashes.clone(), source: String::new(), note: String::new() };
+    let m = Manifest {
+        name: p.file.name.clone(),
+        size: p.file.size,
+        ftype: p.file.ftype.clone(),
+        sha256: p.sha256.clone(),
+        piece: p.piece,
+        hashes: p.hashes.clone(),
+        source: String::new(),
+        note: String::new(),
+    };
     let get = |k: &str| app.form.get(k).cloned().unwrap_or_default();
     h.push_str(&format!(
         "<p class=\"small\">Fingerprint ready: <b>{}</b>, {} in {} piece{} of {}. SHA-256 <span class=\"mono small hash\">{}</span></p><p class=\"small muted\">Uploading every piece costs about {} in all, paid by whoever uploads them. Publishing the fingerprints costs one write (more for very big files) plus the new table.</p>",
         esc(&p.file.name),
-        ui::bytes(p.file.size as usize),
+        ui::bytes(p.file.size),
         n,
         if n == 1 { "" } else { "s" },
-        ui::bytes(p.piece as usize),
+        ui::bytes(p.piece),
         esc(&p.sha256),
         ui::sol(total_cost(&m, legacy))
     ));

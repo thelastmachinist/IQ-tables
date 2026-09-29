@@ -375,7 +375,10 @@ pub fn set_id_column(tb: &mut DraftTable, base: &[BaseRec], c: usize) -> Result<
     let _ = has_saved_data(tb, base);
     // pending rows were matched to saved ones by the old ID: re-point them
     let old = tb.id_col;
-    let saved: HashMap<String, Json> = rows.iter().filter_map(|r| r.base.as_ref().map(|b| (b.get(old).map(|v| v.cell_text()).unwrap_or_default(), b.get(c).cloned().unwrap_or(Json::Null)))).collect();
+    let saved: HashMap<String, Json> = rows
+        .iter()
+        .filter_map(|r| r.base.as_ref().map(|b| (b.get(old).map(|v| v.cell_text()).unwrap_or_default(), b.get(c).cloned().unwrap_or(Json::Null))))
+        .collect();
     for g in tb.rows.iter_mut().filter(|g| g.sig.is_none() && g.deleted) {
         let k = g.vals.get(old).map(|v| v.cell_text()).unwrap_or_default();
         if let Some(v) = saved.get(&k) {

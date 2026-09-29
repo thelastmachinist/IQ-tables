@@ -71,7 +71,20 @@ fn header(app: &App, h: &mut String) {
     va::account_button(app, h);
     h.push_str("</header>");
     if app.settings.cluster == "devnet" {
-        h.push_str(if app.use_rpc() { "<div class=\"devnet\">Devnet — test SOL only · reading straight from Solana</div>" } else { "<div class=\"devnet\">Devnet — test SOL only</div>" });
+        h.push_str(if app.use_rpc() {
+            "<div class=\"devnet\">Devnet — test SOL only · reading straight from Solana</div>"
+        } else {
+            "<div class=\"devnet\">Devnet — test SOL only</div>"
+        });
+    }
+    // Settings live in browser storage that other sites on the same domain
+    // can change: say so whenever the gateway isn't IQ's own.
+    let official = [crate::app::MAIN_GATEWAY, crate::app::DEV_GATEWAY];
+    if !official.contains(&app.settings.gateway.trim_end_matches('/')) {
+        h.push_str(&format!(
+            "<div class=\"devnet custom\">Tables are being read from a custom gateway, <b>{}</b> — not IQ's own. <a href=\"#/settings\">Settings</a></div>",
+            esc(&app.settings.gateway)
+        ));
     }
 }
 
@@ -85,8 +98,18 @@ pub fn link_html(app: &App, raw: &str) -> Option<String> {
     if s.is_empty() || s.len() > 400 || s.contains(char::is_whitespace) || s.contains('<') || s.contains('"') {
         return None;
     }
-    let ext = |href: &str, label: &str| Some(format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"{}\">↗ {}</a>", esc(href), esc(s), esc(label)));
-    let tx = |sig: &str, label: &str| Some(format!("<button class=\"link file\" data-a=\"open-tx\" data-arg=\"{}\" data-val=\"{}\" title=\"{}\">📎 {}</button>", esc(sig), esc(label), esc(s), esc(label)));
+    let ext = |href: &str, label: &str| {
+        Some(format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"{}\">↗ {}</a>", esc(href), esc(s), esc(label)))
+    };
+    let tx = |sig: &str, label: &str| {
+        Some(format!(
+            "<button class=\"link file\" data-a=\"open-tx\" data-arg=\"{}\" data-val=\"{}\" title=\"{}\">📎 {}</button>",
+            esc(sig),
+            esc(label),
+            esc(s),
+            esc(label)
+        ))
+    };
     if let Some((sig, name)) = attach::parse_tx_link(s) {
         let label = if name.is_empty() { format!("tx {}", solana::short(&sig)) } else { name };
         return tx(&sig, &label);
@@ -112,7 +135,8 @@ pub fn link_html(app: &App, raw: &str) -> Option<String> {
     }
     if let Some(pda) = s.strip_prefix("iq://db/") {
         parse_pk(pda)?;
-        let label = app.dbroots.ready().and_then(|rs| rs.iter().find(|r| r.pda == pda)).map(|r| r.name()).unwrap_or_else(|| format!("database {}", solana::short(pda)));
+        let label =
+            app.dbroots.ready().and_then(|rs| rs.iter().find(|r| r.pda == pda)).map(|r| r.name()).unwrap_or_else(|| format!("database {}", solana::short(pda)));
         return Some(format!("<a href=\"#/db/{}\" title=\"{}\">↗ {}</a>", esc(pda), esc(s), esc(&label)));
     }
     if let Some(pda) = crate::git::browser_pda(s) {
@@ -126,7 +150,10 @@ pub fn link_html(app: &App, raw: &str) -> Option<String> {
         return ext(s, &shown);
     }
     let lower = s.to_ascii_lowercase();
-    if lower.ends_with(".sol") && lower.len() > 4 && lower[..lower.len() - 4].split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')) {
+    if lower.ends_with(".sol")
+        && lower.len() > 4
+        && lower[..lower.len() - 4].split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+    {
         return ext(&format!("https://browser.iqlabs.dev/{}", lower), &lower);
     }
     match base58::decode(s).map(|b| b.len()) {
@@ -194,7 +221,10 @@ fn viewer(app: &App, h: &mut String) {
         Load::Ready(x) if x.filename != "iqgit-tree" => x.filename.clone(),
         _ => v.label.clone(),
     };
-    h.push_str(&format!("<div class=\"tablehead\"><h3 class=\"grow\">📎 {}</h3><button class=\"x\" data-a=\"viewer-close\" aria-label=\"Close\">×</button></div>", esc(&title)));
+    h.push_str(&format!(
+        "<div class=\"tablehead\"><h3 class=\"grow\">📎 {}</h3><button class=\"x\" data-a=\"viewer-close\" aria-label=\"Close\">×</button></div>",
+        esc(&title)
+    ));
     match &v.state {
         Load::Ready(x) => {
             let size = x.bytes.as_ref().map(|b| b.len()).or_else(|| x.text.as_ref().map(|t| t.len())).unwrap_or(0);
@@ -215,8 +245,17 @@ fn viewer(app: &App, h: &mut String) {
             }
             let img = attach::inline_image(&x.filetype);
             match (&x.bytes, &x.text) {
-                (Some(b), _) if img => h.push_str(&format!("<img class=\"preview\" alt=\"{}\" src=\"data:{};base64,{}\">", esc(&x.filename), esc(&x.filetype.to_ascii_lowercase()), base64_encode(b))),
-                (_, Some(t)) if img => h.push_str(&format!("<img class=\"preview\" alt=\"{}\" src=\"data:image/svg+xml;base64,{}\">", esc(&x.filename), base64_encode(t.as_bytes()))),
+                (Some(b), _) if img => h.push_str(&format!(
+                    "<img class=\"preview\" alt=\"{}\" src=\"data:{};base64,{}\">",
+                    esc(&x.filename),
+                    esc(&x.filetype.to_ascii_lowercase()),
+                    base64_encode(b)
+                )),
+                (_, Some(t)) if img => h.push_str(&format!(
+                    "<img class=\"preview\" alt=\"{}\" src=\"data:image/svg+xml;base64,{}\">",
+                    esc(&x.filename),
+                    base64_encode(t.as_bytes())
+                )),
                 (_, Some(t)) if x.filename == "iqgit-tree" && crate::git::parse_tree(t).is_some() => {
                     crate::git::tree_html(&crate::git::parse_tree(t).unwrap_or_default(), h);
                 }
@@ -225,7 +264,11 @@ fn viewer(app: &App, h: &mut String) {
                     let parsed = crate::json::parse(t).ok();
                     match parsed.as_ref().and_then(crate::app::decode_row) {
                         Some(Ok(p)) => {
-                            h.push_str(&format!("<p class=\"small\"><span class=\"pill iqt\">IQT pack</span> {} record(s), columns {}</p>", p.recs.len(), esc(&p.schema.cols.join(", "))));
+                            h.push_str(&format!(
+                                "<p class=\"small\"><span class=\"pill iqt\">IQT pack</span> {} record(s), columns {}</p>",
+                                p.recs.len(),
+                                esc(&p.schema.cols.join(", "))
+                            ));
                             let recs: Vec<Json> = p
                                 .recs
                                 .iter()
@@ -247,7 +290,11 @@ fn viewer(app: &App, h: &mut String) {
             } else {
                 h.push_str("<div class=\"row\">");
             }
-            h.push_str(&format!("<button class=\"btn\" data-a=\"copy\" data-arg=\"iq://tx/{}#{}\">Copy link</button></div>", esc(&v.sig), esc(&crate::app::pct_encode(&x.filename))));
+            h.push_str(&format!(
+                "<button class=\"btn\" data-a=\"copy\" data-arg=\"iq://tx/{}#{}\">Copy link</button></div>",
+                esc(&v.sig),
+                esc(&crate::app::pct_encode(&x.filename))
+            ));
         }
         Load::Err(e) => h.push_str(&format!("<div class=\"card bad\">{}</div>", esc(e))),
         _ => h.push_str("<div class=\"loading\">Reading the inscription…</div>"),
@@ -292,7 +339,11 @@ fn databases(app: &App, h: &mut String) {
                     if mine.contains(&r.creator) { " <span class=\"pill off\">yours</span>" } else { "" },
                     r.tables.len(),
                     va::who(app, &r.creator),
-                    if r.table_creators.is_empty() { "<span class=\"muted\">anyone</span>".to_string() } else { format!("{} wallet(s)", r.table_creators.len()) }
+                    if r.table_creators.is_empty() {
+                        "<span class=\"muted\">anyone</span>".to_string()
+                    } else {
+                        format!("{} wallet(s)", r.table_creators.len())
+                    }
                 ));
             }
             h.push_str("</tbody></table></div>");
@@ -328,10 +379,16 @@ fn database(app: &App, pda: &str, h: &mut String) {
     ));
     h.push_str(&format!(
         "<div><span>Table creation</span><span>{}</span></div>",
-        if r.table_creators.is_empty() { "open to anyone".into() } else { format!("restricted to {}", r.table_creators.iter().map(|c| addr(c)).collect::<Vec<_>>().join(", ")) }
+        if r.table_creators.is_empty() {
+            "open to anyone".into()
+        } else {
+            format!("restricted to {}", r.table_creators.iter().map(|c| addr(c)).collect::<Vec<_>>().join(", "))
+        }
     ));
     h.push_str("</div>");
-    h.push_str("<h2>Tables</h2><div class=\"scroll\"><table class=\"grid\"><thead><tr><th>Table</th><th>Listing</th><th>Address</th><th></th></tr></thead><tbody>");
+    h.push_str(
+        "<h2>Tables</h2><div class=\"scroll\"><table class=\"grid\"><thead><tr><th>Table</th><th>Listing</th><th>Address</th><th></th></tr></thead><tbody>",
+    );
     for t in &r.tables {
         h.push_str(&format!(
             "<tr><td><a href=\"#/t/{}/{}\">{}</a></td><td>{}</td><td class=\"mono small\">{}</td><td><button class=\"link\" data-a=\"copy\" data-arg=\"iq://table/{}\">copy link</button></td></tr>",
@@ -364,7 +421,11 @@ fn search(app: &App, h: &mut String) {
         for r in roots {
             if r.name().to_lowercase().contains(&ql) {
                 n += 1;
-                h.push_str(&format!("<tr><td><span class=\"pill\">dbroot</span></td><td><a href=\"#/db/{}\">{}</a></td><td></td></tr>", esc(&r.pda), esc(&r.name())));
+                h.push_str(&format!(
+                    "<tr><td><span class=\"pill\">dbroot</span></td><td><a href=\"#/db/{}\">{}</a></td><td></td></tr>",
+                    esc(&r.pda),
+                    esc(&r.name())
+                ));
             }
             for t in &r.tables {
                 if net::label_of(t).to_lowercase().contains(&ql) {
@@ -586,7 +647,6 @@ pub fn view_rows(tv: &TableView) -> (Vec<String>, Vec<VRow>) {
     (cols, rows)
 }
 
-
 pub fn pretty(v: &Json, ind: usize) -> String {
     let pad = "  ".repeat(ind + 1);
     let end = "  ".repeat(ind);
@@ -613,11 +673,17 @@ fn table(app: &App, h: &mut String) {
     let title = meta_name.clone().or_else(|| tv.label.clone()).unwrap_or_else(|| solana::short(&tv.pda));
     let stored_as = tv.label.clone().filter(|l| Some(l) != meta_name.as_ref() && meta_name.is_some());
     match &tv.root {
-        Some(r) => h.push_str(&format!("<p class=\"crumbs\"><a href=\"#/\">Databases</a> › <a href=\"#/db/{}\">{}</a> › {}</p>", esc(r), esc(&dbname), esc(&title))),
+        Some(r) => {
+            h.push_str(&format!("<p class=\"crumbs\"><a href=\"#/\">Databases</a> › <a href=\"#/db/{}\">{}</a> › {}</p>", esc(r), esc(&dbname), esc(&title)))
+        }
         None => h.push_str(&format!("<p class=\"crumbs\"><a href=\"#/\">Databases</a> › {}</p>", esc(&title))),
     }
     let packed = is_packed_table(tv);
-    h.push_str(&format!("<h1>{}{}</h1>", esc(&title), if packed { " <span class=\"pill iqt\" title=\"Records are packed and compressed by IQ Tables\">IQT packed</span>" } else { "" }));
+    h.push_str(&format!(
+        "<h1>{}{}</h1>",
+        esc(&title),
+        if packed { " <span class=\"pill iqt\" title=\"Records are packed and compressed by IQ Tables\">IQT packed</span>" } else { "" }
+    ));
     h.push_str("<div class=\"kv\">");
     if let Some(l) = &stored_as {
         h.push_str(&format!("<div><span>Listed as</span><span class=\"mono small\">{}</span></div>", esc(l)));
@@ -684,13 +750,18 @@ fn table(app: &App, h: &mut String) {
             if tv.who == Who::All { "on" } else { "" }
         ));
     }
-    h.push_str(&format!("<input type=\"search\" id=\"tvq\" placeholder=\"Filter rows…\" value=\"{}\" data-live=\"tv-text\" aria-label=\"Filter rows\">", esc(&tv.text)));
+    h.push_str(&format!(
+        "<input type=\"search\" id=\"tvq\" placeholder=\"Filter rows…\" value=\"{}\" data-live=\"tv-text\" aria-label=\"Filter rows\">",
+        esc(&tv.text)
+    ));
     h.push_str("<span class=\"grow\"></span>");
     h.push_str(&format!(
         "<button class=\"btn\" data-a=\"tv-refresh\" title=\"{}\">Refresh</button>",
         if app.use_rpc() { "Read again from Solana" } else { "Reload from IQ's gateway, bypassing its cache" }
     ));
-    h.push_str("<button class=\"btn\" data-a=\"tv-export\" data-arg=\"csv\">CSV</button><button class=\"btn\" data-a=\"tv-export\" data-arg=\"json\">JSON</button>");
+    h.push_str(
+        "<button class=\"btn\" data-a=\"tv-export\" data-arg=\"csv\">CSV</button><button class=\"btn\" data-a=\"tv-export\" data-arg=\"json\">JSON</button>",
+    );
     if packed && tv.db_id.is_some() {
         h.push_str("<button class=\"btn primary\" data-a=\"tv-draft\" data-arg=\"\" title=\"Open this table in the Editor\">Edit</button>");
     }
@@ -718,7 +789,7 @@ fn table(app: &App, h: &mut String) {
         h.push_str(&format!("<div class=\"card bad\">{}</div>", esc(e)));
     }
     // grid
-    let pages = (rows.len() + PAGE - 1) / PAGE;
+    let pages = rows.len().div_ceil(PAGE);
     let page = tv.page.min(pages.saturating_sub(1));
     h.push_str("<div class=\"scroll\"><table class=\"grid data\"><thead><tr>");
     let arrow = |c: &str| match &tv.sort {
@@ -761,11 +832,8 @@ fn table(app: &App, h: &mut String) {
             h.push_str(&format!("<tr class=\"detail\"><td colspan=\"{}\">", cols.len() + 2));
             let obj = Json::Obj(cols.iter().cloned().zip(r.vals.iter().cloned()).filter(|(_, v)| !v.is_null()).collect());
             h.push_str(&format!("<pre>{}</pre>", esc(&pretty(&obj, 0))));
-            let links: Vec<String> = cols
-                .iter()
-                .zip(&r.vals)
-                .filter_map(|(c, v)| v.str().and_then(|s| link_html(app, s)).map(|l| format!("<b>{}</b>: {}", esc(c), l)))
-                .collect();
+            let links: Vec<String> =
+                cols.iter().zip(&r.vals).filter_map(|(c, v)| v.str().and_then(|s| link_html(app, s)).map(|l| format!("<b>{}</b>: {}", esc(c), l))).collect();
             if !links.is_empty() {
                 h.push_str(&format!("<p class=\"small\">Links — {}</p>", links.join(" · ")));
             }
@@ -819,16 +887,13 @@ fn settings(app: &App, h: &mut String) {
     let s = &app.settings;
     h.push_str("<h1>Settings</h1><div class=\"card formgrid\">");
     h.push_str(&format!(
-        "<label>Read tables from<select data-in=\"set\" data-arg=\"source\"><option value=\"gateway\" {}>IQ gateway — fast, cached, with search and files (mainnet)</option><option value=\"rpc\" {}>Solana directly — live, no cache (needs an RPC that allows getProgramAccounts)</option></select></label>",
+        "<label>Read tables from<select data-in=\"set\" data-arg=\"source\"><option value=\"gateway\" {}>IQ gateway — fast, cached, with search and files (mainnet)</option><option value=\"rpc\" {}>Solana directly — live, no cache (needs an RPC with full history, e.g. Helius)</option></select></label>",
         if s.source != "rpc" { "selected" } else { "" },
         if s.source == "rpc" { "selected" } else { "" }
     ));
+    h.push_str(&format!("<label>IQ gateway<input value=\"{}\" data-in=\"set\" data-arg=\"gateway\" spellcheck=\"false\"></label>", esc(&s.gateway)));
     h.push_str(&format!(
-        "<label>IQ gateway<input value=\"{}\" data-in=\"set\" data-arg=\"gateway\" spellcheck=\"false\"></label>",
-        esc(&s.gateway)
-    ));
-    h.push_str(&format!(
-        "<label>Solana RPC (writes, balances, direct reads)<input value=\"{}\" data-in=\"set\" data-arg=\"rpc\" spellcheck=\"false\"></label><p class=\"muted small\">The public endpoint is heavily rate-limited and may refuse browser requests. A free key from Helius, QuickNode or Triton works much better.</p>",
+        "<label>Solana RPC (writes, balances, direct reads)<input value=\"{}\" data-in=\"set\" data-arg=\"rpc\" spellcheck=\"false\"></label><p class=\"muted small\">The default is PublicNode's free endpoint, which accepts requests from web pages. For heavy use, or to read tables straight from Solana, a free key from Helius, QuickNode or Triton works better.</p>",
         esc(&s.rpc)
     ));
     h.push_str(&format!(
@@ -866,9 +931,11 @@ fn about(h: &mut String) {
 <h3>Packing and compression</h3>
 <p>Each on-chain row holds a <em>pack</em> of many records: <code>{"id": pack-id, "p": "IQT1z…"}</code>. Records are laid out column by column, compressed with a small context-mixing compressor (order 1–5 contexts, a match model and logistic mixing — tighter than gzip or brotli on small tables), then written with a 92-character alphabet that never needs escaping inside JSON. A pack fills one transaction (up to 3,400 bytes of metadata with v1 transactions), so a single 0.001 SOL write can carry hundreds of records. Packs carry their own column list, so tables can gain columns later. Newer records replace older ones with the same id; deletions are tombstone records. Uncompressed packs (<code>IQT1j</code>) are available when you want rows searchable by the gateway.</p>
 <h3>Accounts and wallets</h3>
-<p>Your account is one file holding all your wallets. Drop it anywhere on the page and every wallet in it is unlocked — no browser extension. New wallets are derived from the account's 32-byte master secret (<code>SHA-256("iq-tables/account/v1/wallet" ‖ master ‖ index)</code>), so a wallet made after your last save is found again on login. Keys from elsewhere (Solana CLI keypairs, base58 secret keys) can be imported and live in the file. The file is encrypted with the IQ SDK's <code>passwordEncrypt</code> scheme (PBKDF2-SHA256 × 250,000 → AES-256-GCM), so the SDK's <code>passwordDecrypt</code> can open it too. Each database can have its own wallet: it creates the database, so its address is the <em>official</em> signer and a public donation address. Rows written by anyone else show as <em>unofficial</em>.</p>
+<p>Your wallet is your account. Drop its key file anywhere on the page (a Solana key file like <code>id.json</code>) or paste the secret key — no browser extension, no name or email. The key stays in the tab's memory and every transaction is signed right there; nothing is stored, and closing the tab signs you out. No wallet yet? <em>Make a new wallet</em> downloads its key as a Solana key file. Extra wallets are derived from your key (<code>SHA-256("iq-tables/account/v1/wallet" ‖ master ‖ index)</code>, with the master itself from your key), so the same key always brings them back. Optionally, your keys can be downloaded as one file encrypted with the IQ SDK's <code>passwordEncrypt</code> scheme (PBKDF2-SHA256 × 250,000 → AES-256-GCM), which the SDK's <code>passwordDecrypt</code> opens too. A database belongs to the wallet that creates it: its address is the <em>official</em> signer and a public donation address. Rows written by anyone else show as <em>unofficial</em>.</p>
 <h3>Links and files</h3>
-<p>Cells can link anywhere: <code>iq://table/&lt;table&gt;/&lt;record&gt;</code> and <code>iq://db/&lt;database&gt;</code> open in the explorer, web links and <code>.sol</code> names open in a new tab (<code>.sol</code> through IQ's browser), and <code>iq://tx/&lt;signature&gt;</code> opens an inscription. Attaching a file inscribes it with <code>user_inventory_code_in</code>, exactly like the SDK's <code>codeIn</code> (text as text, binary as base64), and IQ's gateway serves it back at <code>/data</code>, <code>/img</code> and <code>/view</code>.</p>
+<p>Cells can link anywhere: <code>iq://table/&lt;table&gt;/&lt;record&gt;</code> and <code>iq://db/&lt;database&gt;</code> open in the explorer, web links and <code>.sol</code> names open in a new tab (<code>.sol</code> through IQ's browser), <code>iq://tx/&lt;signature&gt;</code> opens an inscription, and an IQ git repository's browser link shows the project's newest commit. Attaching a file inscribes it with <code>user_inventory_code_in</code>, exactly like the SDK's <code>codeIn</code> (text as text, binary as base64) — in parallel parts with IQ's chunked upload when it's bigger than one transaction — and IQ's gateway serves it back at <code>/data</code>, <code>/img</code> and <code>/view</code>.</p>
+<h3>Big files, together</h3>
+<p>A crowdfunded upload publishes a big file's fingerprints (a SHA-256 per piece) in a table anyone can add to. Anyone can upload pieces from their own balance; downloads check every piece and the whole file against the first fingerprints published, so it doesn't matter who uploaded what.</p>
 <h3>Written in Rust</h3>
 <p>Everything — SHA-2, Keccak, Ed25519, PBKDF2, AES-GCM, Base58, Solana transaction encoding (legacy and v1), the IQ program's instructions, JSON, compression, QR codes, the UI — is dependency-free Rust compiled to WebAssembly. A small JavaScript file only connects it to the page, the network and your files.</p>
 </div>"#);

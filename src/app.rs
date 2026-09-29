@@ -16,8 +16,6 @@ use crate::net::{self, DbRootInfo};
 use crate::pack;
 use crate::solana::{self, b58, parse_pk, Keypair};
 
-pub const K_ACCOUNT: &str = "iqtables:v1:account";
-pub const K_REMEMBER: &str = "iqtables:v1:remember";
 use crate::state::{self, Draft, DraftTable, GhostRow, Settings};
 use crate::ui;
 
@@ -108,25 +106,48 @@ pub enum P {
     Meta(String, u32),
     Rows(String, u32),
     RootInfo(String, u32),
-    NameCheck { draft: String, name: String },
+    NameCheck {
+        draft: String,
+        name: String,
+    },
     /// The Table account behind an editor table (its name and writers).
     BaseAcct(String),
     Balance(String),
-    Confirm { what: String, sig: String, since: f64, after: After },
-    ConfirmTick { what: String, sig: String, since: f64, after: After },
+    Confirm {
+        what: String,
+        sig: String,
+        since: f64,
+        after: After,
+    },
+    ConfirmTick {
+        what: String,
+        sig: String,
+        since: f64,
+        after: After,
+    },
     Run(RunOp),
     // accounts (accounts_flow.rs)
     Unlock,
-    CreateAccount,
     SetPass,
     Rescan(Vec<(u32, String)>),
     Balances(Vec<String>),
-    TransferHash { from: String, to: String, lamports: u64, after: After },
+    TransferHash {
+        from: String,
+        to: String,
+        lamports: u64,
+        after: After,
+    },
     TransferSent(After),
     Airdrop(String),
-    Passkey(bool),
-    Sns { name: String, lamports: u64 },
-    SaveCheck { key: String, need: u64, main: Option<String> },
+    Sns {
+        name: String,
+        lamports: u64,
+    },
+    SaveCheck {
+        key: String,
+        need: u64,
+        main: Option<String>,
+    },
     // direct chain reads (chain.rs)
     RpcRoots,
     RpcMeta(String, u32),
@@ -152,6 +173,8 @@ pub enum P {
     CrowdPiece(usize),
     /// A piece of a download: (piece, candidate).
     CrowdDl(usize, usize),
+    /// Read the current piece of the download again (after a pause).
+    CrowdDlNext,
     // IQ git links (git.rs)
     GitMeta(String),
     GitRows(String),
@@ -201,10 +224,6 @@ pub struct App {
     /// Blocking work in progress (e.g. "Unlocking…" while PBKDF2 runs).
     pub busy: Option<String>,
     pub account_menu: bool,
-    /// Imported keys not yet saved to the account file.
-    pub unsaved_keys: bool,
-    /// Keep the encrypted account file in this browser.
-    pub remember: bool,
     /// Files each account wallet inscribed (IQ gateway `/user/<wallet>/assets`).
     pub files: HashMap<String, Load<Vec<crate::attach::Asset>>>,
     /// A file being inscribed into a cell: ("key:table:row", status).
@@ -244,7 +263,7 @@ pub struct App {
 }
 
 thread_local! {
-    static APP: RefCell<Option<App>> = RefCell::new(None);
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
 const K_SETTINGS: &str = "iqtables:v1:settings";
@@ -260,6 +279,9 @@ pub extern "C" fn alloc(len: usize) -> *mut u8 {
     p
 }
 
+///
+/// # Safety
+/// Called only by `web/host.js` with memory from `alloc` (the page gives ownership back).
 #[no_mangle]
 pub unsafe extern "C" fn dealloc(p: *mut u8, len: usize) {
     drop(Vec::from_raw_parts(p, 0, len.max(1)));
@@ -276,14 +298,21 @@ unsafe fn owned_str(p: *mut u8, len: usize) -> String {
 #[no_mangle]
 pub extern "C" fn start() {
     APP.with(|a| {
-        let mut app = App::new();
-        app.auto_login();
-        *a.borrow_mut() = Some(app);
+        // nothing about accounts is kept in the browser any more
+        for k in crate::accounts_flow::LEGACY_FLAGS {
+            if host::storage_get(k).map(|v| !v.is_empty()).unwrap_or(false) {
+                host::storage_set(k, "");
+            }
+        }
+        *a.borrow_mut() = Some(App::new());
     });
 }
 
 /// Key presses from elements marked data-keys. Returns 1 when handled (the
 /// page then prevents the browser's default action).
+///
+/// # Safety
+/// Called only by `web/host.js` with memory from `alloc` (the page gives ownership back).
 #[no_mangle]
 pub unsafe extern "C" fn on_key(ap: *mut u8, al: usize, gp: *mut u8, gl: usize, kp: *mut u8, kl: usize, vp: *mut u8, vl: usize) -> u32 {
     let action = owned_str(ap, al);
@@ -305,6 +334,9 @@ pub unsafe extern "C" fn on_key(ap: *mut u8, al: usize, gp: *mut u8, gl: usize, 
     handled
 }
 
+///
+/// # Safety
+/// Called only by `web/host.js` with memory from `alloc` (the page gives ownership back).
 #[no_mangle]
 pub unsafe extern "C" fn on_event(kp: *mut u8, kl: usize, ap: *mut u8, al: usize, gp: *mut u8, gl: usize, vp: *mut u8, vl: usize) {
     let kind = owned_str(kp, kl);
@@ -314,6 +346,9 @@ pub unsafe extern "C" fn on_event(kp: *mut u8, kl: usize, ap: *mut u8, al: usize
     with_app(|app| app.event(&kind, &action, &arg, &val));
 }
 
+///
+/// # Safety
+/// Called only by `web/host.js` with memory from `alloc` (the page gives ownership back).
 #[no_mangle]
 pub unsafe extern "C" fn on_async(id: u32, ok: u32, status: u32, p: *mut u8, l: usize) {
     let data = owned(p, l);
@@ -334,16 +369,16 @@ fn with_app(f: impl FnOnce(&mut App) -> bool) {
 
 // ---------------------------------------------------------------------- app
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
-        let settings = host::storage_get(K_SETTINGS)
-            .and_then(|s| json::parse(&s).ok())
-            .map(|v| Settings::from_json(&v))
-            .unwrap_or_default();
-        let drafts = host::storage_get(K_DRAFTS)
-            .and_then(|s| json::parse(&s).ok())
-            .map(|v| state::drafts_from_json(&v))
-            .unwrap_or_default();
+        let settings = host::storage_get(K_SETTINGS).and_then(|s| json::parse(&s).ok()).map(|v| Settings::from_json(&v)).unwrap_or_default();
+        let drafts = host::storage_get(K_DRAFTS).and_then(|s| json::parse(&s).ok()).map(|v| state::drafts_from_json(&v)).unwrap_or_default();
         App {
             route: Route::Databases,
             settings,
@@ -357,8 +392,6 @@ impl App {
             locked: None,
             busy: None,
             account_menu: false,
-            unsaved_keys: false,
-            remember: host::storage_get(K_REMEMBER).as_deref() == Some("1"),
             files: HashMap::new(),
             attach_status: None,
             viewer: None,
@@ -732,6 +765,10 @@ impl App {
         let Some(owner) = self.official_for(pda) else { return false };
         let Some(t) = self.tv_mut(pda, gen) else { return false };
         let packs: Vec<pack::SourcePack> = t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
+        // a crowdfunded table is always read to its start: its first manifest is what counts
+        if crate::crowd::looks_crowd(&packs.iter().collect::<Vec<_>>()) {
+            return false;
+        }
         if !pack::checkpoint_covers(&packs, &|s| s == owner) {
             return false;
         }
@@ -964,6 +1001,7 @@ impl App {
             (_, "run-close") => {
                 if self.run.as_ref().map(|r| !r.busy()).unwrap_or(true) {
                     self.run = None;
+                    self.uploads.remove("run");
                 }
             }
             // settings
@@ -1006,10 +1044,11 @@ impl App {
             }
             "cluster" => {
                 self.settings.cluster = val.to_string();
-                if val == "devnet" && self.settings.rpc.contains("mainnet") {
-                    self.settings.rpc = "https://api.devnet.solana.com".into();
-                } else if val == "mainnet" && self.settings.rpc.contains("devnet") {
-                    self.settings.rpc = "https://api.mainnet-beta.solana.com".into();
+                // the default RPC follows the cluster; a custom one is left alone
+                if val == "devnet" && (self.settings.rpc == state::RPC_MAINNET || self.settings.rpc.contains("mainnet")) {
+                    self.settings.rpc = state::RPC_DEVNET.into();
+                } else if val == "mainnet" && (self.settings.rpc == state::RPC_DEVNET || self.settings.rpc.contains("devnet")) {
+                    self.settings.rpc = state::RPC_MAINNET.into();
                 }
                 self.balances.clear();
                 self.name_checks.clear();
@@ -1087,19 +1126,12 @@ impl App {
             }
             P::Meta(pda, gen) => {
                 if let Some(t) = self.tv_mut(&pda, gen) {
-                    t.meta = if http_ok {
-                        json::parse(&text()).map(Load::Ready).unwrap_or_else(Load::Err)
-                    } else {
-                        Load::Err(fetch_err(ok, status, &text()))
-                    };
+                    t.meta = if http_ok { json::parse(&text()).map(Load::Ready).unwrap_or_else(Load::Err) } else { Load::Err(fetch_err(ok, status, &text())) };
                 }
             }
             P::RootInfo(pda, gen) => {
                 let creator = if http_ok {
-                    net::rpc_result(&text())
-                        .ok()
-                        .and_then(|r| net::account_data(r.get("value")))
-                        .and_then(|d| iq::decode_db_root(&d))
+                    net::rpc_result(&text()).ok().and_then(|r| net::account_data(r.get("value"))).and_then(|d| iq::decode_db_root(&d))
                 } else {
                     None
                 };
@@ -1140,7 +1172,9 @@ impl App {
                                 t.rows.extend(rows);
                                 t.cursor = v.get("nextCursor").str().map(String::from);
                                 // a crowdfunded table is read whole (its manifest is its oldest record)
-                                if !t.load_all && crate::crowd::looks_crowd(&t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).collect::<Vec<_>>()) {
+                                if !t.load_all
+                                    && crate::crowd::looks_crowd(&t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).collect::<Vec<_>>())
+                                {
                                     t.load_all = true;
                                     // its rows come from everyone who uploads a piece
                                     t.who = Who::All;
@@ -1181,9 +1215,7 @@ impl App {
                 if cur.as_deref() == Some(&name) {
                     let v = if http_ok {
                         match net::rpc_result(&text()) {
-                            Ok(r) => Load::Ready(
-                                net::account_data(r.get("value")).and_then(|d| iq::decode_db_root(&d)).map(|d| b58(&d.creator)),
-                            ),
+                            Ok(r) => Load::Ready(net::account_data(r.get("value")).and_then(|d| iq::decode_db_root(&d)).map(|d| b58(&d.creator))),
                             Err(e) => Load::Err(e),
                         }
                     } else {
@@ -1213,22 +1245,19 @@ impl App {
                 let v = st.as_ref().map(|r| r.get("value").idx(0).clone()).unwrap_or(Json::Null);
                 let conf = v.get("confirmationStatus").str_or("");
                 if !v.get("err").is_null() {
-                    if let After::Attach(_) | After::AttachFunded(_) = after {
-                        self.attach_status = None;
-                    }
-                    self.err(format!("{} failed on chain: {}", what, v.get("err")));
+                    self.after_failed(&after, format!("{} failed on chain: {}", what, v.get("err")));
                 } else if conf == "confirmed" || conf == "finalized" {
-                    self.ok(format!("{} confirmed", what));
+                    // crowdfunded pieces report progress on their own card
+                    if !matches!(&after, After::Attach(j) if j.crowd.is_some()) {
+                        self.ok(format!("{} confirmed", what));
+                    }
                     self.fetch_all_balances();
                     self.after_confirm(after, &sig);
                 } else if host::now_ms() - since < 90_000.0 {
                     self.timer(2000, P::ConfirmTick { what, sig, since, after });
                     return false;
                 } else {
-                    if let After::Attach(_) | After::AttachFunded(_) = after {
-                        self.attach_status = None;
-                    }
-                    self.err(format!("{} not confirmed after 90s — check {}", what, solana::short(&sig)));
+                    self.after_failed(&after, format!("{} not confirmed after 90s — check {}", what, solana::short(&sig)));
                 }
             }
             P::Run(op) => return self.run_async(op, ok, status, data),
@@ -1240,12 +1269,22 @@ impl App {
     fn more_async(&mut self, p: P, ok: bool, status: u32, data: Vec<u8>) -> bool {
         match p {
             P::RpcRoots | P::RpcMeta(..) | P::RpcSigs(..) | P::RpcTxs(..) | P::RpcChunk(..) => self.chain_async(p, ok, status, data),
-            P::AttachCheck(_) | P::AttachSession(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => self.attach_async(p, ok, status, data),
+            P::AttachCheck(_) | P::AttachSession(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => {
+                self.attach_async(p, ok, status, data)
+            }
             P::SaveCheck { .. } => self.save_async(p, ok, status, data),
             P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
-            P::CrowdHash(..) | P::CrowdPiece(_) | P::CrowdDl(..) => self.crowd_async(p, ok, status, data),
+            P::CrowdHash(..) | P::CrowdPiece(_) | P::CrowdDl(..) | P::CrowdDlNext => self.crowd_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
+        }
+    }
+
+    /// A transaction that something was waiting for failed or never landed.
+    pub fn after_failed(&mut self, after: &After, msg: String) {
+        match after {
+            After::Attach(_) | After::AttachFunded(_) => self.attach_fail(msg),
+            _ => self.err(msg),
         }
     }
 
@@ -1307,15 +1346,10 @@ impl App {
             // start with a sheet to type into, like a new spreadsheet
             d.tables.push(DraftTable::starter("sheet1", &["name", "notes"]));
         }
-        // its own wallet, made automatically when signed in
-        if let Some(a) = self.account.as_mut() {
-            let w = a.new_wallet(&format!("db: {}", name), &format!("Wallet of database \"{}\"", name));
-            a.dirty = true;
-            d.wallet = Some(w.address());
-        }
+        // saved with the wallet you're signed in with
+        d.wallet = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address());
         self.drafts.push(d);
         self.save_drafts();
-        self.persist_account();
         self.check_name(&key);
         Ok(key)
     }
@@ -1494,8 +1528,11 @@ impl App {
         let unknown: Vec<&String> = header.iter().zip(&map).filter(|(_, m)| m.is_none()).map(|(h, _)| h).collect();
         let n = rows.len();
         let cur = self.sheet_rows(&k, t);
-        let by_id: std::collections::HashMap<String, crate::sheet::SRow> =
-            cur.iter().filter(|r| r.state != crate::sheet::RowState::Deleted).map(|r| (r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default(), r.clone())).collect();
+        let by_id: std::collections::HashMap<String, crate::sheet::SRow> = cur
+            .iter()
+            .filter(|r| r.state != crate::sheet::RowState::Deleted)
+            .map(|r| (r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default(), r.clone()))
+            .collect();
         let nc = tb.columns.len();
         let mut changes = vec![];
         let mut updated = 0;
@@ -1577,7 +1614,10 @@ impl App {
         let i = self.draft_idx(&key).unwrap();
         let mut names: Vec<String> = info.as_ref().map(|r| r.tables.iter().filter_map(|t| t.label.clone()).collect()).unwrap_or_default();
         let wanted = table.as_ref().and_then(|(pda, label)| {
-            label.clone().filter(|l| !l.starts_with('#')).or_else(|| info.as_ref().and_then(|r| r.tables.iter().find(|t| &t.pda == pda).and_then(|t| t.label.clone())))
+            label
+                .clone()
+                .filter(|l| !l.starts_with('#'))
+                .or_else(|| info.as_ref().and_then(|r| r.tables.iter().find(|t| &t.pda == pda).and_then(|t| t.label.clone())))
         });
         if table.is_some() && wanted.is_none() {
             self.err("This table's name isn't readable, so it can't be opened in the editor.");
@@ -1610,10 +1650,7 @@ impl App {
         let (cols, rows) = crate::views::view_rows(tv);
         let name = tv.label.clone().unwrap_or_else(|| tv.pda.clone());
         if fmt == "json" {
-            let arr: Vec<Json> = rows
-                .iter()
-                .map(|r| Json::Obj(cols.iter().cloned().zip(r.vals.iter().cloned()).collect()))
-                .collect();
+            let arr: Vec<Json> = rows.iter().map(|r| Json::Obj(cols.iter().cloned().zip(r.vals.iter().cloned()).collect())).collect();
             host::download(&format!("{}.json", safe_name(&name)), "application/json", Json::Arr(arr).to_string().as_bytes());
         } else {
             let mut out = cols.iter().map(|c| ui::csv_cell(c)).collect::<Vec<_>>().join(",");
@@ -1704,6 +1741,7 @@ impl App {
 pub const ROWS_PER_PAGE: usize = 50;
 /// IQ's gateway for devnet (the one the IQ SDKs switch to on devnet).
 pub const DEV_GATEWAY: &str = "https://dev-gateway.iqlabs.dev";
+pub const MAIN_GATEWAY: &str = "https://gateway.iqlabs.dev";
 
 pub fn decode_row(r: &Json) -> Option<Result<pack::SourcePack, String>> {
     let p = r.get("p").str()?;
@@ -1726,10 +1764,13 @@ pub fn fetch_err(ok: bool, status: u32, body: &str) -> String {
         return format!("network error: {}", body);
     }
     if status == 429 {
-        return "rate limited (429) — the public RPC is heavily throttled; set your own RPC URL in Settings".into();
+        return "rate limited (429) — the RPC is throttling requests; wait a moment, or set your own RPC URL in Settings".into();
     }
     if status == 403 {
-        return format!("forbidden (403) — this endpoint refuses browser requests; set a different RPC URL in Settings. {}", body.chars().take(120).collect::<String>());
+        return format!(
+            "forbidden (403) — this endpoint refuses browser requests; set a different RPC URL in Settings. {}",
+            body.chars().take(120).collect::<String>()
+        );
     }
     net::gateway_error(status, body)
 }

@@ -67,10 +67,7 @@ fn pdas_match_sdk() {
     let root = iq::db_root_pda(b"iq-locker");
     assert_eq!(b58(&root), "HrWK65t1rXTebdeKPV8Pa2WMuv7qah5mB4hvzv6TA7YM");
     assert_eq!(b58(&root), k.get("iqLockerRoot").str().unwrap());
-    assert_eq!(
-        b58(&iq::table_pda(&root, &iq::seed_bytes("notes"))),
-        "3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP"
-    );
+    assert_eq!(b58(&iq::table_pda(&root, &iq::seed_bytes("notes"))), "3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP");
     let a = f.get("ata");
     let owner = pk(a.get("owner").str().unwrap());
     let mint = pk(iq::IQ_MINT_STR);
@@ -100,11 +97,7 @@ fn instructions_match_sdk() {
     let seed = h(x.get("tableSeed"));
     assert_eq!(seed, iq::seed_bytes("fasteners"));
     same_ix(&iq::initialize_db_root(&signer, &db_id), x.get("initializeDbRoot"), "initialize_db_root");
-    same_ix(
-        &iq::manage_table_creators(&signer, &db_id, &[signer], &[signer, creator]),
-        x.get("manageTableCreators"),
-        "manage_table_creators",
-    );
+    same_ix(&iq::manage_table_creators(&signer, &db_id, &[signer], &[signer, creator]), x.get("manageTableCreators"), "manage_table_creators");
     let cols = vec!["id".to_string(), "p".to_string()];
     let ext = vec!["iqt:1".to_string()];
     let spec = |writers| iq::TableSpec {
@@ -130,11 +123,16 @@ fn instructions_match_sdk() {
     same_ix(&iq::realloc_account(&signer, &iq::db_root_pda(&db_id), 4321), x.get("realloc"), "realloc");
     same_ix(&iq::user_inventory_code_in_inline(&signer, &md, None), x.get("userInventoryCodeIn"), "user_inventory_code_in");
     let none: Vec<String> = vec![];
-    let uspec = |writers| iq::TableSpec { db_id: &db_id, table_seed: &seed, hint: "", name: "Parts we stock", columns: &cols, id_col: "id", ext_keys: &none, writers };
+    let uspec =
+        |writers| iq::TableSpec { db_id: &db_id, table_seed: &seed, hint: "", name: "Parts we stock", columns: &cols, id_col: "id", ext_keys: &none, writers };
     let w2 = [signer, creator];
     same_ix(&iq::update_table(&signer, &uspec(Some(&w2))), x.get("updateTableLocked"), "update_table locked");
     same_ix(&iq::update_table(&signer, &uspec(Some(&[]))), x.get("updateTableOpen"), "update_table open");
-    same_ix(&iq::update_db_root_table_list(&signer, &db_id, &[b"fasteners".to_vec(), b"suppliers".to_vec()]), x.get("updateTableList"), "update_db_root_table_list");
+    same_ix(
+        &iq::update_db_root_table_list(&signer, &db_id, &[b"fasteners".to_vec(), b"suppliers".to_vec()]),
+        x.get("updateTableList"),
+        "update_db_root_table_list",
+    );
     // data bigger than one transaction
     let c = f.get("chunks");
     assert_eq!(crate::solana::b58(&iq::session_pda(&signer, 3)), c.get("session").str().unwrap(), "session pda");
@@ -240,7 +238,7 @@ pub fn sample_parts(n: usize, seed: u64) -> (pack::Schema, Vec<pack::Record>) {
                     json::n(r.next() % 5000),
                     json::n(format!("{}.{:02}", r.next() % 40, r.next() % 100)),
                     json::s(r.pick(&sup)),
-                    json::s(if r.next() % 5 == 0 { "MX" } else { "US" }),
+                    json::s(if r.next().is_multiple_of(5) { "MX" } else { "US" }),
                     json::n(1_790_000_000_000u64 + r.next() % 90_000_000_000),
                 ],
                 deleted: false,
@@ -315,12 +313,9 @@ fn merge_latest_wins_and_tombstones() {
     let schema = pack::Schema { cols: vec!["id".into(), "v".into()], id: 0 };
     let rec = |id: &str, v: i32, del: bool| pack::Record { vals: vec![json::s(id), json::n(v)], deleted: del };
     let sp = |tx: &str, recs| pack::SourcePack { id: tx.into(), tx: tx.into(), signer: "S".into(), time: None, schema: schema.clone(), recs, meta: None };
-    let merged = pack::merge(&[
-        sp("t1", vec![rec("a", 1, false), rec("b", 2, false), rec("c", 3, false)]),
-        sp("t2", vec![rec("a", 10, false), rec("b", 0, true)]),
-    ]);
-    let got: Vec<(String, String, usize)> =
-        merged.iter().map(|m| (m.key.clone(), m.vals[1].1.to_string(), m.versions)).collect();
+    let merged =
+        pack::merge(&[sp("t1", vec![rec("a", 1, false), rec("b", 2, false), rec("c", 3, false)]), sp("t2", vec![rec("a", 10, false), rec("b", 0, true)])]);
+    let got: Vec<(String, String, usize)> = merged.iter().map(|m| (m.key.clone(), m.vals[1].1.to_string(), m.versions)).collect();
     assert_eq!(got, vec![("a".into(), "10".into(), 2), ("c".into(), "3".into(), 1)]);
 }
 
@@ -341,7 +336,7 @@ fn qr_matrix_for_scanner_check() {
     let rows: Vec<String> = m.iter().map(|r| r.iter().map(|&d| if d { '1' } else { '0' }).collect()).collect();
     let _ = std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
     std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/target/qr.txt"), format!("{}\n{}", text, rows.join("\n"))).unwrap();
-    assert!(m.len() >= 21 && (m.len() - 17) % 4 == 0);
+    assert!(m.len() >= 21 && (m.len() - 17).is_multiple_of(4));
 }
 
 // ------------------------------------------------------ password encryption
@@ -396,7 +391,7 @@ fn parses_our_transactions_back() {
     let seed = iq::seed_bytes("t");
     let md = iq::inline_metadata(3, &pack::row_json("IQT1zABC"));
     let ix = iq::db_code_in_inline(&kp.pubkey, b"db", &seed, &md, None);
-    let msg = solana::compile(&kp.pubkey, &[ix.clone()], [9; 32]);
+    let msg = solana::compile(&kp.pubkey, std::slice::from_ref(&ix), [9; 32]);
     for (raw, sig) in [solana::v1_signed(&msg, &kp.seed), solana::legacy_signed(&msg, &kp.seed)] {
         let t = solana::parse_tx(&raw).expect("parses");
         assert_eq!(t.signature, base58::encode(&sig));
@@ -428,7 +423,7 @@ fn account_file_roundtrip_and_imports() {
     a.set_passphrase("pass phrase", [1; 16]);
     let file = a.to_file([2; 12]);
     assert!(!file.contains(&b58(&w2.kp.pubkey)), "addresses are inside the ciphertext");
-    let Parsed::Locked(name, v) = account::parse_file("acct.json", &file).unwrap() else { panic!() };
+    let Parsed::Locked(name, v) = account::parse_file(&file).unwrap() else { panic!() };
     assert_eq!(name, "Test");
     assert!(account::unlock(&v, "nope").is_err());
     let b = account::unlock(&v, "pass phrase").unwrap();
@@ -440,24 +435,24 @@ fn account_file_roundtrip_and_imports() {
     assert!(crate::crypto::aead::password_decrypt("pass phrase", &salt, &iv, &unhex(v.get("ciphertext").str().unwrap()).unwrap()).is_some());
     // rescan finds a wallet created after the save
     let lost = account::derive(&[3; 32], 5);
-    assert!(b.rescan_candidates().iter().any(|(i, k)| *i == 5 && k.pubkey == lost.pubkey));
+    assert!(b.scan_from(b.next_index).iter().any(|(i, k)| *i == 5 && k.pubkey == lost.pubkey));
     // Solana CLI keypair file
     let mut arr: Vec<u8> = cli.seed.to_vec();
     arr.extend_from_slice(&cli.pubkey);
     let cli_json = format!("[{}]", arr.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-    let Parsed::Keys(k) = account::parse_file("id.json", &cli_json).unwrap() else { panic!() };
+    let Parsed::Keys(k) = account::parse_file(&cli_json).unwrap() else { panic!() };
     assert_eq!(k[0].1.pubkey, cli.pubkey);
-    assert_eq!(k[0].0, "id");
+    assert_eq!(k[0].0, "", "a key file carries no label; signing in names it Main");
     // text list with labels
     let txt = format!("# my keys\ntreasury: {}\n{}\n", cli.export_b58(), solana::Keypair::from_seed([9; 32]).export_b58());
-    let Parsed::Keys(k) = account::parse_file("keys.txt", &txt).unwrap() else { panic!() };
+    let Parsed::Keys(k) = account::parse_file(&txt).unwrap() else { panic!() };
     assert_eq!(k.len(), 2);
     assert_eq!(k[0].0, "treasury");
-    assert!(account::parse_file("x.txt", "not a key").is_err());
+    assert!(account::parse_file("not a key").is_err());
     // unencrypted export round-trips
     let mut c = account::Account::new("Plain", [4; 32]);
     c.seal = None;
-    let Parsed::Account(c2) = account::parse_file("p.json", &c.to_file([0; 12])).unwrap() else { panic!() };
+    let Parsed::Account(c2) = account::parse_file(&c.to_file([0; 12])).unwrap() else { panic!() };
     assert_eq!(c2.addresses(), c.addresses());
 }
 
@@ -518,7 +513,10 @@ fn sheet_overlays_pending_edits_on_saved_rows() {
 #[test]
 fn sql_parses_and_evaluates() {
     use crate::sql::{self, Stmt};
-    let s = sql::parse("SELECT name, COUNT(*) AS n FROM `parts list` WHERE qty >= 10 AND name LIKE '%bolt%' GROUP BY name ORDER BY n DESC LIMIT 5 OFFSET 1; -- c\nSHOW TABLES").unwrap();
+    let s = sql::parse(
+        "SELECT name, COUNT(*) AS n FROM `parts list` WHERE qty >= 10 AND name LIKE '%bolt%' GROUP BY name ORDER BY n DESC LIMIT 5 OFFSET 1; -- c\nSHOW TABLES",
+    )
+    .unwrap();
     assert_eq!(s.len(), 2);
     let Stmt::Query(q) = &s[0].0 else { panic!("{:?}", s[0]) };
     assert_eq!(q.order.len(), 1);
@@ -551,7 +549,8 @@ fn sql_runs_against_a_draft() {
     let mut app = crate::app::App::new();
     app.drafts.push(crate::state::Draft::new("k".into(), "shop".into()));
     let run = |app: &mut crate::app::App, q: &str| app.run_sql("k", q);
-    let out = run(&mut app, "CREATE TABLE parts (sku PRIMARY KEY, name, qty); INSERT INTO parts VALUES ('A1','Hex bolt',10), ('A2','Nut',3), ('A3','Washer',30)");
+    let out =
+        run(&mut app, "CREATE TABLE parts (sku PRIMARY KEY, name, qty); INSERT INTO parts VALUES ('A1','Hex bolt',10), ('A2','Nut',3), ('A3','Washer',30)");
     assert!(out.iter().all(|o| matches!(o, Out::Msg(true, _))), "{:?}", out);
     assert!(matches!(&run(&mut app, "INSERT INTO parts (sku) VALUES ('A1')")[0], Out::Msg(false, m) if m.contains("already exists")));
     let out = run(&mut app, "UPDATE parts SET qty = qty + 1 WHERE qty < 20; DELETE FROM parts WHERE sku = 'A2'");
@@ -563,7 +562,8 @@ fn sql_runs_against_a_draft() {
     let Out::Rows { rows, cols, .. } = &out[0] else { panic!() };
     assert_eq!(cols, &vec!["n".to_string(), "total".into(), "AVG(qty)".into()]);
     assert_eq!(rows[0].iter().map(|v| v.cell_text()).collect::<Vec<_>>(), vec!["2", "41", "20.5"]);
-    let out = run(&mut app, "ALTER TABLE parts ADD COLUMN color; UPDATE parts SET color = 'red' WHERE sku = 'A3'; SELECT sku FROM parts WHERE color IS NOT NULL");
+    let out =
+        run(&mut app, "ALTER TABLE parts ADD COLUMN color; UPDATE parts SET color = 'red' WHERE sku = 'A3'; SELECT sku FROM parts WHERE color IS NOT NULL");
     let Out::Rows { rows, .. } = &out[2] else { panic!("{:?}", out) };
     assert_eq!(rows.len(), 1);
     assert!(matches!(&run(&mut app, "SELECT nope FROM parts")[0], Out::Msg(false, m) if m.contains("Unknown column")));
@@ -575,7 +575,8 @@ fn sql_runs_against_a_draft() {
 fn dropping_a_table_forgets_what_was_computed_for_its_position() {
     let mut app = crate::app::App::new();
     app.drafts.push(crate::state::Draft::new("k".into(), "shop".into()));
-    let out = app.run_sql("k", "CREATE TABLE a (id PRIMARY KEY); INSERT INTO a VALUES ('x'); CREATE TABLE b (id PRIMARY KEY); INSERT INTO b VALUES ('1'), ('2'), ('3')");
+    let out = app
+        .run_sql("k", "CREATE TABLE a (id PRIMARY KEY); INSERT INTO a VALUES ('x'); CREATE TABLE b (id PRIMARY KEY); INSERT INTO b VALUES ('1'), ('2'), ('3')");
     assert!(out.iter().all(|o| matches!(o, crate::sql_exec::Out::Msg(true, _))), "{:?}", out);
     let cap = app.inline_cap();
     let count = |app: &mut crate::app::App, t| app.plan_for("k", t, cap).as_ref().unwrap().iter().map(|p| p.count).sum::<usize>();
@@ -622,10 +623,86 @@ fn iq_git_links() {
     let tree = git::parse_tree(r#"{"iqpages.json":{"txId":"21Y6pXb84UfKxQDsJjWuw3hEv1yrgjzvwdMvA54zcc78TbSxhRzBh8Th8k9w7SdyPDgpSSjj63GX4PpHEECnGLez","hash":"31"},"index.html":{"txId":"2sWxhbizTf5EhJ96pWzf43QJnGshbGDD35ZrzcsM4v6dhL2qufiqAoc1jWeuRruiXif5sXsywAoRVWDrkymen2RM","hash":"c9"}}"#).unwrap();
     assert_eq!(tree.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), vec!["index.html", "iqpages.json"]);
     assert_eq!(git::parse_tree(r#"{"a":{"nope":1}}"#), None);
-    let v = crate::attach::viewed("application/octet-stream", "iqgit-blob:index.html", crate::crypto::base64_encode(b"<!doctype html>\n<p>hi</p>"), owner.into(), None, "IQ gateway");
+    let v = crate::attach::viewed(
+        "application/octet-stream",
+        "iqgit-blob:index.html",
+        crate::crypto::base64_encode(b"<!doctype html>\n<p>hi</p>"),
+        owner.into(),
+        None,
+        "IQ gateway",
+    );
     assert_eq!((v.filename.as_str(), v.filetype.as_str(), v.text.as_deref()), ("index.html", "text/html", Some("<!doctype html>\n<p>hi</p>")));
-    let v = crate::attach::viewed("application/octet-stream", "iqgit-blob:logo.png", crate::crypto::base64_encode(&[137, 80, 78, 71, 0, 1]), owner.into(), None, "IQ gateway");
+    let v = crate::attach::viewed(
+        "application/octet-stream",
+        "iqgit-blob:logo.png",
+        crate::crypto::base64_encode(&[137, 80, 78, 71, 0, 1]),
+        owner.into(),
+        None,
+        "IQ gateway",
+    );
     assert_eq!((v.filetype.as_str(), v.bytes.as_ref().map(|b| b.len())), ("image/png", Some(6)));
     assert_eq!(git::ago(10_000_000.0, 10_000_000 - 3 * 86_400_000), "3 days ago");
     assert_eq!(git::ago(10_000_000.0, 10_000_000 - 3_600_000), "1 hour ago");
+}
+
+#[test]
+fn signing_in_with_a_key() {
+    use crate::account::{Account, Kind, Origin};
+    let kp = crate::solana::Keypair::from_seed([21; 32]);
+    let a = Account::from_keys(vec![("Main".into(), kp.clone())]).unwrap();
+    assert_eq!(a.origin, Origin::Keys);
+    assert_eq!(a.main().unwrap().kp.pubkey, kp.pubkey, "the key signed in with is the main wallet");
+    // extra wallets come from the key, so the same key brings the same ones back
+    let mut a1 = a.clone();
+    let mut a2 = Account::from_keys(vec![("again".into(), kp.clone())]).unwrap();
+    let w1 = a1.new_wallet("spare", "");
+    let w2 = a2.new_wallet("spare", "");
+    assert_eq!(w1.address(), w2.address());
+    assert_eq!(w1.kind, Kind::Derived(0));
+    assert_eq!(a1.main().unwrap().kp.pubkey, kp.pubkey, "a derived wallet doesn't take over as main");
+    let other = Account::from_keys(vec![("x".into(), crate::solana::Keypair::from_seed([22; 32]))]).unwrap();
+    assert_ne!(other.master, a.master);
+    // a Solana CLI key file (64 bytes: seed ‖ public key) signs in
+    let mut sk = kp.seed.to_vec();
+    sk.extend_from_slice(&kp.pubkey);
+    let file = format!("[{}]", sk.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+    match crate::account::parse_file(&file).unwrap() {
+        crate::account::Parsed::Keys(k) => assert_eq!(k[0].1.pubkey, kp.pubkey),
+        _ => panic!("not keys"),
+    }
+    // settings from an earlier version move off Solana's browser-refusing endpoint
+    let s = crate::state::Settings::from_json(&crate::json::parse(r#"{"rpc":"https://api.mainnet-beta.solana.com"}"#).unwrap());
+    assert_eq!(s.rpc, crate::state::RPC_MAINNET);
+    let s = crate::state::Settings::from_json(&crate::json::parse(r#"{"rpc":"https://mainnet.helius-rpc.com/?api-key=x"}"#).unwrap());
+    assert!(s.rpc.contains("helius"), "a custom RPC is kept");
+}
+
+#[test]
+fn review_hardening() {
+    // a wallet address pasted as a "secret key" is refused, not turned into a wallet anyone could take
+    let kp = crate::solana::Keypair::from_seed([5; 32]);
+    let addr = b58(&kp.pubkey);
+    assert!(crate::solana::Keypair::from_secret_b58(&addr).is_none());
+    let e = match crate::account::parse_file(&addr) {
+        Err(e) => e,
+        Ok(_) => panic!("an address signed in"),
+    };
+    assert!(e.contains("wallet address"), "{}", e);
+    assert!(crate::solana::Keypair::from_secret_b58(&kp.export_b58()).is_some());
+    // a secret whose public half doesn't match is refused too
+    let mut bad = kp.seed.to_vec();
+    bad.extend_from_slice(&[1u8; 32]);
+    assert!(crate::solana::Keypair::from_secret_b58(&base58::encode(&bad)).is_none());
+    // shortening never splits a character
+    assert_eq!(crate::solana::short("ééééééééééééé"), "éééé…éééé");
+    // sizes past 4 GB
+    assert_eq!(crate::ui::bytes(8u64 << 30), "8.00 GB");
+    assert_eq!(crate::ui::bytes(1536usize), "1.5 KB");
+    // a manifest from the chain: only web sources, only pieces a browser can hold
+    let m = |source: &str, piece: u64| {
+        json::parse(&format!(r#"{{"size":10,"sha256":"{h}","piece":{piece},"hashes":["{h}"],"source":"{source}"}}"#, h = "a".repeat(64))).unwrap()
+    };
+    assert_eq!(crate::crowd::Manifest::from_json(&m("javascript:alert(1)", 1 << 20)).unwrap().source, "");
+    assert_eq!(crate::crowd::Manifest::from_json(&m("https://x.example/f", 1 << 20)).unwrap().source, "https://x.example/f");
+    assert!(crate::crowd::Manifest::from_json(&m("", 1 << 30)).is_none(), "1 GB pieces are refused");
 }

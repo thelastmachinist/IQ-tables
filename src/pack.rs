@@ -163,13 +163,8 @@ pub fn encode_payload(schema: &Schema, recs: &[Record], compress: bool) -> Strin
         format!("{}z{}", MAGIC, codec::to_text(&codec::compress(&raw)))
     } else {
         let rows: Vec<Json> = recs.iter().map(|r| Json::Arr(r.normalized(schema).vals)).collect();
-        let dels: Vec<Json> =
-            recs.iter().enumerate().filter(|(_, r)| r.deleted).map(|(i, _)| json::n(i)).collect();
-        let mut o = json::obj(vec![
-            ("c", Json::Arr(schema.cols.iter().map(|c| json::s(c)).collect())),
-            ("i", json::n(schema.id)),
-            ("r", Json::Arr(rows)),
-        ]);
+        let dels: Vec<Json> = recs.iter().enumerate().filter(|(_, r)| r.deleted).map(|(i, _)| json::n(i)).collect();
+        let mut o = json::obj(vec![("c", Json::Arr(schema.cols.iter().map(|c| json::s(c)).collect())), ("i", json::n(schema.id)), ("r", Json::Arr(rows))]);
         if !dels.is_empty() {
             o.set("d", Json::Arr(dels));
         }

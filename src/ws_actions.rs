@@ -149,7 +149,14 @@ impl App {
         if name.is_empty() {
             return Err("Give the column a name".into());
         }
-        let preset = { let p = self.f("ce:type"); if p.is_empty() { "text".to_string() } else { p } };
+        let preset = {
+            let p = self.f("ce:type");
+            if p.is_empty() {
+                "text".to_string()
+            } else {
+                p
+            }
+        };
         let ty = type_from_form(&preset, &self.f("ce:param"))?;
         let mut s = format!("{}{}{}", q(&name), if ty.is_empty() { "" } else { " " }, ty);
         let nullable = self.f("ce:null") != "false";
@@ -194,7 +201,8 @@ impl App {
         let _ = kind;
         let key = self.cur_db()?;
         let di = self.draft_idx(&key)?;
-        let destructive = matches!(action, "op-truncate" | "op-drop" | "col-drop" | "idx-drop" | "fk-drop" | "chk-drop" | "view-drop" | "bookmark-del" | "del-draft-confirm");
+        let destructive =
+            matches!(action, "op-truncate" | "op-drop" | "col-drop" | "idx-drop" | "fk-drop" | "chk-drop" | "view-drop" | "bookmark-del" | "del-draft-confirm");
         if !destructive && action != "form" {
             self.ed.confirm = None;
         }
@@ -262,7 +270,10 @@ impl App {
             "col-unique" | "col-index" => {
                 let (key, _, tb) = self.cur_tb()?;
                 let c: usize = arg.parse().ok()?;
-                self.run_ui_sql(&key, &format!("ALTER TABLE {} ADD {} ({})", q(&tb.title), if action == "col-unique" { "UNIQUE" } else { "INDEX" }, q(tb.columns.get(c)?)));
+                self.run_ui_sql(
+                    &key,
+                    &format!("ALTER TABLE {} ADD {} ({})", q(&tb.title), if action == "col-unique" { "UNIQUE" } else { "INDEX" }, q(tb.columns.get(c)?)),
+                );
             }
             "idx-add" => {
                 let (key, _, tb) = self.cur_tb()?;
@@ -301,7 +312,14 @@ impl App {
                     "setnull" => " ON DELETE SET NULL",
                     _ => "",
                 };
-                let stmt = format!("ALTER TABLE {} ADD FOREIGN KEY ({}) REFERENCES {}{}{}", q(&tb.title), q(&col), q(&rt), if rc.is_empty() { String::new() } else { format!(" ({})", q(&rc)) }, del);
+                let stmt = format!(
+                    "ALTER TABLE {} ADD FOREIGN KEY ({}) REFERENCES {}{}{}",
+                    q(&tb.title),
+                    q(&col),
+                    q(&rt),
+                    if rc.is_empty() { String::new() } else { format!(" ({})", q(&rc)) },
+                    del
+                );
                 if self.run_ui_sql(&key, &stmt) {
                     for k in ["fk:col", "fk:target", "fk:del"] {
                         self.form.remove(k);
@@ -362,9 +380,9 @@ impl App {
                         "gt" => format!("{} > {}", col, lit(&v)),
                         "le" => format!("{} <= {}", col, lit(&v)),
                         "ge" => format!("{} >= {}", col, lit(&v)),
-                        "in" => format!("{} IN ({})", col, v.split(',').map(|x| lit(x)).collect::<Vec<_>>().join(", ")),
+                        "in" => format!("{} IN ({})", col, v.split(',').map(&lit).collect::<Vec<_>>().join(", ")),
                         "between" => {
-                            let mut it = v.splitn(2, |ch| ch == ',' || ch == '-' && false);
+                            let mut it = v.splitn(2, ',');
                             let a = it.next().unwrap_or("");
                             let b = it.next().unwrap_or("");
                             format!("{} BETWEEN {} AND {}", col, lit(a), lit(b))
@@ -378,7 +396,11 @@ impl App {
                     conds.push(cond);
                 }
                 let joiner = if self.f("sq:any") == "true" { " OR " } else { " AND " };
-                let stmt = format!("SELECT * FROM {}{} LIMIT 1000", q(&tb.title), if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(joiner)) });
+                let stmt = format!(
+                    "SELECT * FROM {}{} LIMIT 1000",
+                    q(&tb.title),
+                    if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(joiner)) }
+                );
                 self.ed.search_out = self.run_sql(&key, &stmt);
                 self.ed.last_sql = Some(stmt);
             }
@@ -397,7 +419,14 @@ impl App {
                     self.err("Pick a column and the text to find");
                     return Some(true);
                 }
-                let stmt = format!("UPDATE {t} SET {c} = REPLACE({c}, {f}, {w}) WHERE {c} LIKE {l}", t = q(&tb.title), c = q(&col), f = sql_str(&find), w = sql_str(&self.f("rp:with")), l = sql_str(&format!("%{}%", find.replace('%', "\\%").replace('_', "\\_"))));
+                let stmt = format!(
+                    "UPDATE {t} SET {c} = REPLACE({c}, {f}, {w}) WHERE {c} LIKE {l}",
+                    t = q(&tb.title),
+                    c = q(&col),
+                    f = sql_str(&find),
+                    w = sql_str(&self.f("rp:with")),
+                    l = sql_str(&format!("%{}%", find.replace('%', "\\%").replace('_', "\\_")))
+                );
                 self.run_ui_sql(&key, &stmt);
             }
             "dbsearch-run" => {
@@ -405,16 +434,30 @@ impl App {
                 if text.is_empty() {
                     return Some(true);
                 }
-                let tables: Vec<(usize, String, Vec<String>)> = self.drafts[di].tables.iter().enumerate().filter(|(_, t)| !t.dropped && !t.is_system()).map(|(i, t)| (i, t.title.clone(), t.columns.clone())).collect();
+                let tables: Vec<(usize, String, Vec<String>)> = self.drafts[di]
+                    .tables
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !t.dropped && !t.is_system())
+                    .map(|(i, t)| (i, t.title.clone(), t.columns.clone()))
+                    .collect();
                 let pat = sql_str(&format!("%{}%", text));
                 let mut rows = vec![];
                 for (i, title, cols) in tables {
                     let cond = cols.iter().map(|c| format!("{} LIKE {}", q(c), pat)).collect::<Vec<_>>().join(" OR ");
                     let out = self.run_sql(&key, &format!("SELECT COUNT(*) FROM {} WHERE {}", q(&title), cond));
-                    let n = out.iter().find_map(|o| if let Out::Rows { rows, .. } = o { rows.first().and_then(|r| r.first()).map(|v| v.cell_text()) } else { None }).unwrap_or_else(|| "0".into());
+                    let n = out
+                        .iter()
+                        .find_map(|o| if let Out::Rows { rows, .. } = o { rows.first().and_then(|r| r.first()).map(|v| v.cell_text()) } else { None })
+                        .unwrap_or_else(|| "0".into());
                     rows.push(vec![Json::Str(title), Json::Str(n), Json::Str(format!("{}", i))]);
                 }
-                self.ed.search_out = vec![Out::Rows { title: "__dbsearch".into(), cols: vec!["Table".into(), "Matching rows".into(), "".into()], rows, note: format!("Rows containing “{}” anywhere", text) }];
+                self.ed.search_out = vec![Out::Rows {
+                    title: "__dbsearch".into(),
+                    cols: vec!["Table".into(), "Matching rows".into(), "".into()],
+                    rows,
+                    note: format!("Rows containing “{}” anywhere", text),
+                }];
             }
             "dbsearch-browse" => {
                 let t: usize = arg.parse().ok()?;
@@ -442,9 +485,17 @@ impl App {
                         continue;
                     }
                     cols.push(q(name));
-                    vals.push(if m.ty.is_numeric() && crate::schema::numeric_text(&Json::Str(v.clone())).is_some() { crate::schema::numeric_text(&Json::Str(v.clone())).unwrap() } else { sql_str(&v.replace('T', if matches!(m.ty, Ty::DateTime(_) | Ty::Timestamp(_)) { " " } else { "T" })) });
+                    vals.push(if m.ty.is_numeric() && crate::schema::numeric_text(&Json::Str(v.clone())).is_some() {
+                        crate::schema::numeric_text(&Json::Str(v.clone())).unwrap()
+                    } else {
+                        sql_str(&v.replace('T', if matches!(m.ty, Ty::DateTime(_) | Ty::Timestamp(_)) { " " } else { "T" }))
+                    });
                 }
-                let stmt = if cols.is_empty() { format!("INSERT INTO {} () VALUES ()", q(&tb.title)) } else { format!("INSERT INTO {} ({}) VALUES ({})", q(&tb.title), cols.join(", "), vals.join(", ")) };
+                let stmt = if cols.is_empty() {
+                    format!("INSERT INTO {} () VALUES ()", q(&tb.title))
+                } else {
+                    format!("INSERT INTO {} ({}) VALUES ({})", q(&tb.title), cols.join(", "), vals.join(", "))
+                };
                 if self.run_ui_sql(&key, &stmt) {
                     for c in 0..tb.columns.len() {
                         self.form.remove(&format!("in:{}", c));
@@ -561,7 +612,11 @@ impl App {
             }
             "op-access" => {
                 let (key, _, tb) = self.cur_tb()?;
-                let stmt = if arg == "open" { format!("GRANT INSERT ON {} TO PUBLIC", q(&tb.title)) } else { format!("REVOKE INSERT ON {} FROM PUBLIC", q(&tb.title)) };
+                let stmt = if arg == "open" {
+                    format!("GRANT INSERT ON {} TO PUBLIC", q(&tb.title))
+                } else {
+                    format!("REVOKE INSERT ON {} FROM PUBLIC", q(&tb.title))
+                };
                 self.run_ui_sql(&key, &stmt);
             }
             "op-writer-add" => {
@@ -608,7 +663,14 @@ impl App {
             "import-sql-file" => self.import_sql(&key, val),
             "import-csv-new" => {
                 let stem = arg.rsplit_once('.').map(|(a, _)| a).unwrap_or(arg);
-                let mut base: String = stem.chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>().trim_matches('_').chars().take(48).collect();
+                let mut base: String = stem
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                    .collect::<String>()
+                    .trim_matches('_')
+                    .chars()
+                    .take(48)
+                    .collect();
                 if base.is_empty() {
                     base = "imported".into();
                 }
@@ -642,7 +704,8 @@ impl App {
                     self.err("Name the table");
                     return Some(true);
                 }
-                let cols: Vec<String> = self.f("ct:cols").split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("id")).collect();
+                let cols: Vec<String> =
+                    self.f("ct:cols").split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("id")).collect();
                 let mut defs = vec!["`id` INT AUTO_INCREMENT PRIMARY KEY".to_string()];
                 defs.extend(cols.iter().map(|c| q(c)));
                 if cols.is_empty() {
@@ -692,7 +755,9 @@ impl App {
                 }
             }
             "sql-csv" => {
-                let Some(Out::Rows { cols, rows, title, .. }) = self.ed.sql_out.iter().rev().find(|o| matches!(o, Out::Rows { .. })).cloned() else { return Some(true) };
+                let Some(Out::Rows { cols, rows, title, .. }) = self.ed.sql_out.iter().rev().find(|o| matches!(o, Out::Rows { .. })).cloned() else {
+                    return Some(true);
+                };
                 let mut out = String::from("\u{feff}");
                 out.push_str(&cols.iter().map(|c| ui::csv_cell(c)).collect::<Vec<_>>().join(","));
                 out.push('\n');
@@ -748,7 +813,16 @@ impl App {
             out.push_str(&tb.columns.iter().map(|c| ui::csv_cell(c)).collect::<Vec<_>>().join(","));
             out.push('\n');
             for r in &live {
-                out.push_str(&r.vals.iter().enumerate().map(|(c, v)| ui::csv_cell(&tb.meta.get(c).map(|m| if m.ty == Ty::Bool { v.cell_text() } else { m.ty.show(v) }).unwrap_or_else(|| v.cell_text()))).collect::<Vec<_>>().join(","));
+                out.push_str(
+                    &r.vals
+                        .iter()
+                        .enumerate()
+                        .map(|(c, v)| {
+                            ui::csv_cell(&tb.meta.get(c).map(|m| if m.ty == Ty::Bool { v.cell_text() } else { m.ty.show(v) }).unwrap_or_else(|| v.cell_text()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
                 out.push('\n');
             }
             host::download(&format!("{}.csv", name), "text/csv", out.as_bytes());

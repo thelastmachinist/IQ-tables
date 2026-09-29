@@ -129,7 +129,7 @@ pub fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
         let (y, m, d) = (num(&t[..4])?, num(&t[4..6])? as u32, num(&t[6..])? as u32);
         return valid(y, m, d).then_some((y, m, d));
     }
-    let parts: Vec<&str> = t.split(|c: char| c == '-' || c == '/' || c == '.' || c == ' ' || c == ',').filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = t.split(['-', '/', '.', ' ', ',']).filter(|p| !p.is_empty()).collect();
     if parts.len() != 3 {
         return None;
     }

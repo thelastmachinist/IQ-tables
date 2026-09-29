@@ -1,13 +1,16 @@
-//! Accounts: one file holds all of a user's wallets.
+//! Accounts: the wallets a person signed in with, held in memory only.
 //!
-//! * Dedicated wallets are derived from a 32-byte master secret:
-//!   seed(i) = SHA-256("iq-tables/account/v1/wallet" ‖ master ‖ u32le(i)).
-//!   A wallet created after the file was last saved is never lost: logging in
-//!   rescans the next indices for on-chain activity.
-//! * Outside keys (Solana CLI keypairs, Phantom exports) can be imported; those
-//!   live in the file itself, so the file must be re-saved after importing.
-//! * The file is encrypted with the IQ SDK's `passwordEncrypt` scheme
-//!   (PBKDF2-SHA256 × 250,000 → AES-256-GCM), so `passwordDecrypt` opens it too.
+//! * Signing in is dropping in a wallet's key (a Solana CLI keypair file, or
+//!   base58 secret keys). The first key is the main wallet. Nothing is saved:
+//!   closing the tab signs out.
+//! * Extra wallets are derived from a master secret that comes from the main
+//!   key: seed(i) = SHA-256("iq-tables/account/v1/wallet" ‖ master ‖ u32le(i)),
+//!   master = SHA-256("iq-tables/key-master/v1" ‖ main key's seed). Dropping
+//!   the same key in again brings them back (signing in rescans for any that
+//!   were used on chain).
+//! * Optionally the keys can be downloaded as a passphrase-protected file,
+//!   encrypted with the IQ SDK's `passwordEncrypt` scheme (PBKDF2-SHA256 ×
+//!   250,000 → AES-256-GCM), so `passwordDecrypt` opens it too.
 
 use crate::crypto::{aead, base58, hex, sha2, unhex};
 use crate::json::{self, Json};
@@ -36,17 +39,13 @@ impl Wallet {
     }
 }
 
-/// Where an account's secret comes from, which decides how it is kept.
-#[derive(Clone, PartialEq)]
+/// How the person signed in.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Origin {
-    /// An account file the user saves and drops back in (passphrase-encrypted).
+    /// Dropped-in keys.
+    Keys,
+    /// A passphrase-protected file made here earlier.
     File,
-    /// Derived from a passkey (WebAuthn PRF). Nothing secret is stored; the
-    /// wallet list is kept in this browser, encrypted with a key that also
-    /// comes from the passkey.
-    Passkey { cred: String, store_key: [u8; 32] },
-    /// Kept in this browser only (fallback when passkeys aren't available).
-    Browser,
 }
 
 #[derive(Clone)]
@@ -55,8 +54,6 @@ pub struct Account {
     pub master: [u8; 32],
     pub next_index: u32,
     pub wallets: Vec<Wallet>,
-    /// Unsaved changes (new imports, labels) since the file was last written.
-    pub dirty: bool,
     /// (salt, AES key) from the passphrase, kept so saving doesn't re-run PBKDF2.
     pub seal: Option<([u8; 16], [u8; 32])>,
     pub origin: Origin,
@@ -68,9 +65,26 @@ pub fn derive(master: &[u8; 32], index: u32) -> Keypair {
 
 impl Account {
     pub fn new(name: &str, master: [u8; 32]) -> Self {
-        let mut a = Account { name: name.to_string(), master, next_index: 0, wallets: vec![], dirty: true, seal: None, origin: Origin::File };
+        let mut a = Account { name: name.to_string(), master, next_index: 0, wallets: vec![], seal: None, origin: Origin::File };
         a.new_wallet("Main", "");
         a
+    }
+
+    /// Signed in with keys: the first one is the main wallet, and derived
+    /// wallets come from it, so they're the same every time it's used.
+    pub fn from_keys(keys: Vec<(String, Keypair)>) -> Option<Self> {
+        let first = keys.first()?.1.clone();
+        let master = sha2::sha256_parts(&[b"iq-tables/key-master/v1", &first.seed]);
+        let mut a = Account { name: crate::solana::short(&b58(&first.pubkey)), master, next_index: 0, wallets: vec![], seal: None, origin: Origin::Keys };
+        for (i, (label, kp)) in keys.into_iter().enumerate() {
+            let label = match (label.trim().is_empty(), i) {
+                (false, _) => label,
+                (true, 0) => "Main".to_string(),
+                (true, i) => format!("Key {}", i + 1),
+            };
+            a.import(kp, &label);
+        }
+        Some(a)
     }
 
     pub fn new_wallet(&mut self, label: &str, note: &str) -> Wallet {
@@ -99,13 +113,7 @@ impl Account {
             return false;
         }
         self.wallets.push(Wallet { label: label.to_string(), note: String::new(), kind: Kind::Imported, kp });
-        self.dirty = true;
         true
-    }
-
-    /// Candidate derived wallets beyond the last saved index (for rescans).
-    pub fn rescan_candidates(&self) -> Vec<(u32, Keypair)> {
-        (self.next_index..self.next_index + RESCAN_WINDOW).map(|i| (i, derive(&self.master, i))).collect()
     }
 
     pub fn recover(&mut self, index: u32) {
@@ -115,26 +123,17 @@ impl Account {
         let kp = derive(&self.master, index);
         self.wallets.push(Wallet { label: format!("Recovered #{}", index), note: String::new(), kind: Kind::Derived(index), kp });
         self.next_index = self.next_index.max(index + 1);
-        self.dirty = true;
     }
 
-    /// The main wallet: derived index 0, or the first wallet if there is none.
+    /// The main wallet: the key signed in with (or, in a file made by an
+    /// older version, its first wallet).
     pub fn main(&self) -> Option<&Wallet> {
-        self.wallets.iter().find(|w| w.kind == Kind::Derived(0)).or_else(|| self.wallets.first())
+        self.wallets.first()
     }
 
     /// Candidate derived wallets from `start` (gap-limit rescans).
     pub fn scan_from(&self, start: u32) -> Vec<(u32, Keypair)> {
         (start..start + RESCAN_WINDOW).map(|i| (i, derive(&self.master, i))).collect()
-    }
-
-    /// The wallet list as stored for passkey and browser accounts.
-    pub fn store_json(&self) -> String {
-        json::obj(vec![("name", json::s(&self.name)), ("payload", self.payload())]).to_string()
-    }
-
-    pub fn from_store_json(v: &Json) -> Result<Self, String> {
-        Account::from_payload(&v.get("name").str_or("My account"), v.get("payload"))
     }
 
     fn payload(&self) -> Json {
@@ -170,7 +169,8 @@ impl Account {
         }
         let mut master = [0u8; 32];
         master.copy_from_slice(&m);
-        let mut a = Account { name: name.to_string(), master, next_index: p.get("next").u64().unwrap_or(0) as u32, wallets: vec![], dirty: false, seal: None, origin: Origin::File };
+        let mut a =
+            Account { name: name.to_string(), master, next_index: p.get("next").u64().unwrap_or(0) as u32, wallets: vec![], seal: None, origin: Origin::File };
         for w in p.get("wallets").arr() {
             let label = w.get("label").str_or("Wallet");
             let note = w.get("note").str_or("");
@@ -215,7 +215,6 @@ impl Account {
 
     pub fn set_passphrase(&mut self, passphrase: &str, salt: [u8; 16]) {
         self.seal = Some((salt, aead::password_key(passphrase, &salt)));
-        self.dirty = true;
     }
 }
 
@@ -275,9 +274,9 @@ fn json_byte_array(v: &Json) -> Option<Vec<u8>> {
 /// Recognise whatever was dropped: an IQ Tables account file, a Solana CLI
 /// keypair (`[12,34,…]`), a list of those, or text with one base58 secret key
 /// per line (optionally `label: key` or `label,key`).
-pub fn parse_file(name: &str, text: &str) -> Result<Parsed, String> {
+pub fn parse_file(text: &str) -> Result<Parsed, String> {
     let t = text.trim().trim_start_matches('\u{feff}');
-    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name).trim_end_matches(".json").trim_end_matches(".txt").to_string();
+    // keys without a label of their own get one when they're added (see `label_keys`)
     if t.starts_with('{') {
         let v = json::parse(t)?;
         if v.get("format").str() != Some(FORMAT) {
@@ -292,7 +291,7 @@ pub fn parse_file(name: &str, text: &str) -> Result<Parsed, String> {
     if t.starts_with('[') {
         let v = json::parse(t)?;
         if let Some(bytes) = json_byte_array(&v) {
-            return key_from_bytes(&bytes).map(|kp| Parsed::Keys(vec![(stem.clone(), kp)])).ok_or_else(|| "That array isn't a valid 64-byte keypair".into());
+            return key_from_bytes(&bytes).map(|kp| Parsed::Keys(vec![(String::new(), kp)])).ok_or_else(|| "That array isn't a valid 64-byte keypair".into());
         }
         let mut keys = vec![];
         for (i, item) in v.arr().iter().enumerate() {
@@ -301,7 +300,7 @@ pub fn parse_file(name: &str, text: &str) -> Result<Parsed, String> {
                 .or_else(|| item.str().and_then(Keypair::from_secret_b58))
                 .or_else(|| item.get("secret").str().and_then(Keypair::from_secret_b58));
             match kp {
-                Some(kp) => keys.push((item.get("label").str().map(String::from).unwrap_or(format!("{} #{}", stem, i + 1)), kp)),
+                Some(kp) => keys.push((item.get("label").str_or(""), kp)),
                 None => return Err(format!("Entry {} isn't a key", i + 1)),
             }
         }
@@ -317,10 +316,14 @@ pub fn parse_file(name: &str, text: &str) -> Result<Parsed, String> {
             Some((l, k)) if !k.trim().is_empty() => (l.trim().trim_end_matches([':', ',']).trim().to_string(), k.trim()),
             _ => (String::new(), line),
         };
-        let kp = Keypair::from_secret_b58(key)
-            .or_else(|| base58::decode(key).and_then(|b| key_from_bytes(&b)))
-            .ok_or_else(|| format!("Line {} isn't a base58 secret key", n + 1))?;
-        keys.push((if label.is_empty() { format!("{} #{}", stem, keys.len() + 1) } else { label }, kp));
+        let kp = match (Keypair::from_secret_b58(key), base58::decode(key).map(|b| b.len())) {
+            (Some(kp), _) => kp,
+            (None, Some(32)) => {
+                return Err("That's a wallet address, not its secret key. The secret key is 64 bytes (about 88 characters) — in Phantom or Solflare it's under Export private key.".into())
+            }
+            _ => return Err(format!("Line {} isn't a secret key", n + 1)),
+        };
+        keys.push((label, kp));
     }
     if keys.is_empty() {
         return Err("No keys found in that file".into());

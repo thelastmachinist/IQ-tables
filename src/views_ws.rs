@@ -275,12 +275,22 @@ pub fn page(app: &mut App, key: &str, h: &mut String) {
     }
     let pend_n = pend.0 + pend.1 + pend.2;
     let wallet = d.wallet.clone();
-    let structural = d.tables.iter().filter(|x| (x.created.is_none() && !x.dropped) || (x.created.is_some() && (x.schema_changed() || x.meta_changed(wallet.as_deref())))).count();
+    let structural = d
+        .tables
+        .iter()
+        .filter(|x| (x.created.is_none() && !x.dropped) || (x.created.is_some() && (x.schema_changed() || x.meta_changed(wallet.as_deref()))))
+        .count();
     let (cost, _) = app.save_estimate(key);
     h.push_str("<nav class=\"tabs2\" role=\"tablist\">");
     for (id, label) in tabs {
         let badge = if *id == "save" && (pend_n > 0 || structural > 0 || !on_chain) { " <span class=\"dotp\"></span>" } else { "" };
-        h.push_str(&format!("<button role=\"tab\" class=\"{}\" data-a=\"ed-tab\" data-arg=\"{}\">{}{}</button>", if tab == *id { "on" } else { "" }, id, label, badge));
+        h.push_str(&format!(
+            "<button role=\"tab\" class=\"{}\" data-a=\"ed-tab\" data-arg=\"{}\">{}{}</button>",
+            if tab == *id { "on" } else { "" },
+            id,
+            label,
+            badge
+        ));
     }
     h.push_str("</nav>");
     let running = app.run.as_ref().map(|r| r.busy() && r.draft == key).unwrap_or(false);
@@ -302,7 +312,11 @@ pub fn page(app: &mut App, key: &str, h: &mut String) {
                     "<button class=\"btn primary\" data-a=\"inscribe\" data-arg=\"{}\">Save to blockchain · ≈{}</button>{}",
                     esc(key),
                     ui::sol(cost),
-                    if !scope_db && d.tables[t].ghosts() > 0 { "<button class=\"link\" data-a=\"discard\">discard this table's row changes</button>" } else { "" }
+                    if !scope_db && d.tables[t].ghosts() > 0 {
+                        "<button class=\"link\" data-a=\"discard\">discard this table's row changes</button>"
+                    } else {
+                        ""
+                    }
                 )
             }
         ));
@@ -480,7 +494,9 @@ fn db_structure(app: &mut App, key: &str, h: &mut String) {
     crate::crowd::editor_card(app, key, h);
     // views
     let views = app.views(key);
-    h.push_str("<section class=\"card\"><h3>Views</h3><p class=\"small muted\">A view is a saved SELECT you can query like a table — handy for joins and reports.</p>");
+    h.push_str(
+        "<section class=\"card\"><h3>Views</h3><p class=\"small muted\">A view is a saved SELECT you can query like a table — handy for joins and reports.</p>",
+    );
     if !views.is_empty() {
         h.push_str("<div class=\"scroll\"><table class=\"grid\"><thead><tr><th>View</th><th>Query</th><th></th></tr></thead><tbody>");
         for (v, q) in &views {
@@ -516,7 +532,14 @@ fn db_search(app: &mut App, key: &str, h: &mut String) {
                 "<tr><td>▦ {}</td><td class=\"num\">{}</td><td>{}</td></tr>",
                 esc(&r.first().map(|v| v.cell_text()).unwrap_or_default()),
                 esc(&n),
-                if n != "0" { format!("<button class=\"link\" data-a=\"dbsearch-browse\" data-arg=\"{}\">Show them</button>", esc(&r.get(2).map(|v| v.cell_text()).unwrap_or_default())) } else { String::new() }
+                if n != "0" {
+                    format!(
+                        "<button class=\"link\" data-a=\"dbsearch-browse\" data-arg=\"{}\">Show them</button>",
+                        esc(&r.get(2).map(|v| v.cell_text()).unwrap_or_default())
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
         h.push_str("</tbody></table></div>");
@@ -581,17 +604,23 @@ fn browse(app: &mut App, key: &str, t: usize, h: &mut String) {
     let arg = format!("{}:{}", key, t);
     // toolbar
     h.push_str("<div class=\"sheet-tools\">");
-    h.push_str(&format!("<input type=\"search\" id=\"sheetq\" placeholder=\"Filter rows…\" value=\"{}\" data-live=\"sheet-filter\" aria-label=\"Filter rows\">", esc(&app.ed.filter)));
+    h.push_str(&format!(
+        "<input type=\"search\" id=\"sheetq\" placeholder=\"Filter rows…\" value=\"{}\" data-live=\"sheet-filter\" aria-label=\"Filter rows\">",
+        esc(&app.ed.filter)
+    ));
     h.push_str("<button class=\"btn\" data-a=\"row-add\" title=\"Add a row\">+ Row</button><button class=\"btn\" data-a=\"col-add\" title=\"Add a column\">+ Column</button><button class=\"btn\" data-a=\"row-delete\" title=\"Delete the selected rows (Delete key clears cells)\">Delete row</button>");
     h.push_str(&format!(
-        "<label class=\"btn\" title=\"Put a small file (up to ~2 KB) into the selected cell\">📎 File<input type=\"file\" data-fileb64=\"attach-sel\" data-arg=\"{}\" hidden></label>",
+        "<label class=\"btn\" title=\"Put a file (up to 4 MB) into the selected cell\">📎 File<input type=\"file\" data-fileb64=\"attach-sel\" data-arg=\"{}\" hidden></label>",
         esc(&arg)
     ));
     h.push_str("<button class=\"btn\" data-a=\"sheet-undo\" title=\"Undo (Ctrl+Z)\">↶</button><button class=\"btn\" data-a=\"sheet-undo\" data-arg=\"redo\" title=\"Redo (Ctrl+Y)\">↷</button>");
     h.push_str("<span class=\"grow\"></span>");
     h.push_str(&match &state {
         BaseState::Loading => "<span class=\"muted small\">Reading saved rows from the blockchain…</span>".to_string(),
-        BaseState::Err(e) => format!("<span class=\"warn small\" title=\"{}\">Couldn't read saved rows</span> <button class=\"link\" data-a=\"base-reload\">retry</button>", esc(e)),
+        BaseState::Err(e) => format!(
+            "<span class=\"warn small\" title=\"{}\">Couldn't read saved rows</span> <button class=\"link\" data-a=\"base-reload\">retry</button>",
+            esc(e)
+        ),
         BaseState::Chain => "<button class=\"link small\" data-a=\"base-reload\" title=\"Read the saved rows again\">↻ refresh</button>".to_string(),
         BaseState::Local => String::new(),
     });
@@ -771,7 +800,7 @@ fn browse(app: &mut App, key: &str, t: usize, h: &mut String) {
             }
         }
     }
-    let pages = (nr + 1 + SHEET_PAGE - 1) / SHEET_PAGE;
+    let pages = (nr + 1).div_ceil(SHEET_PAGE);
     h.push_str("<div class=\"statusbar\">");
     h.push_str(&format!("<span>{} row(s){}</span>", nr, if app.ed.filter.is_empty() { String::new() } else { " match".into() }));
     if count > 1 {
@@ -779,7 +808,11 @@ fn browse(app: &mut App, key: &str, t: usize, h: &mut String) {
     }
     if nums.len() > 1 {
         let sum: f64 = nums.iter().sum();
-        h.push_str(&format!("<span>Sum {}</span><span>Average {}</span>", crate::sql::eval::fmt_num(sum).cell_text(), crate::sql::eval::fmt_num(sum / nums.len() as f64).cell_text()));
+        h.push_str(&format!(
+            "<span>Sum {}</span><span>Average {}</span>",
+            crate::sql::eval::fmt_num(sum).cell_text(),
+            crate::sql::eval::fmt_num(sum / nums.len() as f64).cell_text()
+        ));
     }
     if pages > 1 {
         h.push_str(&format!("<span>Page {} of {}", page + 1, pages));
@@ -863,7 +896,10 @@ fn tbl_structure(app: &mut App, key: &str, t: usize, h: &mut String) {
         h.push_str(&format!("<button class=\"link\" data-a=\"col-edit\" data-arg=\"{c}\">Change</button> ", c = c));
         if c != tb.id_col {
             h.push_str(&danger(app, "col-drop", &c.to_string(), "Drop", true));
-            h.push_str(&format!(" <button class=\"link\" data-a=\"col-pk\" data-arg=\"{c}\" title=\"Make this the column that identifies rows\">Primary</button>", c = c));
+            h.push_str(&format!(
+                " <button class=\"link\" data-a=\"col-pk\" data-arg=\"{c}\" title=\"Make this the column that identifies rows\">Primary</button>",
+                c = c
+            ));
         }
         h.push_str(&format!(" <button class=\"link\" data-a=\"col-unique\" data-arg=\"{c}\" title=\"No two rows may share a value\">Unique</button> <button class=\"link\" data-a=\"col-index\" data-arg=\"{c}\">Index</button>", c = c));
         if c > 0 {
@@ -947,7 +983,12 @@ fn tbl_structure(app: &mut App, key: &str, t: usize, h: &mut String) {
     if !tb.keys.checks.is_empty() {
         h.push_str("<div class=\"scroll\"><table class=\"grid\"><thead><tr><th>Name</th><th>Rule</th><th></th></tr></thead><tbody>");
         for ck in &tb.keys.checks {
-            h.push_str(&format!("<tr><td>{}</td><td class=\"mono small\">{}</td><td class=\"acts\">{}</td></tr>", esc(&ck.name), esc(&ck.expr), danger(app, "chk-drop", &ck.name, "Drop", true)));
+            h.push_str(&format!(
+                "<tr><td>{}</td><td class=\"mono small\">{}</td><td class=\"acts\">{}</td></tr>",
+                esc(&ck.name),
+                esc(&ck.expr),
+                danger(app, "chk-drop", &ck.name, "Drop", true)
+            ));
         }
         h.push_str("</tbody></table></div>");
     }
@@ -961,7 +1002,14 @@ fn tbl_structure(app: &mut App, key: &str, t: usize, h: &mut String) {
 
 fn col_form(app: &mut App, tb: &DraftTable, c: Option<usize>, h: &mut String) {
     let f = |k: &str| app.form.get(&format!("ce:{}", k)).cloned().unwrap_or_default();
-    let ty = { let t = f("type"); if t.is_empty() { "text".to_string() } else { t } };
+    let ty = {
+        let t = f("type");
+        if t.is_empty() {
+            "text".to_string()
+        } else {
+            t
+        }
+    };
     h.push_str(&format!(
         "<section class=\"card colform\"><h3>{}</h3><div class=\"formgrid cols3\">",
         match c {
@@ -985,7 +1033,10 @@ fn col_form(app: &mut App, tb: &DraftTable, c: Option<usize>, h: &mut String) {
         "<label>Default<input id=\"ce-default\" value=\"{}\" data-in=\"form\" data-arg=\"ce:default\" data-enter=\"col-save\" placeholder=\"none\"></label>",
         esc(&f("default"))
     ));
-    h.push_str(&format!("<label>Comment<input id=\"ce-comment\" value=\"{}\" data-in=\"form\" data-arg=\"ce:comment\" data-enter=\"col-save\"></label>", esc(&f("comment"))));
+    h.push_str(&format!(
+        "<label>Comment<input id=\"ce-comment\" value=\"{}\" data-in=\"form\" data-arg=\"ce:comment\" data-enter=\"col-save\"></label>",
+        esc(&f("comment"))
+    ));
     if c.is_none() {
         let mut places = vec![o("end", "At the end"), o("first", "At the start")];
         places.extend(tb.columns.iter().map(|x| (x.clone(), format!("After {}", x))));
@@ -1046,7 +1097,11 @@ fn tbl_search(app: &mut App, key: &str, t: usize, h: &mut String) {
             list = if let Ty::Enum(_) = m.ty { format!(" list=\"dl-sq-{}\"", esc(c)) } else { String::new() }
         ));
         if let Ty::Enum(v) = &m.ty {
-            h.push_str(&format!("<datalist id=\"dl-sq-{}\">{}</datalist>", esc(c), v.iter().map(|x| format!("<option value=\"{}\">", esc(x))).collect::<String>()));
+            h.push_str(&format!(
+                "<datalist id=\"dl-sq-{}\">{}</datalist>",
+                esc(c),
+                v.iter().map(|x| format!("<option value=\"{}\">", esc(x))).collect::<String>()
+            ));
         }
     }
     h.push_str("</tbody></table></div>");
@@ -1084,20 +1139,37 @@ fn tbl_insert(app: &mut App, key: &str, t: usize, h: &mut String) {
         let ph = if m.auto_inc {
             "automatic".to_string()
         } else if let Some(d) = &m.default {
-            format!("default: {}", match d { DefVal::Lit(v) => v.cell_text(), DefVal::Expr(e) => e.clone() })
+            format!(
+                "default: {}",
+                match d {
+                    DefVal::Lit(v) => v.cell_text(),
+                    DefVal::Expr(e) => e.clone(),
+                }
+            )
         } else if needs_value(&tb, c) {
             "required".to_string()
         } else {
             String::new()
         };
         let input = match &m.ty {
-            Ty::Bool => format!("<select data-in=\"form\" data-arg=\"{}\" aria-label=\"{}\">{}</select>", k, esc(name), options(&[o("", if ph.is_empty() { "—" } else { &ph }), o("true", "Yes"), o("false", "No")], &v)),
+            Ty::Bool => format!(
+                "<select data-in=\"form\" data-arg=\"{}\" aria-label=\"{}\">{}</select>",
+                k,
+                esc(name),
+                options(&[o("", if ph.is_empty() { "—" } else { &ph }), o("true", "Yes"), o("false", "No")], &v)
+            ),
             Ty::Enum(opts) => {
                 let mut ov = vec![o("", if ph.is_empty() { "—" } else { &ph })];
                 ov.extend(opts.iter().map(|x| o(x, x)));
                 format!("<select data-in=\"form\" data-arg=\"{}\" aria-label=\"{}\">{}</select>", k, esc(name), options(&ov, &v))
             }
-            Ty::Text(_) | Ty::Json => format!("<textarea rows=\"2\" data-in=\"form\" data-arg=\"{}\" placeholder=\"{}\" aria-label=\"{}\">{}</textarea>", k, esc(&ph), esc(name), esc(&v)),
+            Ty::Text(_) | Ty::Json => format!(
+                "<textarea rows=\"2\" data-in=\"form\" data-arg=\"{}\" placeholder=\"{}\" aria-label=\"{}\">{}</textarea>",
+                k,
+                esc(&ph),
+                esc(name),
+                esc(&v)
+            ),
             ty => {
                 let (typ, extra) = match ty {
                     Ty::Int(..) | Ty::Decimal(..) | Ty::Float(..) | Ty::Year => ("number", " step=\"any\""),
@@ -1197,7 +1269,9 @@ fn tbl_operations(app: &mut App, key: &str, t: usize, h: &mut String) {
         if tb.open { "on" } else { "" }
     ));
     if tb.open {
-        h.push_str("<p class=\"small muted\">Anyone can add rows. Rows from wallets other than this database's show as unofficial, and readers can hide them.</p>");
+        h.push_str(
+            "<p class=\"small muted\">Anyone can add rows. Rows from wallets other than this database's show as unofficial, and readers can hide them.</p>",
+        );
     } else {
         h.push_str("<ul class=\"small writers\"><li>This database's wallet</li>");
         for w in &tb.writers {
@@ -1282,8 +1356,14 @@ fn sql_tab(app: &mut App, key: &str, t: Option<usize>, h: &mut String) {
             vec![
                 ("SELECT *".into(), format!("SELECT * FROM {} WHERE 1 LIMIT 50;", tn)),
                 ("SELECT".into(), format!("SELECT {} FROM {} WHERE 1;", cols.join(", "), tn)),
-                ("INSERT".into(), format!("INSERT INTO {} ({}) VALUES ({});", tn, non_id.join(", "), non_id.iter().map(|_| "''").collect::<Vec<_>>().join(", "))),
-                ("UPDATE".into(), format!("UPDATE {} SET {} WHERE {} = 1;", tn, non_id.iter().map(|c| format!("{} = ''", c)).collect::<Vec<_>>().join(", "), idc)),
+                (
+                    "INSERT".into(),
+                    format!("INSERT INTO {} ({}) VALUES ({});", tn, non_id.join(", "), non_id.iter().map(|_| "''").collect::<Vec<_>>().join(", ")),
+                ),
+                (
+                    "UPDATE".into(),
+                    format!("UPDATE {} SET {} WHERE {} = 1;", tn, non_id.iter().map(|c| format!("{} = ''", c)).collect::<Vec<_>>().join(", "), idc),
+                ),
                 ("DELETE".into(), format!("DELETE FROM {} WHERE {} = 1;", tn, idc)),
                 ("Count".into(), format!("SELECT COUNT(*) AS total FROM {};", tn)),
                 ("Describe".into(), format!("DESCRIBE {};", tn)),
@@ -1324,14 +1404,23 @@ fn sql_tab(app: &mut App, key: &str, t: Option<usize>, h: &mut String) {
     if !d.bookmarks.is_empty() {
         h.push_str("<div class=\"row bms\"><span class=\"muted small\">Saved queries:</span>");
         for (i, (n, _)) in d.bookmarks.iter().enumerate() {
-            h.push_str(&format!("<span class=\"bmk\"><button class=\"link\" data-a=\"bookmark-load\" data-arg=\"{}\">☆ {}</button>{}</span>", i, esc(n), danger(app, "bookmark-del", &i.to_string(), "×", true)));
+            h.push_str(&format!(
+                "<span class=\"bmk\"><button class=\"link\" data-a=\"bookmark-load\" data-arg=\"{}\">☆ {}</button>{}</span>",
+                i,
+                esc(n),
+                danger(app, "bookmark-del", &i.to_string(), "×", true)
+            ));
         }
         h.push_str("</div>");
     }
     if !app.ed.sql_hist.is_empty() {
         h.push_str("<details class=\"hist\"><summary>History</summary><ol>");
         for (i, q) in app.ed.sql_hist.iter().enumerate().rev().take(20) {
-            h.push_str(&format!("<li><button class=\"link mono small\" data-a=\"sql-hist\" data-arg=\"{}\">{}</button></li>", i, esc(&q.chars().take(110).collect::<String>())));
+            h.push_str(&format!(
+                "<li><button class=\"link mono small\" data-a=\"sql-hist\" data-arg=\"{}\">{}</button></li>",
+                i,
+                esc(&q.chars().take(110).collect::<String>())
+            ));
         }
         h.push_str("</ol></details>");
     }
@@ -1384,12 +1473,23 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
     if d.root_sig.is_none() {
         lines.push(format!("Create the database “{}” · {}", esc(&d.name), ui::sol(iq::DB_ROOT_COST_ESTIMATE)));
     }
-    let new_tables: Vec<String> = d.tables.iter().filter(|t| t.created.is_none() && !t.dropped).map(|t| if t.is_system() { "(views)".to_string() } else { t.title.clone() }).collect();
+    let new_tables: Vec<String> =
+        d.tables.iter().filter(|t| t.created.is_none() && !t.dropped).map(|t| if t.is_system() { "(views)".to_string() } else { t.title.clone() }).collect();
     if !new_tables.is_empty() {
-        lines.push(format!("Create table{} {} · {} each", if new_tables.len() == 1 { "" } else { "s" }, esc(&new_tables.join(", ")), ui::sol(iq::TABLE_COST_ESTIMATE)));
+        lines.push(format!(
+            "Create table{} {} · {} each",
+            if new_tables.len() == 1 { "" } else { "s" },
+            esc(&new_tables.join(", ")),
+            ui::sol(iq::TABLE_COST_ESTIMATE)
+        ));
     }
     if d.user_init_sig.is_none() {
-        lines.push(format!("One-time setup for this database's wallet · {}", ui::sol(iq::USER_INIT_RENT_ESTIMATE)));
+        let own = d.wallet.is_some() && app.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) == d.wallet;
+        lines.push(format!(
+            "One-time IQ setup for {} (a deposit) · {}",
+            if own { "your wallet" } else { "this database's wallet" },
+            ui::sol(iq::USER_INIT_RENT_ESTIMATE)
+        ));
     }
     for (t, tb) in d.tables.iter().enumerate() {
         let label = if tb.is_system() { "Views".to_string() } else { tb.title.clone() };
@@ -1401,7 +1501,11 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
         }
         if tb.created.is_some() {
             if tb.checkpoint {
-                lines.push(format!("<b>{}</b>: checkpoint — the table's rows are rewritten together, then readers skip its older history · {} for the record", esc(&label), ui::sol(write)));
+                lines.push(format!(
+                    "<b>{}</b>: checkpoint — the table's rows are rewritten together, then readers skip its older history · {} for the record",
+                    esc(&label),
+                    ui::sol(write)
+                ));
             } else if tb.clear {
                 lines.push(format!("<b>{}</b>: empty it (earlier rows stop showing) · {}", esc(&label), ui::sol(write)));
             } else if tb.schema_changed() {
@@ -1434,7 +1538,13 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
                     esc(&label),
                     recs,
                     if tb.checkpoint { "row(s) rewritten" } else { "changed" },
-                    if tb.checkpoint { "" } else if tb.is_system() { "view(s)" } else { "row(s)" },
+                    if tb.checkpoint {
+                        ""
+                    } else if tb.is_system() {
+                        "view(s)"
+                    } else {
+                        "row(s)"
+                    },
                     how,
                     ui::sol(p.iter().map(|x| x.cost()).sum::<u64>())
                 ));
@@ -1475,7 +1585,7 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
     }
     match &app.account {
         None => {
-            h.push_str("<div class=\"row\"><a class=\"btn primary big\" href=\"#/account\">Create a free account to save</a></div>");
+            h.push_str("<div class=\"row\"><a class=\"btn primary big\" href=\"#/account\">Sign in with your wallet to save</a></div>");
         }
         Some(a) => {
             let main = a.main().map(|w| w.address()).unwrap_or_default();
@@ -1486,7 +1596,14 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
                 h.push_str(&format!(
                     "<p class=\"small\">Paid from your balance{}{}.</p>",
                     main_bal.map(|b| format!(" ({})", ui::sol(b))).unwrap_or_default(),
-                    if d.wallet.is_some() && dbw != main { format!(" — moved automatically to this database's own wallet{}", db_bal.map(|b| format!(", which has {}", ui::sol(b))).unwrap_or_default()) } else { String::new() }
+                    if d.wallet.is_some() && dbw != main {
+                        format!(
+                            " — moved automatically to this database's own wallet{}",
+                            db_bal.map(|b| format!(", which has {}", ui::sol(b))).unwrap_or_default()
+                        )
+                    } else {
+                        String::new()
+                    }
                 ));
                 let rows: usize = plans.iter().filter_map(|p| p.as_ref().ok()).map(|p| p.iter().map(|x| x.count).sum::<usize>()).sum();
                 h.push_str(&format!(
@@ -1497,7 +1614,9 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
                     app.busy_note.as_ref().map(|n| format!("<span class=\"muted small\">{}</span>", esc(n))).unwrap_or_default()
                 ));
                 if main_bal.map(|b| b < cost).unwrap_or(false) && db_bal.map(|b| b < cost).unwrap_or(true) {
-                    h.push_str("<p class=\"warn small\">Your balance is lower than this. <button class=\"link\" data-a=\"add-funds\">Add funds</button> first.</p>");
+                    h.push_str(
+                        "<p class=\"warn small\">Your balance is lower than this. <button class=\"link\" data-a=\"add-funds\">Add funds</button> first.</p>",
+                    );
                 }
             }
         }
@@ -1536,11 +1655,23 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
         }
         h.push_str("</ol><ol class=\"steps\">");
         for (i, s) in r.steps.iter().enumerate() {
-            let mark = if s.sig.is_some() { "✓" } else if i == r.i && r.busy() { "▶" } else { "·" };
+            let mark = if s.sig.is_some() {
+                "✓"
+            } else if i == r.i && r.busy() {
+                "▶"
+            } else {
+                "·"
+            };
             let link = s
                 .sig
                 .as_ref()
-                .map(|sig| format!(" <a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>", esc(&ui::solscan_tx(sig, &app.settings.cluster)), esc(&solana::short(sig))))
+                .map(|sig| {
+                    format!(
+                        " <a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>",
+                        esc(&ui::solscan_tx(sig, &app.settings.cluster)),
+                        esc(&solana::short(sig))
+                    )
+                })
                 .unwrap_or_default();
             let cost = s.cost.map(|c| format!(" · {}", ui::sol(c))).unwrap_or_default();
             h.push_str(&format!("<li>{} {}{}{}</li>", mark, esc(&r.describe(s, &d.tables)), cost, link));

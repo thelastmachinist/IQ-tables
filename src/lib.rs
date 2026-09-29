@@ -1,6 +1,10 @@
 //! IQ Tables — a database portal for IQ Labs on-chain tables, written in
 //! dependency-free Rust and compiled to WebAssembly.
 
+// The hashing, cipher and compression code indexes arrays the way their
+// specifications are written; iterator rewrites would read worse there.
+#![allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
+
 pub mod account;
 pub mod accounts_flow;
 pub mod app;

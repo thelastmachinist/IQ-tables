@@ -434,7 +434,7 @@ pub struct FnEnv<'a> {
     pub rand: &'a std::cell::Cell<u64>,
 }
 
-fn arg<'a>(a: &'a [Json], i: usize) -> &'a Json {
+fn arg(a: &[Json], i: usize) -> &Json {
     static NULL: Json = Json::Null;
     a.get(i).unwrap_or(&NULL)
 }
@@ -715,7 +715,7 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
                 json::n(s0().chars().next().map(|c| c as u32).unwrap_or(0))
             }
         }
-        "CHAR" => Json::Str(a.iter().filter_map(|v| sint(v)).filter_map(|c| char::from_u32(c as u32)).collect()),
+        "CHAR" => Json::Str(a.iter().filter_map(sint).filter_map(|c| char::from_u32(c as u32)).collect()),
         "HEX" => match arg(a, 0) {
             Json::Null => Json::Null,
             v @ Json::Num(_) => Json::Str(format!("{:X}", sint(v).unwrap_or(0))),
@@ -906,7 +906,17 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
         }
         "LOG10" => n(0).filter(|x| *x > 0.0).map(|x| fmt_num(x.log10())).unwrap_or(Json::Null),
         "LOG2" => n(0).filter(|x| *x > 0.0).map(|x| fmt_num(x.log2())).unwrap_or(Json::Null),
-        "SIGN" => n(0).map(|x| json::n(if x > 0.0 { 1 } else if x < 0.0 { -1 } else { 0 })).unwrap_or(Json::Null),
+        "SIGN" => n(0)
+            .map(|x| {
+                json::n(if x > 0.0 {
+                    1
+                } else if x < 0.0 {
+                    -1
+                } else {
+                    0
+                })
+            })
+            .unwrap_or(Json::Null),
         "PI" => Json::Num("3.141593".into()),
         "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "COT" | "DEGREES" | "RADIANS" => match n(0) {
             None => Json::Null,
@@ -1007,7 +1017,8 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
             d.has_time = true;
             Json::Str(d.datetime_str())
         }
-        "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "DAYOFWEEK" | "WEEKDAY" | "DAYOFYEAR" | "QUARTER" | "MONTHNAME" | "DAYNAME" | "LAST_DAY" | "WEEKOFYEAR" | "TO_DAYS" | "YEARWEEK" => {
+        "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "DAYOFWEEK" | "WEEKDAY" | "DAYOFYEAR" | "QUARTER" | "MONTHNAME" | "DAYNAME" | "LAST_DAY" | "WEEKOFYEAR"
+        | "TO_DAYS" | "YEARWEEK" => {
             let Some(d) = to_dt(arg(a, 0)) else { return Ok(Json::Null) };
             let (y, m, dd) = d.ymd();
             match name {
@@ -1049,9 +1060,9 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
             let unit = text(arg(a, 0));
             let v = arg(a, 1);
             match unit.as_str() {
-                "HOUR" | "MINUTE" | "SECOND" | "MICROSECOND" => scalar(&unit, &[v.clone()], env)?,
-                "WEEK" => scalar("WEEK", &[v.clone()], env)?,
-                u => scalar(u, &[v.clone()], env)?,
+                "HOUR" | "MINUTE" | "SECOND" | "MICROSECOND" => scalar(&unit, std::slice::from_ref(v), env)?,
+                "WEEK" => scalar("WEEK", std::slice::from_ref(v), env)?,
+                u => scalar(u, std::slice::from_ref(v), env)?,
             }
         }
         "DATE_FORMAT" | "TIME_FORMAT" => {
@@ -1059,7 +1070,11 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
             if any_null() {
                 return Ok(Json::Null);
             }
-            let d = if name == "TIME_FORMAT" { to_secs_time(&a[0]).map(|(_, s, us)| Dt { days: 0, secs: s % 86400, micros: us, has_time: true }) } else { to_dt(&a[0]) };
+            let d = if name == "TIME_FORMAT" {
+                to_secs_time(&a[0]).map(|(_, s, us)| Dt { days: 0, secs: s % 86400, micros: us, has_time: true })
+            } else {
+                to_dt(&a[0])
+            };
             match d {
                 Some(d) => Json::Str(dates::format(&d, &text(&a[1]))),
                 None => Json::Null,
@@ -1163,7 +1178,9 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
         }
         "FROM_DAYS" => sint(arg(a, 0)).map(|k| Json::Str(Dt { days: k - 719528, secs: 0, micros: 0, has_time: false }.date_str())).unwrap_or(Json::Null),
         "MAKEDATE" => match (sint(arg(a, 0)), sint(arg(a, 1))) {
-            (Some(y), Some(doy)) if doy > 0 => Json::Str(Dt { days: dates::days_from_civil(y, 1, 1) + doy - 1, secs: 0, micros: 0, has_time: false }.date_str()),
+            (Some(y), Some(doy)) if doy > 0 => {
+                Json::Str(Dt { days: dates::days_from_civil(y, 1, 1) + doy - 1, secs: 0, micros: 0, has_time: false }.date_str())
+            }
             _ => Json::Null,
         },
         "MAKETIME" => match (sint(arg(a, 0)), sint(arg(a, 1)), sint(arg(a, 2))) {
@@ -1227,7 +1244,7 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
             v => v.clone(),
         },
         "JSON_OBJECT" => {
-            if a.len() % 2 != 0 {
+            if !a.len().is_multiple_of(2) {
                 return Err("JSON_OBJECT() takes key, value pairs".into());
             }
             Json::Obj(a.chunks(2).map(|kv| (text(&kv[0]), json_of(&kv[1]))).collect())
@@ -1285,7 +1302,25 @@ pub fn scalar(name: &str, a: &[Json], env: &FnEnv) -> Result<Json, String> {
 pub fn is_aggregate_name(n: &str) -> bool {
     matches!(
         n,
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "STD" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "ANY_VALUE" | "JSON_ARRAYAGG" | "JSON_OBJECTAGG" | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "GROUP_CONCAT"
+            | "STD"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "ANY_VALUE"
+            | "JSON_ARRAYAGG"
+            | "JSON_OBJECTAGG"
+            | "BIT_AND"
+            | "BIT_OR"
+            | "BIT_XOR"
     )
 }
 

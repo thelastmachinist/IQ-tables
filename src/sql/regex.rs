@@ -231,11 +231,12 @@ impl Regex {
         match it {
             Item::Ch(x) => self.eq(*x, c),
             Item::Range(a, b) => {
-                (*a <= c && c <= *b) || (self.ci && {
-                    let l = c.to_lowercase().next().unwrap_or(c);
-                    let u = c.to_uppercase().next().unwrap_or(c);
-                    (*a <= l && l <= *b) || (*a <= u && u <= *b)
-                })
+                (*a <= c && c <= *b)
+                    || (self.ci && {
+                        let l = c.to_lowercase().next().unwrap_or(c);
+                        let u = c.to_uppercase().next().unwrap_or(c);
+                        (*a <= l && l <= *b) || (*a <= u && u <= *b)
+                    })
             }
             Item::Digit(p) => c.is_ascii_digit() == *p,
             Item::Word(p) => is_word(c) == *p,
@@ -282,7 +283,20 @@ impl Regex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn rep(&self, node: &Node, min: usize, max: usize, greedy: bool, count: usize, seq: &[Node], k: usize, t: &[char], i: usize, next: &mut dyn FnMut(usize) -> bool, depth: usize) -> bool {
+    fn rep(
+        &self,
+        node: &Node,
+        min: usize,
+        max: usize,
+        greedy: bool,
+        count: usize,
+        seq: &[Node],
+        k: usize,
+        t: &[char],
+        i: usize,
+        next: &mut dyn FnMut(usize) -> bool,
+        depth: usize,
+    ) -> bool {
         if depth > 5000 {
             return false;
         }
@@ -311,11 +325,17 @@ impl Regex {
         for st in from..=t.len() {
             for a in &self.alts {
                 let mut end = None;
-                if self.m(a, 0, t, st, &mut |j| {
-                    end = Some(j);
-                    true
-                }, 0)
-                {
+                if self.m(
+                    a,
+                    0,
+                    t,
+                    st,
+                    &mut |j| {
+                        end = Some(j);
+                        true
+                    },
+                    0,
+                ) {
                     return end.map(|e| (st, e));
                 }
             }

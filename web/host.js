@@ -2,7 +2,7 @@
 // Browsers can only run WebAssembly through JavaScript, so this file gives the
 // Rust app the few things it can't do itself: the DOM, fetch, localStorage,
 // the clock, secure randomness and files. No app logic and no wallet extension:
-// keys live in the user's account file and all signing happens in Rust.
+// keys are dropped in by the user, held in memory, and all signing happens in Rust.
 (async () => {
   "use strict";
   const root = document.getElementById("app");
@@ -170,47 +170,6 @@
         setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000);
       },
       blob_drop: (bid) => { blobs.delete(bid); },
-      passkey: (id, p, l) => {
-        const req = JSON.parse(str(p, l));
-        const out = (o) => done(id, true, 200, JSON.stringify(o));
-        const rnd = (n) => crypto.getRandomValues(new Uint8Array(n));
-        const b64u = (buf) => b64(new Uint8Array(buf)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-        const prfOf = (c) => { const r = c.getClientExtensionResults(); return r && r.prf && r.prf.results && r.prf.results.first ? b64(new Uint8Array(r.prf.results.first)) : null; };
-        (async () => {
-          if (!window.PublicKeyCredential || !navigator.credentials) return out({ ok: false, unsupported: true });
-          try {
-            if (PublicKeyCredential.getClientCapabilities) {
-              const caps = await PublicKeyCredential.getClientCapabilities();
-              if (caps && caps["extension:prf"] === false) return out({ ok: false, unsupported: true });
-            }
-          } catch (_) {}
-          const salt = Uint8Array.from(atob(req.salt), (c) => c.charCodeAt(0));
-          const prf = { eval: { first: salt } };
-          try {
-            let cred, key = null;
-            if (req.mode === "create") {
-              cred = await navigator.credentials.create({ publicKey: {
-                rp: { name: req.name }, user: { id: rnd(16), name: req.name + " account", displayName: req.name + " account" },
-                challenge: rnd(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
-                authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
-                extensions: { prf } } });
-              key = prfOf(cred);
-              const ext = cred.getClientExtensionResults();
-              if (!key && !(ext.prf && ext.prf.enabled)) return out({ ok: false, unsupported: true });
-              if (!key) {
-                // some authenticators only evaluate the PRF when signing in
-                const got = await navigator.credentials.get({ publicKey: { challenge: rnd(32), allowCredentials: [{ type: "public-key", id: cred.rawId }], userVerification: "required", extensions: { prf } } });
-                key = prfOf(got);
-              }
-            } else {
-              cred = await navigator.credentials.get({ publicKey: { challenge: rnd(32), userVerification: "required", extensions: { prf } } });
-              key = prfOf(cred);
-            }
-            if (!key) return out({ ok: false, unsupported: true });
-            out({ ok: true, cred: b64u(cred.rawId), prf: key });
-          } catch (e) { out({ ok: false, error: (e && e.name) || "Error", message: errText(e) }); }
-        })();
-      },
       set_hash: (p, l) => {
         const h = str(p, l);
         if (location.hash !== h) location.hash = h;

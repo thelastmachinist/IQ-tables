@@ -12,9 +12,73 @@ pub struct Parser<'s> {
 }
 
 const RESERVED: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "ORDER", "BY", "GROUP", "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "AS", "IS", "NULL", "LIKE", "IN", "BETWEEN", "DISTINCT", "TRUE", "FALSE", "CREATE", "TABLE", "ALTER", "DROP", "HAVING", "JOIN",
-    "INNER", "LEFT", "RIGHT", "CROSS", "OUTER", "ON", "USING", "UNION", "INTERSECT", "EXCEPT", "CASE", "WHEN", "THEN", "ELSE", "END", "EXISTS", "WITH", "NATURAL", "WINDOW", "INTERVAL", "REGEXP", "RLIKE", "DIV", "XOR", "ALL", "STRAIGHT_JOIN", "FOR", "ASC", "DESC", "ESCAPE",
-    "LOCK", "OVER", "PARTITION", "ROLLUP", "DUAL",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "LIMIT",
+    "OFFSET",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "AS",
+    "IS",
+    "NULL",
+    "LIKE",
+    "IN",
+    "BETWEEN",
+    "DISTINCT",
+    "TRUE",
+    "FALSE",
+    "CREATE",
+    "TABLE",
+    "ALTER",
+    "DROP",
+    "HAVING",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "CROSS",
+    "OUTER",
+    "ON",
+    "USING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "EXISTS",
+    "WITH",
+    "NATURAL",
+    "WINDOW",
+    "INTERVAL",
+    "REGEXP",
+    "RLIKE",
+    "DIV",
+    "XOR",
+    "ALL",
+    "STRAIGHT_JOIN",
+    "FOR",
+    "ASC",
+    "DESC",
+    "ESCAPE",
+    "LOCK",
+    "OVER",
+    "PARTITION",
+    "ROLLUP",
+    "DUAL",
 ];
 
 pub fn reserved(w: &str) -> bool {
@@ -293,7 +357,13 @@ impl<'s> Parser<'s> {
                 self.i += 1;
                 self.eat_kw("EXTENDED");
                 self.eat_kw("ANALYZE");
-                if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("UPDATE") || self.peek_kw("DELETE") || self.peek_kw("INSERT") || self.peek_sym("(") {
+                if self.peek_kw("SELECT")
+                    || self.peek_kw("WITH")
+                    || self.peek_kw("UPDATE")
+                    || self.peek_kw("DELETE")
+                    || self.peek_kw("INSERT")
+                    || self.peek_sym("(")
+                {
                     return Ok(Stmt::Explain(Box::new(self.stmt()?)));
                 }
                 let t = self.table_name()?;
@@ -341,12 +411,15 @@ impl<'s> Parser<'s> {
                 }
                 Ok(Stmt::Optimize(names))
             }
-            "LOCK" | "UNLOCK" | "ANALYZE" | "CHECK" | "REPAIR" | "FLUSH" | "CHECKSUM" | "SAVEPOINT" | "RELEASE" | "KILL" | "RESET" | "PURGE" | "HANDLER" | "DO" | "CHANGE" | "CACHE" | "LOAD" | "INSTALL" | "UNINSTALL" => {
+            "LOCK" | "UNLOCK" | "ANALYZE" | "CHECK" | "REPAIR" | "FLUSH" | "CHECKSUM" | "SAVEPOINT" | "RELEASE" | "KILL" | "RESET" | "PURGE" | "HANDLER"
+            | "DO" | "CHANGE" | "CACHE" | "LOAD" | "INSTALL" | "UNINSTALL" => {
                 self.i += 1;
                 self.skip_rest();
                 Ok(Stmt::Noop(match up.as_str() {
                     "LOCK" | "UNLOCK" => "Tables don't need locking: your changes wait in the editor until you save them.".into(),
-                    "ANALYZE" | "CHECK" | "REPAIR" | "CHECKSUM" => format!("{} TABLE: nothing to do — there are no index files to rebuild; rows are read straight from the blockchain.", up),
+                    "ANALYZE" | "CHECK" | "REPAIR" | "CHECKSUM" => {
+                        format!("{} TABLE: nothing to do — there are no index files to rebuild; rows are read straight from the blockchain.", up)
+                    }
                     "LOAD" => "LOAD DATA isn't available in a browser — use Import (CSV, JSON or SQL) instead.".into(),
                     _ => format!("{} has no effect here.", up),
                 }))
@@ -519,7 +592,19 @@ impl<'s> Parser<'s> {
             if self.eat_kw("DISTINCT") || self.eat_kw("DISTINCTROW") {
                 distinct = true;
             } else if self.eat_kw("ALL") {
-            } else if ["SQL_CALC_FOUND_ROWS", "SQL_NO_CACHE", "SQL_CACHE", "HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_SMALL_RESULT", "SQL_BIG_RESULT", "SQL_BUFFER_RESULT"].iter().any(|k| self.peek_kw(k)) {
+            } else if [
+                "SQL_CALC_FOUND_ROWS",
+                "SQL_NO_CACHE",
+                "SQL_CACHE",
+                "HIGH_PRIORITY",
+                "STRAIGHT_JOIN",
+                "SQL_SMALL_RESULT",
+                "SQL_BIG_RESULT",
+                "SQL_BUFFER_RESULT",
+            ]
+            .iter()
+            .any(|k| self.peek_kw(k))
+            {
                 self.i += 1;
             } else {
                 break;
@@ -529,21 +614,26 @@ impl<'s> Parser<'s> {
         loop {
             if self.eat_sym("*") {
                 items.push(SelItem::Star(None));
-            } else if matches!(self.peek(), Some(Tok::Word(_)) | Some(Tok::Ident(_))) && matches!(self.peek_at(1), Some(Tok::Sym("."))) && matches!(self.peek_at(2), Some(Tok::Sym("*"))) {
+            } else if matches!(self.peek(), Some(Tok::Word(_)) | Some(Tok::Ident(_)))
+                && matches!(self.peek_at(1), Some(Tok::Sym(".")))
+                && matches!(self.peek_at(2), Some(Tok::Sym("*")))
+            {
                 let t = self.any_ident()?;
                 self.i += 2;
                 items.push(SelItem::Star(Some(t)));
             } else {
                 let st = self.pos();
                 let e = self.expr()?;
-                let label = self.text(st);
-                let alias = if self.eat_kw("AS") {
-                    Some(self.any_ident()?)
-                } else if matches!(self.peek(), Some(Tok::Word(w)) if !reserved(w)) || matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::Str(_))) {
-                    Some(self.any_ident()?)
-                } else {
-                    None
+                // like MySQL, `t.col` is labelled `col`
+                let label = match &e {
+                    Expr::Col(_, c) => c.clone(),
+                    _ => self.text(st),
                 };
+                // `expr AS alias`, or the alias right after the expression
+                let aliased = self.eat_kw("AS")
+                    || matches!(self.peek(), Some(Tok::Word(w)) if !reserved(w))
+                    || matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::Str(_)));
+                let alias = if aliased { Some(self.any_ident()?) } else { None };
                 items.push(SelItem::Expr(e, alias, label));
             }
             if !self.eat_sym(",") {
@@ -553,7 +643,7 @@ impl<'s> Parser<'s> {
         if self.peek_kw("INTO") {
             return Err("SELECT … INTO isn't supported; use INSERT INTO … SELECT or CREATE TABLE … AS SELECT.".into());
         }
-        let from = if self.eat_kw("FROM") { Some(self.from_list()?) } else { None };
+        let from = if self.eat_kw("FROM") { Some(self.table_sources()?) } else { None };
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let mut group = vec![];
         let mut rollup = false;
@@ -580,7 +670,7 @@ impl<'s> Parser<'s> {
         Ok(Select { distinct, items, from, filter, group, rollup, having })
     }
 
-    fn from_list(&mut self) -> R<From> {
+    fn table_sources(&mut self) -> R<From> {
         let mut l = self.join_chain()?;
         while self.eat_sym(",") {
             let r = self.join_chain()?;
@@ -647,7 +737,7 @@ impl<'s> Parser<'s> {
                 let alias = self.table_alias()?.ok_or("A subquery in FROM needs a name: (SELECT …) AS t")?;
                 return Ok(From::Sub { q: Box::new(q), alias });
             }
-            let f = self.from_list()?;
+            let f = self.table_sources()?;
             self.want_sym(")")?;
             return Ok(f);
         }
@@ -719,7 +809,8 @@ impl<'s> Parser<'s> {
         self.pred()
     }
     fn subquery_follows(&self) -> bool {
-        self.peek_sym("(") && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "WITH") || (matches!(self.peek_at(1), Some(Tok::Sym("("))) && self.peek_kw_at(2, "SELECT")))
+        self.peek_sym("(")
+            && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "WITH") || (matches!(self.peek_at(1), Some(Tok::Sym("("))) && self.peek_kw_at(2, "SELECT")))
     }
     fn pred(&mut self) -> R<Expr> {
         let mut l = self.bitor()?;
@@ -1008,7 +1099,10 @@ impl<'s> Parser<'s> {
                         };
                         return Ok(Expr::Cast(Box::new(Expr::Lit(Json::Str(s))), to));
                     }
-                    "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_DATE" | "UTC_TIME" | "UTC_TIMESTAMP" | "CURRENT_USER" if !next_paren => {
+                    "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_DATE" | "UTC_TIME" | "UTC_TIMESTAMP"
+                    | "CURRENT_USER"
+                        if !next_paren =>
+                    {
                         self.i += 1;
                         return Ok(func(&up, vec![]));
                     }
@@ -1363,7 +1457,7 @@ impl<'s> Parser<'s> {
 
     fn update(&mut self) -> R<Stmt> {
         while self.eat_kw("LOW_PRIORITY") || self.eat_kw("IGNORE") {}
-        let from = self.from_list()?;
+        let from = self.table_sources()?;
         self.want_kw("SET")?;
         let mut sets = vec![];
         loop {
@@ -1389,7 +1483,7 @@ impl<'s> Parser<'s> {
             if self.eat_kw("USING") {
                 // DELETE FROM t1 USING t1 JOIN t2 …
                 targets.push(t);
-                from = self.from_list()?;
+                from = self.table_sources()?;
             } else {
                 let alias = self.table_alias()?;
                 targets.push(alias.clone().unwrap_or_else(|| t.clone()));
@@ -1411,7 +1505,7 @@ impl<'s> Parser<'s> {
                 }
             }
             self.want_kw("FROM")?;
-            from = self.from_list()?;
+            from = self.table_sources()?;
         }
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let (order, limit, _) = self.order_limit()?;
@@ -1425,7 +1519,8 @@ impl<'s> Parser<'s> {
         let Some(Tok::Word(w)) = self.peek().cloned() else { return Ok(None) };
         let up = w.to_ascii_uppercase();
         let mut name = up.clone();
-        if Ty::from_parts(&up, &[TypeArg::Num(10), TypeArg::Num(2)], false).is_err() && !matches!(up.as_str(), "ENUM" | "SET" | "VARCHAR" | "NATIONAL" | "LONG") {
+        if Ty::from_parts(&up, &[TypeArg::Num(10), TypeArg::Num(2)], false).is_err() && !matches!(up.as_str(), "ENUM" | "SET" | "VARCHAR" | "NATIONAL" | "LONG")
+        {
             return Ok(None);
         }
         if up == "SET" && !matches!(self.peek_at(1), Some(Tok::Sym("("))) {
@@ -1441,10 +1536,8 @@ impl<'s> Parser<'s> {
         if name == "CHARACTER" && self.eat_kw("VARYING") {
             name = "VARCHAR".into();
         }
-        if name == "LONG" {
-            if self.eat_kw("VARCHAR") || self.eat_kw("VARBINARY") {
-                name = "MEDIUMTEXT".into();
-            }
+        if name == "LONG" && (self.eat_kw("VARCHAR") || self.eat_kw("VARBINARY")) {
+            name = "MEDIUMTEXT".into();
         }
         let mut args = vec![];
         if self.eat_sym("(") {
@@ -1491,7 +1584,10 @@ impl<'s> Parser<'s> {
         }
         if let Some(Tok::Word(w)) = self.peek().cloned() {
             let up = w.to_ascii_uppercase();
-            if matches!(up.as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIME" | "LOCALTIMESTAMP" | "CURRENT_DATE" | "CURDATE" | "CURRENT_TIME" | "CURTIME" | "UTC_TIMESTAMP") {
+            if matches!(
+                up.as_str(),
+                "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIME" | "LOCALTIMESTAMP" | "CURRENT_DATE" | "CURDATE" | "CURRENT_TIME" | "CURTIME" | "UTC_TIMESTAMP"
+            ) {
                 self.i += 1;
                 if self.eat_sym("(") {
                     if !self.peek_sym(")") {
@@ -1562,11 +1658,9 @@ impl<'s> Parser<'s> {
         self.expr()?;
         let t = self.text(st);
         self.want_sym(")")?;
-        if self.eat_kw("NOT") {
-            self.eat_kw("ENFORCED");
-        } else {
-            self.eat_kw("ENFORCED");
-        }
+        // [NOT] ENFORCED is accepted and ignored
+        self.eat_kw("NOT");
+        self.eat_kw("ENFORCED");
         Ok(t)
     }
 
@@ -1574,7 +1668,19 @@ impl<'s> Parser<'s> {
         let name = self.any_ident()?;
         let ty = self.col_type()?.unwrap_or(Ty::Any);
         let serial = matches!(ty, Ty::Int(crate::schema::IntKind::Big, true)) && self.t[self.i.saturating_sub(1)].t == Tok::Word("SERIAL".into());
-        let mut c = ColumnSpec { name, ty, not_null: None, default: None, on_update_now: false, auto_inc: false, unique: false, primary: false, comment: None, references: None, check: None };
+        let mut c = ColumnSpec {
+            name,
+            ty,
+            not_null: None,
+            default: None,
+            on_update_now: false,
+            auto_inc: false,
+            unique: false,
+            primary: false,
+            comment: None,
+            references: None,
+            check: None,
+        };
         if serial {
             c.not_null = Some(true);
             c.auto_inc = true;
@@ -1637,10 +1743,8 @@ impl<'s> Parser<'s> {
     fn constraint(&mut self) -> R<Option<Constraint>> {
         let save = self.i;
         let mut cname = None;
-        if self.eat_kw("CONSTRAINT") {
-            if !(self.peek_kw("PRIMARY") || self.peek_kw("UNIQUE") || self.peek_kw("FOREIGN") || self.peek_kw("CHECK")) {
-                cname = Some(self.any_ident()?);
-            }
+        if self.eat_kw("CONSTRAINT") && !(self.peek_kw("PRIMARY") || self.peek_kw("UNIQUE") || self.peek_kw("FOREIGN") || self.peek_kw("CHECK")) {
+            cname = Some(self.any_ident()?);
         }
         if self.eat_kw("PRIMARY") {
             self.want_kw("KEY")?;
@@ -1706,7 +1810,18 @@ impl<'s> Parser<'s> {
     fn table_opts(&mut self, o: &mut TableOpts) -> R<()> {
         loop {
             self.eat_sym(",");
-            if self.eat_kw("ENGINE") || self.eat_kw("TYPE") || self.eat_kw("ROW_FORMAT") || self.eat_kw("COLLATE") || self.eat_kw("STATS_PERSISTENT") || self.eat_kw("PACK_KEYS") || self.eat_kw("CHECKSUM") || self.eat_kw("KEY_BLOCK_SIZE") || self.eat_kw("AVG_ROW_LENGTH") || self.eat_kw("MAX_ROWS") || self.eat_kw("MIN_ROWS") {
+            if self.eat_kw("ENGINE")
+                || self.eat_kw("TYPE")
+                || self.eat_kw("ROW_FORMAT")
+                || self.eat_kw("COLLATE")
+                || self.eat_kw("STATS_PERSISTENT")
+                || self.eat_kw("PACK_KEYS")
+                || self.eat_kw("CHECKSUM")
+                || self.eat_kw("KEY_BLOCK_SIZE")
+                || self.eat_kw("AVG_ROW_LENGTH")
+                || self.eat_kw("MAX_ROWS")
+                || self.eat_kw("MIN_ROWS")
+            {
                 self.eat_eq();
                 self.i += 1;
             } else if self.eat_kw("DEFAULT") {
@@ -1769,7 +1884,8 @@ impl<'s> Parser<'s> {
             return Ok(Stmt::CreateDatabase { name, if_not_exists });
         }
         let unique = self.eat_kw("UNIQUE");
-        if self.eat_kw("FULLTEXT") || self.eat_kw("SPATIAL") {}
+        // FULLTEXT / SPATIAL indexes are kept as ordinary ones
+        let _ = self.eat_kw("FULLTEXT") || self.eat_kw("SPATIAL");
         if self.eat_kw("INDEX") || self.eat_kw("KEY") {
             let name = self.any_ident()?;
             if self.eat_kw("USING") {
@@ -1781,13 +1897,24 @@ impl<'s> Parser<'s> {
             self.index_opts();
             return Ok(Stmt::CreateIndex { name, table, cols, unique });
         }
-        for (kw, what) in [("TRIGGER", "Triggers"), ("PROCEDURE", "Stored procedures"), ("FUNCTION", "Stored functions"), ("EVENT", "Scheduled events"), ("USER", "Database users"), ("ROLE", "Roles")] {
+        for (kw, what) in [
+            ("TRIGGER", "Triggers"),
+            ("PROCEDURE", "Stored procedures"),
+            ("FUNCTION", "Stored functions"),
+            ("EVENT", "Scheduled events"),
+            ("USER", "Database users"),
+            ("ROLE", "Roles"),
+        ] {
             if self.eat_kw(kw) {
                 self.skip_rest();
                 return Ok(Stmt::Unsupported(format!(
                     "{} need a server that runs code, and IQ is storage on Solana. {}",
                     what,
-                    if kw == "USER" || kw == "ROLE" { "Who may write is set per table: GRANT INSERT ON t TO 'wallet address'." } else { "Do it in a query instead." }
+                    if kw == "USER" || kw == "ROLE" {
+                        "Who may write is set per table: GRANT INSERT ON t TO 'wallet address'."
+                    } else {
+                        "Do it in a query instead."
+                    }
                 )));
             }
         }
@@ -1826,11 +1953,8 @@ impl<'s> Parser<'s> {
         }
         self.eat_kw("IGNORE");
         self.eat_kw("REPLACE");
-        let query = if self.eat_kw("AS") || self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_sym("(") {
-            Some(Box::new(self.query()?))
-        } else {
-            None
-        };
+        let query =
+            if self.eat_kw("AS") || self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_sym("(") { Some(Box::new(self.query()?)) } else { None };
         if cols.is_empty() && query.is_none() {
             return Err("A new table needs columns: CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))".into());
         }
@@ -2093,7 +2217,14 @@ impl<'s> Parser<'s> {
         if self.eat_kw("WARNINGS") || self.eat_kw("ERRORS") {
             return Ok(Stmt::Show(Show::Warnings));
         }
-        if self.eat_kw("TRIGGERS") || self.eat_kw("EVENTS") || self.eat_kws(&["PROCEDURE", "STATUS"]) || self.eat_kws(&["FUNCTION", "STATUS"]) || self.eat_kw("PROCESSLIST") || self.eat_kw("ENGINES") || self.eat_kw("PLUGINS") {
+        if self.eat_kw("TRIGGERS")
+            || self.eat_kw("EVENTS")
+            || self.eat_kws(&["PROCEDURE", "STATUS"])
+            || self.eat_kws(&["FUNCTION", "STATUS"])
+            || self.eat_kw("PROCESSLIST")
+            || self.eat_kw("ENGINES")
+            || self.eat_kw("PLUGINS")
+        {
             self.skip_rest();
             return Ok(Stmt::Show(Show::Warnings));
         }

@@ -43,13 +43,19 @@ pub fn parse_sol(s: &str) -> Option<u64> {
     w.checked_mul(1_000_000_000)?.checked_add(f)
 }
 
-pub fn bytes(n: usize) -> String {
-    if n < 1024 {
+/// A size in bytes for people: "512 B", "3.4 KB", "2.19 MB", "1.50 GB".
+/// (u64: the wasm build's usize is 32 bits, too small for big files.)
+pub fn bytes(n: impl TryInto<u64>) -> String {
+    let n: u64 = n.try_into().unwrap_or(u64::MAX);
+    let f = n as f64;
+    if n < 1 << 10 {
         format!("{} B", n)
-    } else if n < 1024 * 1024 {
-        format!("{:.1} KB", n as f64 / 1024.0)
+    } else if n < 1 << 20 {
+        format!("{:.1} KB", f / 1024.0)
+    } else if n < 1 << 30 {
+        format!("{:.2} MB", f / (1u64 << 20) as f64)
     } else {
-        format!("{:.2} MB", n as f64 / 1024.0 / 1024.0)
+        format!("{:.2} GB", f / (1u64 << 30) as f64)
     }
 }
 
@@ -72,11 +78,7 @@ pub fn time(secs: i64) -> String {
 }
 
 pub fn addr(a: &str) -> String {
-    format!(
-        "<span class=\"addr\" title=\"{}\">{}</span>",
-        esc(a),
-        esc(&crate::solana::short(a))
-    )
+    format!("<span class=\"addr\" title=\"{}\">{}</span>", esc(a), esc(&crate::solana::short(a)))
 }
 
 pub fn solscan_tx(sig: &str, cluster: &str) -> String {
@@ -103,7 +105,11 @@ pub fn cmp_cells(a: &str, b: &str) -> std::cmp::Ordering {
 pub fn parse_csv(src: &str) -> Vec<Vec<String>> {
     let delim = {
         let first = src.lines().next().unwrap_or("");
-        if first.matches('\t').count() > first.matches(',').count() { '\t' } else { ',' }
+        if first.matches('\t').count() > first.matches(',').count() {
+            '\t'
+        } else {
+            ','
+        }
     };
     let mut rows = vec![];
     let mut row: Vec<String> = vec![];

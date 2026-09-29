@@ -20,11 +20,15 @@ pub fn b58(p: &Pubkey) -> String {
     base58::encode(p)
 }
 
+/// "AbCd…WxYz" (by characters, so any text is safe to shorten).
 pub fn short(p: &str) -> String {
-    if p.len() <= 10 {
+    let n = p.chars().count();
+    if n <= 10 {
         return p.to_string();
     }
-    format!("{}…{}", &p[..4], &p[p.len() - 4..])
+    let head: String = p.chars().take(4).collect();
+    let tail: String = p.chars().skip(n - 4).collect();
+    format!("{}…{}", head, tail)
 }
 
 /// `PublicKey.findProgramAddressSync` equivalent.
@@ -78,11 +82,7 @@ pub struct Instruction {
 pub fn system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
     let mut data = 2u32.to_le_bytes().to_vec();
     data.extend_from_slice(&lamports.to_le_bytes());
-    Instruction {
-        program_id: SYSTEM_PROGRAM,
-        accounts: vec![AccountMeta::ws(*from), AccountMeta::w(*to)],
-        data,
-    }
+    Instruction { program_id: SYSTEM_PROGRAM, accounts: vec![AccountMeta::ws(*from), AccountMeta::w(*to)], data }
 }
 
 pub struct Message {
@@ -123,31 +123,17 @@ pub fn compile(payer: &Pubkey, ixs: &[Instruction], blockhash: [u8; 32]) -> Mess
     let mut idxs: Vec<usize> = (0..metas.len()).collect();
     idxs.sort_by(|&a, &b| {
         let (x, y) = (&metas[a], &metas[b]);
-        y.is_signer
-            .cmp(&x.is_signer)
-            .then(y.is_writable.cmp(&x.is_writable))
-            .then_with(|| collate_en(&names[a], &names[b]))
+        y.is_signer.cmp(&x.is_signer).then(y.is_writable.cmp(&x.is_writable)).then_with(|| collate_en(&names[a], &names[b]))
     });
     let mut ordered = vec![payer_meta];
     ordered.extend(idxs.into_iter().map(|i| metas[i].clone()));
     let num_required_signatures = ordered.iter().filter(|m| m.is_signer).count() as u8;
     let num_readonly_signed = ordered.iter().filter(|m| m.is_signer && !m.is_writable).count() as u8;
-    let num_readonly_unsigned =
-        ordered.iter().filter(|m| !m.is_signer && !m.is_writable).count() as u8;
+    let num_readonly_unsigned = ordered.iter().filter(|m| !m.is_signer && !m.is_writable).count() as u8;
     let keys: Vec<Pubkey> = ordered.iter().map(|m| m.pubkey).collect();
     let idx = |p: &Pubkey| keys.iter().position(|k| k == p).unwrap() as u8;
-    let cixs = ixs
-        .iter()
-        .map(|ix| (idx(&ix.program_id), ix.accounts.iter().map(|a| idx(&a.pubkey)).collect(), ix.data.clone()))
-        .collect();
-    Message {
-        num_required_signatures,
-        num_readonly_signed,
-        num_readonly_unsigned,
-        keys,
-        blockhash,
-        ixs: cixs,
-    }
+    let cixs = ixs.iter().map(|ix| (idx(&ix.program_id), ix.accounts.iter().map(|a| idx(&a.pubkey)).collect(), ix.data.clone())).collect();
+    Message { num_required_signatures, num_readonly_signed, num_readonly_unsigned, keys, blockhash, ixs: cixs }
 }
 
 /// ICU-style comparison for alphanumeric strings: case-insensitive first,
@@ -268,18 +254,19 @@ impl Keypair {
         sk.extend_from_slice(&self.pubkey);
         base58::encode(&sk)
     }
+    /// A 64-byte secret key (seed ‖ public key) in base58, as Phantom and
+    /// Solflare export it. The public half must match: 32 bytes of base58 is
+    /// a wallet *address*, and treating that as a secret would make a wallet
+    /// anyone could take.
     pub fn from_secret_b58(s: &str) -> Option<Self> {
         let v = base58::decode(s.trim())?;
-        if v.len() != 64 && v.len() != 32 {
+        if v.len() != 64 {
             return None;
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&v[..32]);
         let kp = Keypair::from_seed(seed);
-        if v.len() == 64 && v[32..] != kp.pubkey {
-            return None;
-        }
-        Some(kp)
+        (v[32..] == kp.pubkey).then_some(kp)
     }
 }
 

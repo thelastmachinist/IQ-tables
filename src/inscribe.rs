@@ -23,23 +23,51 @@ pub enum StepKind {
     UserInit,
     /// Grow accounts made by the pre-upgrade program so v1 writes fit.
     Grow(Vec<(Pubkey, u64)>),
-    Pack { t: usize, rows: Vec<usize>, payload: String, pack_id: String, count: usize },
+    Pack {
+        t: usize,
+        rows: Vec<usize>,
+        payload: String,
+        pack_id: String,
+        count: usize,
+    },
     /// A table-structure record (types, keys, renames; TRUNCATE / DROP; a
     /// checkpoint, which also marks `rows` saved).
-    Schema { t: usize, payload: String, doc: String, rows: Vec<usize>, checkpoint: bool },
+    Schema {
+        t: usize,
+        payload: String,
+        doc: String,
+        rows: Vec<usize>,
+        checkpoint: bool,
+    },
     /// One part of a record sent with IQ's chunked upload (`send_code` for a
     /// linked list, `create_session` + `post_chunk` for a session).
-    Chunk { job: usize, i: usize },
+    Chunk {
+        job: usize,
+        i: usize,
+    },
     /// The rest of a session's parts, sent several at a time (upload.rs).
-    Batch { job: usize },
+    Batch {
+        job: usize,
+    },
     /// The `db_code_in` that makes a chunked record appear.
-    Finalize { job: usize },
+    Finalize {
+        job: usize,
+    },
     /// Rename a table or change who may write to it (grow the account first if needed).
     /// Rename / change writers; the table's own columns, ID column and
     /// ext keys are kept as the chain has them.
-    UpdateTable { t: usize, realloc: Option<u64>, cols: Vec<String>, id_col: String, ext: Vec<String> },
+    UpdateTable {
+        t: usize,
+        realloc: Option<u64>,
+        cols: Vec<String>,
+        id_col: String,
+        ext: Vec<String>,
+    },
     /// Rewrite the database's table list (a dropped table comes off it).
-    TableList { seeds: Vec<Vec<u8>>, realloc: Option<u64> },
+    TableList {
+        seeds: Vec<Vec<u8>>,
+        realloc: Option<u64>,
+    },
 }
 
 /// A record too big for one transaction (or cheaper in parts).
@@ -139,12 +167,9 @@ impl Run {
             StepKind::Table(t) => format!("Create table \"{}\"", tables.get(*t).map(|x| x.name.as_str()).unwrap_or("?")),
             StepKind::UserInit => "One-time IQ account setup for the database wallet".into(),
             StepKind::Grow(_) => "Enlarge the wallet's IQ accounts for 4 KB (v1) writes".into(),
-            StepKind::Pack { t, count, pack_id, .. } => format!(
-                "Save {} rows to \"{}\" (pack {})",
-                count,
-                tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?"),
-                pack_id
-            ),
+            StepKind::Pack { t, count, pack_id, .. } => {
+                format!("Save {} rows to \"{}\" (pack {})", count, tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?"), pack_id)
+            }
             StepKind::Schema { t, checkpoint, .. } => {
                 let tb = tables.get(*t);
                 let what = match tb {
@@ -166,11 +191,9 @@ impl Run {
                 None => "Upload part".into(),
             },
             StepKind::Batch { job } => match self.jobs.get(*job) {
-                Some(j) => format!(
-                    "Upload parts 2–{} of \"{}\" (several at a time)",
-                    j.chunks.len(),
-                    tables.get(j.table()).map(|x| x.title.as_str()).unwrap_or("?")
-                ),
+                Some(j) => {
+                    format!("Upload parts 2–{} of \"{}\" (several at a time)", j.chunks.len(), tables.get(j.table()).map(|x| x.title.as_str()).unwrap_or("?"))
+                }
                 None => "Upload parts".into(),
             },
             StepKind::Finalize { job } => match self.jobs.get(*job) {
@@ -194,7 +217,9 @@ fn guard(k: &StepKind) -> u64 {
         StepKind::Chunk { .. } => iq::SESSION_RENT_ESTIMATE + iq::TX_FEE,
         StepKind::Batch { .. } => 100 * iq::TX_FEE,
         StepKind::Finalize { .. } => iq::FEE_SESSION_WRITE + iq::TX_FEE,
-        StepKind::UpdateTable { realloc, .. } | StepKind::TableList { realloc, .. } => iq::TX_FEE + realloc.map(|r| iq::rent_exempt(r as usize) / 4).unwrap_or(0),
+        StepKind::UpdateTable { realloc, .. } | StepKind::TableList { realloc, .. } => {
+            iq::TX_FEE + realloc.map(|r| iq::rent_exempt(r as usize) / 4).unwrap_or(0)
+        }
     }
 }
 
@@ -242,7 +267,7 @@ impl App {
         let Some(i) = self.draft_idx(key) else { return };
         let Some(kp) = self.draft_keypair(key) else {
             self.err(if self.account.is_none() {
-                "Log in first (drop your account file anywhere on the page)"
+                "Sign in first (drop your wallet's key file anywhere on the page)"
             } else {
                 "Pick a wallet from your account for this database first"
             });
@@ -302,10 +327,7 @@ impl App {
             addrs.push(iq::table_pda(&root, &iq::seed_bytes(&t.name)));
         }
         let list = addrs.iter().map(|a| json::s(&b58(a))).collect();
-        let params = Json::Arr(vec![
-            Json::Arr(list),
-            json::obj(vec![("encoding", json::s("base64")), ("commitment", json::s("confirmed"))]),
-        ]);
+        let params = Json::Arr(vec![Json::Arr(list), json::obj(vec![("encoding", json::s("base64")), ("commitment", json::s("confirmed"))])]);
         if let Some(r) = self.run.as_mut() {
             r.state = RunState::Preparing;
             r.note(true, "Reading on-chain state…");
@@ -341,7 +363,11 @@ impl App {
         let (legacy, chunks) = (r.legacy, j.chunks.clone());
         r.state = RunState::Working(format!("Step {}/{} · sending {} parts", r.i + 1, r.steps.len(), chunks.len().saturating_sub(1)));
         // a stopped batch for the same upload keeps the parts already on chain
-        let same = self.uploads.get("run").map(|b| matches!(b.owner, crate::upload::Owner::Run) && b.kp.pubkey == kp.pubkey && b.same_upload(seq, &chunks)).unwrap_or(false);
+        let same = self
+            .uploads
+            .get("run")
+            .map(|b| matches!(b.owner, crate::upload::Owner::Run) && b.kp.pubkey == kp.pubkey && b.same_upload(seq, &chunks))
+            .unwrap_or(false);
         if same {
             self.up_resume("run");
         } else {
@@ -427,7 +453,9 @@ impl App {
                         );
                         self.pause(msg);
                     } else if let Some(sess) = match &r.steps[r.i].kind {
-                        StepKind::Chunk { job, i: 0 } => r.jobs.get(*job).filter(|j| j.exists.is_none()).and_then(|j| j.seq).map(|s| iq::session_pda(&r.kp.pubkey, s)),
+                        StepKind::Chunk { job, i: 0 } => {
+                            r.jobs.get(*job).filter(|j| j.exists.is_none()).and_then(|j| j.seq).map(|s| iq::session_pda(&r.kp.pubkey, s))
+                        }
                         _ => None,
                     } {
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", b58(&sess))).unwrap();
@@ -672,7 +700,13 @@ impl App {
                 let desired = tb.desired_writers(Some(&wallet_s));
                 let chain_w = tb.chain_writers.clone().unwrap_or_default();
                 let title_differs = tb.chain_title.as_deref().map(|x| x != tb.title).unwrap_or(false);
-                let writers_differ = { let mut a = desired.clone(); let mut b = chain_w.clone(); a.sort(); b.sort(); a != b };
+                let writers_differ = {
+                    let mut a = desired.clone();
+                    let mut b = chain_w.clone();
+                    a.sort();
+                    b.sort();
+                    a != b
+                };
                 if !tb.dropped && (title_differs || writers_differ) {
                     let meta = vals.get(8 + t).and_then(net::account_data).and_then(|d| iq::decode_table(&d));
                     let (cols, id_col, ext) = match meta {
@@ -681,7 +715,16 @@ impl App {
                     };
                     let wpk: Vec<Pubkey> = desired.iter().filter_map(|w| solana::parse_pk(w)).collect();
                     let seed = iq::seed_bytes(&tb.name);
-                    let spec = iq::TableSpec { db_id: &[], table_seed: &seed, hint: "", name: &tb.title, columns: &cols, id_col: &id_col, ext_keys: &ext, writers: Some(&wpk) };
+                    let spec = iq::TableSpec {
+                        db_id: &[],
+                        table_seed: &seed,
+                        hint: "",
+                        name: &tb.title,
+                        columns: &cols,
+                        id_col: &id_col,
+                        ext_keys: &ext,
+                        writers: Some(&wpk),
+                    };
                     let need = iq::table_account_size(&spec);
                     let have = len(8 + t);
                     let realloc = (need > have).then(|| need + 64);
@@ -741,7 +784,8 @@ impl App {
                     };
                     iq::table_pda(&rp, &seed)
                 };
-                let dropped: Vec<Pubkey> = tables.iter().filter(|x| x.dropped && x.created.is_some()).map(|x| iq::table_pda(&rp, &iq::seed_bytes(&x.name))).collect();
+                let dropped: Vec<Pubkey> =
+                    tables.iter().filter(|x| x.dropped && x.created.is_some()).map(|x| iq::table_pda(&rp, &iq::seed_bytes(&x.name))).collect();
                 let mut seeds: Vec<Vec<u8>> = rt.table_seeds.iter().filter(|h| !dropped.contains(&pda_of(h))).cloned().collect();
                 for x in tables.iter().filter(|x| !x.dropped && x.clear && x.created.is_some()) {
                     let p = iq::table_pda(&rp, &iq::seed_bytes(&x.name));
@@ -806,7 +850,7 @@ impl App {
             let r = self.run.as_mut().unwrap();
             let w = b58(&r.kp.pubkey);
             self.fetch_balance(&w);
-            self.ok("Inscription complete");
+            self.ok("Saved to the blockchain.");
             // pick up new databases/tables next time the list is shown
             self.dbroots = crate::app::Load::None;
             return;
@@ -920,7 +964,16 @@ impl App {
                 let writers: Vec<Pubkey> = desired.iter().filter_map(|w| solana::parse_pk(w)).collect();
                 ixs.push(iq::update_table(
                     &kp.pubkey,
-                    &iq::TableSpec { db_id: &db_id, table_seed: &seed, hint: "", name: &tb.title, columns: cols, id_col, ext_keys: ext, writers: Some(&writers) },
+                    &iq::TableSpec {
+                        db_id: &db_id,
+                        table_seed: &seed,
+                        hint: "",
+                        name: &tb.title,
+                        columns: cols,
+                        id_col,
+                        ext_keys: ext,
+                        writers: Some(&writers),
+                    },
                 ));
             }
             StepKind::TableList { seeds, realloc } => {
@@ -980,7 +1033,13 @@ impl App {
             return false;
         }
         r.legacy = true;
-        r.note(false, format!("The RPC rejected the v1 transaction format ({}). Falling back to legacy transactions and re-planning packs (700-byte cap).", e.lines().next().unwrap_or("")));
+        r.note(
+            false,
+            format!(
+                "The RPC rejected the v1 transaction format ({}). Falling back to legacy transactions and re-planning packs (700-byte cap).",
+                e.lines().next().unwrap_or("")
+            ),
+        );
         r.steps.clear();
         r.i = 0;
         self.prep();

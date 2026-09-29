@@ -123,7 +123,9 @@ pub fn hoist_keys(mut stmts: Vec<(Stmt, String)>) -> Vec<(Stmt, String)> {
     let n = stmts.len();
     for i in 0..n {
         let (name, has_pk) = match &stmts[i].0 {
-            Stmt::CreateTable { name, cols, cons, .. } => (name.clone(), cols.iter().any(|c| c.primary) || cons.iter().any(|c| matches!(c, Constraint::Primary(_)))),
+            Stmt::CreateTable { name, cols, cons, .. } => {
+                (name.clone(), cols.iter().any(|c| c.primary) || cons.iter().any(|c| matches!(c, Constraint::Primary(_))))
+            }
             _ => continue,
         };
         if has_pk {
@@ -215,7 +217,17 @@ impl App {
         if s.on_update_now && !matches!(ty, Ty::DateTime(_) | Ty::Timestamp(_)) {
             return Err(format!("`{}`: ON UPDATE CURRENT_TIMESTAMP needs a DATETIME or TIMESTAMP column", s.name));
         }
-        Ok(ColMeta { key: key.to_string(), ty, not_null, default, on_update_now: s.on_update_now, auto_inc: s.auto_inc, comment: s.comment.clone().unwrap_or_default(), fill: Json::Null, auto_added: false })
+        Ok(ColMeta {
+            key: key.to_string(),
+            ty,
+            not_null,
+            default,
+            on_update_now: s.on_update_now,
+            auto_inc: s.auto_inc,
+            comment: s.comment.clone().unwrap_or_default(),
+            fill: Json::Null,
+            auto_added: false,
+        })
     }
 
     /// Resolve a REFERENCES clause against the database.
@@ -226,7 +238,14 @@ impl App {
             .collect::<R<_>>()?;
         let same = r.table.eq_ignore_ascii_case(&tb.title) || r.table.eq_ignore_ascii_case(&tb.name);
         let (rt_name, ref_cols) = if same {
-            let rc: Vec<String> = if r.cols.is_empty() { vec![tb.pk_key()] } else { r.cols.iter().map(|c| tb.col(c).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("REFERENCES: no column `{}` in {}", c, tb.title))).collect::<R<_>>()? };
+            let rc: Vec<String> = if r.cols.is_empty() {
+                vec![tb.pk_key()]
+            } else {
+                r.cols
+                    .iter()
+                    .map(|c| tb.col(c).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("REFERENCES: no column `{}` in {}", c, tb.title)))
+                    .collect::<R<_>>()?
+            };
             (tb.name.clone(), rc)
         } else {
             let t = self.tbl(key, &r.table).map_err(|_| format!("REFERENCES {}: no such table", r.table))?;
@@ -234,7 +253,10 @@ impl App {
             let rc: Vec<String> = if r.cols.is_empty() {
                 vec![rtb.pk_key()]
             } else {
-                r.cols.iter().map(|c| rtb.col(c).map(|i| rtb.meta[i].key.clone()).ok_or_else(|| format!("REFERENCES: no column `{}` in {}", c, rtb.title))).collect::<R<_>>()?
+                r.cols
+                    .iter()
+                    .map(|c| rtb.col(c).map(|i| rtb.meta[i].key.clone()).ok_or_else(|| format!("REFERENCES: no column `{}` in {}", c, rtb.title)))
+                    .collect::<R<_>>()?
             };
             (rtb.name.clone(), rc)
         };
@@ -251,7 +273,9 @@ impl App {
     pub fn exec_ddl(&mut self, key: &str, s: Stmt, text: &str, ctx: &mut RunCtx) -> R<Vec<Out>> {
         let _ = (text, &ctx);
         match s {
-            Stmt::CreateTable { name, if_not_exists, cols, cons, opts, like, query } => self.create_table(key, name, if_not_exists, cols, cons, opts, like, query),
+            Stmt::CreateTable { name, if_not_exists, cols, cons, opts, like, query } => {
+                self.create_table(key, name, if_not_exists, cols, cons, opts, like, query)
+            }
             Stmt::Alter { table, ops } => self.alter(key, &table, ops),
             Stmt::DropTable { names, if_exists } => {
                 let mut out = vec![];
@@ -296,7 +320,11 @@ impl App {
                 }
                 msg(out.join(" "))
             }
-            Stmt::CreateIndex { name, table, cols, unique } => self.alter(key, &table, vec![AlterOp::AddConstraint(if unique { Constraint::Unique(Some(name), cols) } else { Constraint::Index(Some(name), cols) })]),
+            Stmt::CreateIndex { name, table, cols, unique } => self.alter(
+                key,
+                &table,
+                vec![AlterOp::AddConstraint(if unique { Constraint::Unique(Some(name), cols) } else { Constraint::Index(Some(name), cols) })],
+            ),
             Stmt::DropIndex { name, table } => self.alter(key, &table, vec![AlterOp::DropIndex(name)]),
             Stmt::CreateDatabase { name, if_not_exists } => {
                 if self.drafts.iter().any(|d| d.name == name) {
@@ -314,7 +342,10 @@ impl App {
                     self.ed.scope_db = true;
                     msg(format!("Now working in {}", name))
                 }
-                None => Err(format!("No database {} in the editor. CREATE DATABASE {} makes one; to open one from the blockchain, find it in Explore and choose Edit.", name, name)),
+                None => Err(format!(
+                    "No database {} in the editor. CREATE DATABASE {} makes one; to open one from the blockchain, find it in Explore and choose Edit.",
+                    name, name
+                )),
             },
             Stmt::Show(s) => self.show(key, s),
             Stmt::Describe(t) => self.show(key, Show::Columns { table: t, full: false }),
@@ -372,7 +403,17 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_table(&mut self, key: &str, name: String, if_not_exists: bool, cols: Vec<ColumnSpec>, cons: Vec<Constraint>, opts: TableOpts, like: Option<String>, query: Option<Box<Query>>) -> R<Vec<Out>> {
+    fn create_table(
+        &mut self,
+        key: &str,
+        name: String,
+        if_not_exists: bool,
+        cols: Vec<ColumnSpec>,
+        cons: Vec<Constraint>,
+        opts: TableOpts,
+        like: Option<String>,
+        query: Option<Box<Query>>,
+    ) -> R<Vec<Out>> {
         valid_name("Table", &name)?;
         if self.tbl(key, &name).is_ok() {
             if if_not_exists {
@@ -397,7 +438,8 @@ impl App {
             let k = |old: &str| remap.iter().find(|(a, _)| a == old).map(|x| x.1.clone()).unwrap_or_default();
             tb.meta = s.meta.iter().zip(&s.columns).map(|(m, n)| ColMeta { key: n.clone(), fill: Json::Null, ..m.clone() }).collect();
             tb.id_col = s.id_col;
-            tb.keys.indexes = s.keys.indexes.iter().map(|i| Index { name: i.name.clone(), cols: i.cols.iter().map(|c| k(c)).collect(), unique: i.unique }).collect();
+            tb.keys.indexes =
+                s.keys.indexes.iter().map(|i| Index { name: i.name.clone(), cols: i.cols.iter().map(|c| k(c)).collect(), unique: i.unique }).collect();
             tb.keys.checks = s.keys.checks.clone();
             tb.keys.comment = s.keys.comment.clone();
             tb.open = s.open;
@@ -446,25 +488,32 @@ impl App {
                     tb.keys.indexes.push(Index { name: n, cols: vec![tb.meta[ci].key.clone()], unique: true });
                 }
                 if let Some(r) = &c.references {
-                    let fk = self.fk_from(key, &tb, None, &[c.name.clone()], r)?;
+                    let fk = self.fk_from(key, &tb, None, std::slice::from_ref(&c.name), r)?;
                     tb.keys.fks.push(fk);
                 }
                 if let Some((n, e)) = &c.check {
                     sql::parse_expr(e)?;
                     let taken_c: Vec<String> = tb.keys.checks.iter().map(|x| x.name.clone()).collect();
-                    tb.keys.checks.push(Check { name: n.clone().unwrap_or_else(|| unique_name(&format!("{}_chk_{}", name, tb.keys.checks.len() + 1), &taken_c)), expr: e.clone() });
+                    tb.keys.checks.push(Check {
+                        name: n.clone().unwrap_or_else(|| unique_name(&format!("{}_chk_{}", name, tb.keys.checks.len() + 1), &taken_c)),
+                        expr: e.clone(),
+                    });
                 }
             }
             for c in &cons {
                 match c {
                     Constraint::Primary(pc) if pc.len() > 1 => {
-                        let keys: Vec<String> = pc.iter().map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("PRIMARY KEY: no column `{}`", x))).collect::<R<_>>()?;
+                        let keys: Vec<String> = pc
+                            .iter()
+                            .map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("PRIMARY KEY: no column `{}`", x)))
+                            .collect::<R<_>>()?;
                         taken.push("PRIMARY_cols".into());
                         tb.keys.indexes.push(Index { name: unique_name(&pc[0], &taken), cols: keys, unique: true });
                     }
                     Constraint::Primary(_) => {}
                     Constraint::Unique(n, uc) | Constraint::Index(n, uc) => {
-                        let keys: Vec<String> = uc.iter().map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("KEY: no column `{}`", x))).collect::<R<_>>()?;
+                        let keys: Vec<String> =
+                            uc.iter().map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("KEY: no column `{}`", x))).collect::<R<_>>()?;
                         let nm = unique_name(n.as_deref().unwrap_or(&uc[0]), &taken);
                         taken.push(nm.clone());
                         tb.keys.indexes.push(Index { name: nm, cols: keys, unique: matches!(c, Constraint::Unique(..)) });
@@ -476,7 +525,10 @@ impl App {
                     Constraint::Check(n, e) => {
                         sql::parse_expr(e)?;
                         let taken_c: Vec<String> = tb.keys.checks.iter().map(|x| x.name.clone()).collect();
-                        tb.keys.checks.push(Check { name: n.clone().unwrap_or_else(|| unique_name(&format!("{}_chk_{}", name, tb.keys.checks.len() + 1), &taken_c)), expr: e.clone() });
+                        tb.keys.checks.push(Check {
+                            name: n.clone().unwrap_or_else(|| unique_name(&format!("{}_chk_{}", name, tb.keys.checks.len() + 1), &taken_c)),
+                            expr: e.clone(),
+                        });
                     }
                 }
             }
@@ -574,7 +626,11 @@ impl App {
             }
             let k: String = vals.iter().map(|v| eval::key(v)).collect::<Vec<_>>().join("\u{1}");
             if !seen.insert(k) {
-                return Err(format!("Can't add {}: the value '{}' appears more than once", label, vals.iter().map(|v| v.cell_text()).collect::<Vec<_>>().join(", ")));
+                return Err(format!(
+                    "Can't add {}: the value '{}' appears more than once",
+                    label,
+                    vals.iter().map(|v| v.cell_text()).collect::<Vec<_>>().join(", ")
+                ));
             }
         }
         Ok(())
@@ -684,12 +740,12 @@ impl App {
                         self.set_pk(&mut tb, &base, ci, &mut notes)?;
                     }
                     if spec.unique {
-                        self.check_unique(&tb, &base, &[k.clone()], &format!("UNIQUE on {}", spec.name))?;
+                        self.check_unique(&tb, &base, std::slice::from_ref(&k), &format!("UNIQUE on {}", spec.name))?;
                         let taken: Vec<String> = tb.keys.indexes.iter().map(|i| i.name.clone()).collect();
                         tb.keys.indexes.push(Index { name: unique_name(&spec.name, &taken), cols: vec![k.clone()], unique: true });
                     }
                     if let Some(r) = &spec.references {
-                        let fk = self.fk_from(key, &tb, None, &[spec.name.clone()], r)?;
+                        let fk = self.fk_from(key, &tb, None, std::slice::from_ref(&spec.name), r)?;
                         self.check_fk_data(key, &tb, &base, &fk)?;
                         tb.keys.fks.push(fk);
                     }
@@ -705,7 +761,13 @@ impl App {
                         let ci = tb.col(&cols[0]).ok_or_else(|| format!("PRIMARY KEY ({}): no such column", cols[0]))?;
                         let cur_auto = tb.meta.get(tb.id_col).map(|m| m.auto_added).unwrap_or(false);
                         if !pk_dropped && !cur_auto && ci != tb.id_col {
-                            return Err(format!("{} already has a primary key ({}). Change it with: ALTER TABLE {} DROP PRIMARY KEY, ADD PRIMARY KEY ({})", tb.title, tb.columns[tb.id_col], sql_ident(&tb.title), sql_ident(&cols[0])));
+                            return Err(format!(
+                                "{} already has a primary key ({}). Change it with: ALTER TABLE {} DROP PRIMARY KEY, ADD PRIMARY KEY ({})",
+                                tb.title,
+                                tb.columns[tb.id_col],
+                                sql_ident(&tb.title),
+                                sql_ident(&cols[0])
+                            ));
                         }
                         self.set_pk(&mut tb, &base, ci, &mut notes)?;
                         pk_dropped = false;
@@ -714,7 +776,8 @@ impl App {
                         }
                     }
                     Constraint::Unique(n, cols) | Constraint::Index(n, cols) => {
-                        let keys: Vec<String> = cols.iter().map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("No column `{}`", x))).collect::<R<_>>()?;
+                        let keys: Vec<String> =
+                            cols.iter().map(|x| tb.col(x).map(|i| tb.meta[i].key.clone()).ok_or_else(|| format!("No column `{}`", x))).collect::<R<_>>()?;
                         let unique = matches!(c, Constraint::Unique(..));
                         let taken: Vec<String> = tb.keys.indexes.iter().map(|i| i.name.clone()).collect();
                         let name = n.clone().unwrap_or_else(|| unique_name(&cols[0], &taken));
@@ -739,7 +802,10 @@ impl App {
                 AlterOp::DropColumn(c) => {
                     let ci = tb.col(&c).ok_or_else(|| format!("No column `{}` in {}", c, tb.title))?;
                     if ci == tb.id_col {
-                        return Err(format!("`{}` is the primary key. Make another column the key first (ALTER TABLE … DROP PRIMARY KEY, ADD PRIMARY KEY (other)).", c));
+                        return Err(format!(
+                            "`{}` is the primary key. Make another column the key first (ALTER TABLE … DROP PRIMARY KEY, ADD PRIMARY KEY (other)).",
+                            c
+                        ));
                     }
                     if let Some(ck) = tb.keys.checks.iter().find(|k| mentions(&k.expr, &c)) {
                         return Err(format!("The rule {} uses `{}` — drop the rule first (ALTER TABLE … DROP CHECK {})", ck.name, c, ck.name));
@@ -796,7 +862,14 @@ impl App {
                         let v = &r.vals[ci];
                         let cv = m.ty.coerce(v).map_err(|e| format!("Can't change `{}` to {}: in {}, {}", old, m.ty.sql(), row_label(&tb, &r.vals), e))?;
                         if cv.is_null() && m.not_null {
-                            return Err(format!("Can't make `{}` NOT NULL: {} has no value in it. Fill it in first (UPDATE {} SET {} = … WHERE {} IS NULL).", label, row_label(&tb, &r.vals), sql_ident(&tb.title), sql_ident(&old), sql_ident(&old)));
+                            return Err(format!(
+                                "Can't make `{}` NOT NULL: {} has no value in it. Fill it in first (UPDATE {} SET {} = … WHERE {} IS NULL).",
+                                label,
+                                row_label(&tb, &r.vals),
+                                sql_ident(&tb.title),
+                                sql_ident(&old),
+                                sql_ident(&old)
+                            ));
                         }
                     }
                     if m.auto_inc && !is_pk && !tb.keys.indexes.iter().any(|i| i.cols == vec![m.key.clone()]) && !spec.unique && !spec.primary {
@@ -845,14 +918,14 @@ impl App {
                     }
                     if spec.unique {
                         let k = tb.meta[ci].key.clone();
-                        self.check_unique(&tb, &base, &[k.clone()], &format!("UNIQUE on {}", spec.name))?;
+                        self.check_unique(&tb, &base, std::slice::from_ref(&k), &format!("UNIQUE on {}", spec.name))?;
                         let taken: Vec<String> = tb.keys.indexes.iter().map(|i| i.name.clone()).collect();
                         if !tb.keys.indexes.iter().any(|i| i.unique && i.cols == vec![k.clone()]) {
                             tb.keys.indexes.push(Index { name: unique_name(&spec.name, &taken), cols: vec![k], unique: true });
                         }
                     }
                     if let Some(r) = &spec.references {
-                        let fk = self.fk_from(key, &tb, None, &[spec.name.clone()], r)?;
+                        let fk = self.fk_from(key, &tb, None, std::slice::from_ref(&spec.name), r)?;
                         self.check_fk_data(key, &tb, &base, &fk)?;
                         tb.keys.fks.push(fk);
                     }
@@ -1002,11 +1075,7 @@ impl App {
             }
             x.keys.ai_next = 0;
         });
-        Ok(if saved {
-            format!("{} will be emptied when you save (one small write, whatever its size).", tb.title)
-        } else {
-            format!("{} emptied.", tb.title)
-        })
+        Ok(if saved { format!("{} will be emptied when you save (one small write, whatever its size).", tb.title) } else { format!("{} emptied.", tb.title) })
     }
 
     /// Mark a table for a checkpoint (or un-mark it): the next save rewrites
@@ -1023,7 +1092,10 @@ impl App {
         self.bump(key, t);
         self.save_drafts();
         Ok(if on {
-            format!("{} will get a checkpoint when you save: its rows are rewritten together, and from then on it opens without replaying older history.", tb.title)
+            format!(
+                "{} will get a checkpoint when you save: its rows are rewritten together, and from then on it opens without replaying older history.",
+                tb.title
+            )
         } else {
             format!("Checkpoint for {} cancelled.", tb.title)
         })
@@ -1033,7 +1105,9 @@ impl App {
         valid_name("Table", new)?;
         let di = self.draft_idx(key).unwrap();
         let old = self.drafts[di].tables[t].title.clone();
-        if !new.eq_ignore_ascii_case(&old) && (self.table_names(key).iter().any(|n| n.eq_ignore_ascii_case(new)) || self.views(key).iter().any(|(v, _)| v.eq_ignore_ascii_case(new))) {
+        if !new.eq_ignore_ascii_case(&old)
+            && (self.table_names(key).iter().any(|n| n.eq_ignore_ascii_case(new)) || self.views(key).iter().any(|(v, _)| v.eq_ignore_ascii_case(new)))
+        {
             return Err(format!("There's already a table or view called {}", new));
         }
         self.require_owner(key, t)?;
@@ -1103,11 +1177,16 @@ impl App {
                 return Err(format!("{} names for {} columns", cols.len(), r.names().len()));
             }
             // keep the column names by wrapping the query
-            format!("SELECT {} FROM ({}) AS v", r.names().iter().zip(&cols).map(|(a, b)| format!("{} AS {}", sql_ident(a), sql_ident(b))).collect::<Vec<_>>().join(", "), text)
+            format!(
+                "SELECT {} FROM ({}) AS v",
+                r.names().iter().zip(&cols).map(|(a, b)| format!("{} AS {}", sql_ident(a), sql_ident(b))).collect::<Vec<_>>().join(", "),
+                text
+            )
         };
         let st = self.ensure_system_table(key);
         let rows = self.sheet_rows(key, st);
-        let existing = rows.iter().find(|r| r.state != RowState::Deleted && r.vals.first().map(|v| v.cell_text().eq_ignore_ascii_case(name)).unwrap_or(false)).cloned();
+        let existing =
+            rows.iter().find(|r| r.state != RowState::Deleted && r.vals.first().map(|v| v.cell_text().eq_ignore_ascii_case(name)).unwrap_or(false)).cloned();
         let vals = vec![json::s(name), json::s("view"), json::s(&body)];
         let ch = match existing {
             Some(row) => Change::Update { row, vals, set: vec![true; 3] },
@@ -1118,7 +1197,11 @@ impl App {
             "View {} {}. It's stored with the database{}.",
             name,
             if exists { "replaced" } else { "created" },
-            if self.drafts[self.draft_idx(key).unwrap()].tables[st].created.is_none() { " (the first view adds a small settings table, about 0.017 SOL, when you save)" } else { "" }
+            if self.drafts[self.draft_idx(key).unwrap()].tables[st].created.is_none() {
+                " (the first view adds a small settings table, about 0.017 SOL, when you save)"
+            } else {
+                ""
+            }
         ))
     }
 
@@ -1127,7 +1210,9 @@ impl App {
             return if if_exists { Ok(format!("No view {}.", name)) } else { Err(format!("No view called {}", name)) };
         };
         let rows = self.sheet_rows(key, st);
-        let Some(row) = rows.into_iter().find(|r| r.state != RowState::Deleted && r.vals.first().map(|v| v.cell_text().eq_ignore_ascii_case(name)).unwrap_or(false)) else {
+        let Some(row) =
+            rows.into_iter().find(|r| r.state != RowState::Deleted && r.vals.first().map(|v| v.cell_text().eq_ignore_ascii_case(name)).unwrap_or(false))
+        else {
             return if if_exists { Ok(format!("No view {}.", name)) } else { Err(format!("No view called {}", name)) };
         };
         self.apply_changes(key, st, vec![Change::Delete { row }], &Opts { strict: false, fk_checks: false })?;
@@ -1157,7 +1242,11 @@ impl App {
                         x.remember_chain_meta(dw.as_deref());
                         x.open = open;
                     });
-                    notes.push(format!("{}: {}", title, if open { "anyone may now add rows (they show as unofficial)" } else { "only the database wallet and listed wallets may add rows" }));
+                    notes.push(format!(
+                        "{}: {}",
+                        title,
+                        if open { "anyone may now add rows (they show as unofficial)" } else { "only the database wallet and listed wallets may add rows" }
+                    ));
                     continue;
                 }
                 let w = g.split('@').next().unwrap_or("").trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string();
@@ -1183,7 +1272,10 @@ impl App {
                 ));
             }
         }
-        msg(format!("{}. Saved on chain with the next COMMIT. (Writing is all-or-nothing on IQ: a wallet that may insert may also update and delete its own rows.)", notes.join("; ")))
+        msg(format!(
+            "{}. Saved on chain with the next COMMIT. (Writing is all-or-nothing on IQ: a wallet that may insert may also update and delete its own rows.)",
+            notes.join("; ")
+        ))
     }
 
     // ------------------------------------------------------------- SHOW
@@ -1211,7 +1303,11 @@ impl App {
                 rows_out("tables", &cols, rows, "")
             }
             Show::Databases => {
-                let rows = self.drafts.iter().map(|d| vec![json::s(&d.name), json::s(if d.root_sig.is_some() { "on the blockchain" } else { "not saved yet" })]).collect();
+                let rows = self
+                    .drafts
+                    .iter()
+                    .map(|d| vec![json::s(&d.name), json::s(if d.root_sig.is_some() { "on the blockchain" } else { "not saved yet" })])
+                    .collect();
                 rows_out("databases", &["Database", "Status"], rows, "Databases open in this editor")
             }
             Show::Columns { table, full } => {
@@ -1224,7 +1320,12 @@ impl App {
                             let snap = self.snapshot(key);
                             let eng = self.engine_for(key, &snap);
                             let r = eng.query(&sql::parse_query(&q)?, None)?;
-                            return rows_out(&table, &["Field", "Type"], r.names().iter().map(|n| vec![json::s(n), json::s("(view column)")]).collect(), "a view");
+                            return rows_out(
+                                &table,
+                                &["Field", "Type"],
+                                r.names().iter().map(|n| vec![json::s(n), json::s("(view column)")]).collect(),
+                                "a view",
+                            );
                         }
                         return Err(e);
                     }
@@ -1254,7 +1355,14 @@ impl App {
                     if m.on_update_now {
                         extra.push("on update CURRENT_TIMESTAMP".into());
                     }
-                    let mut row = vec![json::s(&tb.columns[c]), json::s(&type_sql(m, c == tb.id_col)), json::s(if m.not_null || c == tb.id_col { "NO" } else { "YES" }), json::s(keyk), def, json::s(&extra.join(" "))];
+                    let mut row = vec![
+                        json::s(&tb.columns[c]),
+                        json::s(&type_sql(m, c == tb.id_col)),
+                        json::s(if m.not_null || c == tb.id_col { "NO" } else { "YES" }),
+                        json::s(keyk),
+                        def,
+                        json::s(&extra.join(" ")),
+                    ];
                     if full {
                         row.push(json::s(&m.comment));
                     }
@@ -1264,7 +1372,16 @@ impl App {
                 if full {
                     cols.push("Comment");
                 }
-                rows_out(&tb.title, &cols, rows, format!("{} · {}", if tb.open { "open to everyone" } else { "locked to the owner" }, if tb.created.is_some() { "on the blockchain" } else { "not saved yet" }))
+                rows_out(
+                    &tb.title,
+                    &cols,
+                    rows,
+                    format!(
+                        "{} · {}",
+                        if tb.open { "open to everyone" } else { "locked to the owner" },
+                        if tb.created.is_some() { "on the blockchain" } else { "not saved yet" }
+                    ),
+                )
             }
             Show::CreateTable(table) => {
                 let t = self.tbl(key, &table)?;
@@ -1291,7 +1408,12 @@ impl App {
                         rows.push(vec![json::s(&tb.title), json::n(1), json::s(&f.name), json::n(i + 1), json::s(&name_of(c))]);
                     }
                 }
-                rows_out(&tb.title, &["Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name"], rows, "Keys here are rules (unique, links) — lookups don't need them")
+                rows_out(
+                    &tb.title,
+                    &["Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name"],
+                    rows,
+                    "Keys here are rules (unique, links) — lookups don't need them",
+                )
             }
             Show::TableStatus => {
                 let mut rows = vec![];
@@ -1304,9 +1426,11 @@ impl App {
                     let r = self.sheet_rows(key, t);
                     let (a, c, d) = sheet::pending(&r);
                     let live = r.iter().filter(|x| x.state != RowState::Deleted).count();
-                    let ai = tb.meta.iter().position(|m| m.auto_inc).map(|c| {
-                        r.iter().filter_map(|x| x.vals.get(c).and_then(eval::num)).fold(0.0f64, f64::max) as u64 + 1
-                    });
+                    let ai = tb
+                        .meta
+                        .iter()
+                        .position(|m| m.auto_inc)
+                        .map(|c| r.iter().filter_map(|x| x.vals.get(c).and_then(eval::num)).fold(0.0f64, f64::max) as u64 + 1);
                     rows.push(vec![
                         json::s(&tb.title),
                         json::n(live),
@@ -1343,7 +1467,12 @@ impl App {
                     rows.push(vec![json::s(if tb.is_system() { "(views)" } else { &tb.title }), json::n(a), json::n(c), json::n(d), json::s(structure)]);
                 }
                 let (cost, packs) = self.save_estimate(key);
-                rows_out("unsaved changes", &["table", "new", "changed", "deleted", "other"], rows, format!("COMMIT would write {} pack(s) · about {}", packs, crate::ui::sol(cost)))
+                rows_out(
+                    "unsaved changes",
+                    &["table", "new", "changed", "deleted", "other"],
+                    rows,
+                    format!("COMMIT would write {} pack(s) · about {}", packs, crate::ui::sol(cost)),
+                )
             }
             Show::Grants(table) => {
                 let mut rows = vec![];
@@ -1355,7 +1484,12 @@ impl App {
                     }
                     rows.push(vec![json::s(&tb.title), json::s(&writers_text(tb))]);
                 }
-                rows_out("grants", &["table", "who can add rows"], rows, "The database wallet can always write. GRANT INSERT ON t TO 'wallet' / TO PUBLIC changes this.")
+                rows_out(
+                    "grants",
+                    &["table", "who can add rows"],
+                    rows,
+                    "The database wallet can always write. GRANT INSERT ON t TO 'wallet' / TO PUBLIC changes this.",
+                )
             }
             Show::Variables => {
                 let mut rows: Vec<Vec<Json>> = self.ed.sql_vars.iter().map(|(k, v)| vec![json::s(k), v.clone()]).collect();
@@ -1401,7 +1535,12 @@ impl App {
         }
         lines.push(format!("  PRIMARY KEY ({})", sql_ident(&tb.columns[tb.id_col])));
         for ix in &tb.keys.indexes {
-            lines.push(format!("  {}KEY {} ({})", if ix.unique { "UNIQUE " } else { "" }, sql_ident(&ix.name), ix.cols.iter().map(|k| sql_ident(&name_of(tb, k))).collect::<Vec<_>>().join(", ")));
+            lines.push(format!(
+                "  {}KEY {} ({})",
+                if ix.unique { "UNIQUE " } else { "" },
+                sql_ident(&ix.name),
+                ix.cols.iter().map(|k| sql_ident(&name_of(tb, k))).collect::<Vec<_>>().join(", ")
+            ));
         }
         for f in &tb.keys.fks {
             let rt = d.tables.iter().find(|t| t.name == f.table);
@@ -1448,7 +1587,11 @@ impl App {
         for t in order {
             let tb = d.tables[t].clone();
             if structure {
-                out.push_str(&format!("-- --------------------------------------------------------\n-- Table {}\n\n{};\n\n", sql_ident(&tb.title), self.create_sql(key, &tb)));
+                out.push_str(&format!(
+                    "-- --------------------------------------------------------\n-- Table {}\n\n{};\n\n",
+                    sql_ident(&tb.title),
+                    self.create_sql(key, &tb)
+                ));
             }
             if data {
                 let rows: Vec<Vec<Json>> = self.sheet_rows(key, t).into_iter().filter(|r| r.state != RowState::Deleted).map(|r| r.vals).collect();

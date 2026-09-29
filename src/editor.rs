@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::app::{fetch_err, After, App, Load, TableView, Mode, Who, P};
+use crate::app::{fetch_err, After, App, Load, Mode, TableView, Who, P};
 use crate::host;
 use crate::iq;
 use crate::json::Json;
@@ -229,7 +229,9 @@ impl App {
                 if !self.table_pda_of(&key, t).map(|(_, p)| p == pda).unwrap_or(false) {
                     continue;
                 }
-                let taken = |d: &crate::state::Draft, n: &str| d.tables.iter().enumerate().any(|(j, x)| j != t && !x.dropped && (x.title.eq_ignore_ascii_case(n) || x.name.eq_ignore_ascii_case(n)));
+                let taken = |d: &crate::state::Draft, n: &str| {
+                    d.tables.iter().enumerate().any(|(j, x)| j != t && !x.dropped && (x.title.eq_ignore_ascii_case(n) || x.name.eq_ignore_ascii_case(n)))
+                };
                 let name_ok = !m.name.is_empty() && m.name.len() <= 64 && !taken(&self.drafts[di], &m.name);
                 let tb = &mut self.drafts[di].tables[t];
                 if tb.chain_title.is_none() && name_ok {
@@ -304,7 +306,8 @@ impl App {
         let official = |s: &str| owner.is_empty() || owner.iter().any(|o| o == s);
         let take = |p: &pack::SourcePack| allowed.is_empty() || allowed.contains(&p.signer);
         let seen: std::collections::HashSet<String> = tv.rows.iter().map(|r| r.get("__txSignature").str_or("")).collect();
-        let mut out: Vec<BaseRec> = pack::merge_events(&packs, &official, &take).0.into_iter().map(|m| BaseRec { key: m.key, vals: m.vals, signer: m.signer }).collect();
+        let mut out: Vec<BaseRec> =
+            pack::merge_events(&packs, &official, &take).0.into_iter().map(|m| BaseRec { key: m.key, vals: m.vals, signer: m.signer }).collect();
         // our own recent writes the chain read doesn't include yet
         for r in tb.rows.iter().filter(|r| r.sig.as_ref().map(|s| !seen.contains(s)).unwrap_or(false)) {
             let k = r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default();
@@ -315,7 +318,11 @@ impl App {
                 }
                 continue;
             }
-            let rec = BaseRec { key: k, vals: tb.col_keys().into_iter().zip(r.vals.iter().cloned()).collect(), signer: self.drafts[i].wallet.clone().unwrap_or_default() };
+            let rec = BaseRec {
+                key: k,
+                vals: tb.col_keys().into_iter().zip(r.vals.iter().cloned()).collect(),
+                signer: self.drafts[i].wallet.clone().unwrap_or_default(),
+            };
             match pos {
                 Some(p) => out[p] = rec,
                 None => out.push(rec),
@@ -338,7 +345,8 @@ impl App {
     pub fn sheet_view(&mut self, key: &str, t: usize) -> (Vec<SRow>, Vec<usize>) {
         let rows = self.sheet_rows(key, t);
         let q = self.ed.filter.to_lowercase();
-        let mut order: Vec<usize> = (0..rows.len()).filter(|&i| q.is_empty() || rows[i].vals.iter().any(|v| v.cell_text().to_lowercase().contains(&q))).collect();
+        let mut order: Vec<usize> =
+            (0..rows.len()).filter(|&i| q.is_empty() || rows[i].vals.iter().any(|v| v.cell_text().to_lowercase().contains(&q))).collect();
         if let Some((c, desc)) = self.ed.sort {
             order.sort_by(|&a, &b| {
                 let x = rows[a].vals.get(c).map(|v| v.cell_text()).unwrap_or_default();
@@ -514,7 +522,10 @@ impl App {
     fn selected_text(&mut self, key: &str, t: usize) -> Vec<Vec<String>> {
         let ((r0, c0), (r1, c1)) = self.range();
         let (rows, order) = self.sheet_view(key, t);
-        (r0..=r1).filter_map(|r| order.get(r).map(|&i| &rows[i])).map(|row| (c0..=c1).map(|c| row.vals.get(c).map(|v| v.cell_text()).unwrap_or_default()).collect()).collect()
+        (r0..=r1)
+            .filter_map(|r| order.get(r).map(|&i| &rows[i]))
+            .map(|row| (c0..=c1).map(|c| row.vals.get(c).map(|v| v.cell_text()).unwrap_or_default()).collect())
+            .collect()
     }
 
     fn clear_range(&mut self, key: &str, t: usize) {
@@ -744,8 +755,7 @@ impl App {
             other => {
                 // typing starts editing the cell, like Excel
                 if other.chars().count() == 1 && !key.contains("Ctrl+") && !key.contains("Alt+") {
-                    let ch = if shift { other.to_string() } else { other.to_string() };
-                    self.ed.editing = Some(ch);
+                    self.ed.editing = Some(other.to_string());
                     return (true, true);
                 }
                 if key == "Shift+ " || key == " " {
@@ -937,7 +947,8 @@ impl App {
                 if !restore.is_empty() {
                     self.edit_tb(&k, t, |tb, _| sheet::delete_rows(tb, &restore));
                 }
-                let del: Vec<crate::constraints::Change> = picked.iter().filter(|r| r.state != RowState::Deleted).map(|r| crate::constraints::Change::Delete { row: r.clone() }).collect();
+                let del: Vec<crate::constraints::Change> =
+                    picked.iter().filter(|r| r.state != RowState::Deleted).map(|r| crate::constraints::Change::Delete { row: r.clone() }).collect();
                 if !del.is_empty() {
                     let fk = self.fk_checks();
                     match self.apply_changes(&k, t, del, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
@@ -1103,24 +1114,22 @@ impl App {
         }
         let Some(i) = self.draft_idx(key) else { return };
         let Some(a) = self.account.as_ref() else {
-            self.err("Create a free account (or sign in) to save to the blockchain.");
+            self.err("Sign in with your wallet's key to save to the blockchain.");
             self.keep_toast = true;
             host::set_hash("#/account");
             return;
         };
         let main = a.main().map(|w| w.address());
         if self.drafts[i].wallet.is_none() {
-            let name = self.drafts[i].name.clone();
-            let a = self.account.as_mut().unwrap();
-            let w = a.new_wallet(&format!("db: {}", name), &format!("Wallet of database \"{}\"", name));
-            a.dirty = true;
-            self.drafts[i].wallet = Some(w.address());
+            self.drafts[i].wallet = main.clone();
             self.save_drafts();
-            self.persist_account();
         }
-        let wallet = self.drafts[i].wallet.clone().unwrap();
+        let Some(wallet) = self.drafts[i].wallet.clone() else {
+            self.err("Sign in with your wallet's key to save to the blockchain.");
+            return;
+        };
         if self.keypair(&wallet).is_none() {
-            self.err("This database's wallet isn't in the account you're signed in with.");
+            self.err("This database belongs to a wallet you're not signed in with. Drop in that wallet's key, or pick another wallet under Save → Advanced.");
             return;
         }
         // rows typed in bit by bit must be complete before they're saved
@@ -1132,7 +1141,11 @@ impl App {
         }
         if !problems.is_empty() {
             self.ed.tab = "save".into();
-            self.err(format!("Fill these in first: {}{}", problems.iter().take(3).cloned().collect::<Vec<_>>().join("; "), if problems.len() > 3 { format!(" (+{} more)", problems.len() - 3) } else { String::new() }));
+            self.err(format!(
+                "Fill these in first: {}{}",
+                problems.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+                if problems.len() > 3 { format!(" (+{} more)", problems.len() - 3) } else { String::new() }
+            ));
             return;
         }
         self.ed.tab = "save".into();
@@ -1147,7 +1160,11 @@ impl App {
         }
         let params = Json::Arr(vec![
             Json::Arr(addrs),
-            crate::json::obj(vec![("encoding", crate::json::s("base64")), ("dataSlice", crate::json::obj(vec![("offset", crate::json::n(0)), ("length", crate::json::n(0))])), ("commitment", crate::json::s("confirmed"))]),
+            crate::json::obj(vec![
+                ("encoding", crate::json::s("base64")),
+                ("dataSlice", crate::json::obj(vec![("offset", crate::json::n(0)), ("length", crate::json::n(0))])),
+                ("commitment", crate::json::s("confirmed")),
+            ]),
         ]);
         self.busy_note = Some("Checking your balance…".into());
         self.rpc("getMultipleAccounts", params, P::SaveCheck { key: key.to_string(), need: est, main });
@@ -1185,11 +1202,7 @@ impl App {
                     self.ok(format!("Moving {} from your balance to this database's wallet…", ui::sol(short)));
                     self.transfer(&m, &wallet, short, After::StartRun(key));
                 } else {
-                    self.err(format!(
-                        "Saving needs about {} and your balance is {}. Add funds, then save again.",
-                        ui::sol(want),
-                        ui::sol(main_bal + have)
-                    ));
+                    self.err(format!("Saving needs about {} and your balance is {}. Add funds, then save again.", ui::sol(want), ui::sol(main_bal + have)));
                     self.ed.tab = "save".into();
                 }
             }
