@@ -17,7 +17,7 @@ pub enum RowState {
     Deleted,
 }
 
-/// A saved record: (id, column → value pairs, who wrote it).
+/// A saved record: (id, storage key → value pairs, who wrote it).
 #[derive(Clone, Debug)]
 pub struct BaseRec {
     pub key: String,
@@ -43,10 +43,6 @@ impl SRow {
     }
 }
 
-fn align(cols: &[String], pairs: &[(String, Json)]) -> Vec<Json> {
-    cols.iter().map(|c| pairs.iter().find(|(k, _)| k == c).map(|(_, v)| v.clone()).unwrap_or(Json::Null)).collect()
-}
-
 fn padded(v: &[Json], n: usize) -> Vec<Json> {
     let mut v = v.to_vec();
     v.resize(n, Json::Null);
@@ -66,7 +62,7 @@ pub fn local_base(tb: &DraftTable) -> Vec<BaseRec> {
         if !map.contains_key(&key) && !order.contains(&key) {
             order.push(key.clone());
         }
-        map.insert(key.clone(), BaseRec { key, vals: tb.columns.iter().cloned().zip(padded(&r.vals, tb.columns.len())).collect(), signer: String::new() });
+        map.insert(key.clone(), BaseRec { key, vals: tb.col_keys().into_iter().zip(padded(&r.vals, tb.columns.len())).collect(), signer: String::new() });
     }
     order.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
@@ -87,8 +83,13 @@ pub fn rows(tb: &DraftTable, base: &[BaseRec]) -> Vec<SRow> {
     let mut used: HashSet<usize> = HashSet::new();
     let mut out = vec![];
     for b in base {
-        let bv = align(&tb.columns, &b.vals);
-        match pend.get(&b.key) {
+        let bv = crate::schema::align(&tb.meta, &b.vals);
+        // keyed by the current ID column (it may differ from when it was saved)
+        let bkey = match bv.get(id).map(|v| v.cell_text()) {
+            Some(k) if !k.is_empty() => k,
+            _ => b.key.clone(),
+        };
+        match pend.get(&bkey) {
             Some(&g) => {
                 used.insert(g);
                 let gr = &tb.rows[g];
@@ -213,6 +214,7 @@ pub fn apply_rows(tb: &mut DraftTable, updates: Vec<(SRow, Vec<Json>)>) -> Vec<S
 }
 
 pub fn insert_row(tb: &mut DraftTable) {
+    tb.fix_meta();
     tb.rows.push(GhostRow { vals: vec![Json::Null; tb.columns.len()], deleted: false, sig: None });
 }
 
@@ -256,15 +258,26 @@ fn has_saved_data(tb: &DraftTable, base: &[BaseRec]) -> bool {
 }
 
 pub fn add_column(tb: &mut DraftTable, name: &str, at: Option<usize>) -> Result<usize, String> {
+    add_column_def(tb, name, crate::schema::ColMeta::plain(""), at)
+}
+
+/// Add a column with a type and constraints; `meta.key` is filled in.
+pub fn add_column_def(tb: &mut DraftTable, name: &str, mut meta: crate::schema::ColMeta, at: Option<usize>) -> Result<usize, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Give the column a name".into());
     }
+    if name.chars().count() > 64 {
+        return Err("Column names are at most 64 characters".into());
+    }
     if tb.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
         return Err(format!("There's already a column called \"{}\"", name));
     }
+    tb.fix_meta();
+    meta.key = crate::schema::fresh_key(name, &tb.col_keys(), &tb.keys.retired);
     let at = at.unwrap_or(tb.columns.len()).min(tb.columns.len());
     tb.columns.insert(at, name.to_string());
+    tb.meta.insert(at, meta);
     for r in tb.rows.iter_mut() {
         if r.vals.len() >= at {
             r.vals.insert(at, Json::Null);
@@ -295,7 +308,20 @@ pub fn delete_column(tb: &mut DraftTable, c: usize) -> Result<(), String> {
     if c == tb.id_col {
         return Err("That's the ID column; every row needs one.".into());
     }
+    tb.fix_meta();
+    let key = tb.meta[c].key.clone();
+    if let Some(f) = tb.keys.fks.iter().find(|f| f.cols.contains(&key)) {
+        return Err(format!("\"{}\" is used by the link {} — remove the link first.", tb.columns[c], f.name));
+    }
+    for ix in tb.keys.indexes.iter_mut() {
+        ix.cols.retain(|k| *k != key);
+    }
+    tb.keys.indexes.retain(|ix| !ix.cols.is_empty());
+    if (tb.created.is_some() || tb.rows.iter().any(|r| r.sig.is_some())) && !tb.keys.retired.contains(&key) {
+        tb.keys.retired.push(key);
+    }
     tb.columns.remove(c);
+    tb.meta.remove(c);
     for r in tb.rows.iter_mut() {
         if c < r.vals.len() {
             r.vals.remove(c);
@@ -312,11 +338,12 @@ pub fn rename_column(tb: &mut DraftTable, base: &[BaseRec], c: usize, name: &str
     if c >= tb.columns.len() || name.is_empty() {
         return Err("Give the column a name".into());
     }
+    let _ = base;
     if tb.columns[c] == name {
         return Ok(());
     }
-    if has_saved_data(tb, base) {
-        return Err("Columns of a table that's already on the blockchain can't be renamed (the saved data keeps the old name). Add a new column instead.".into());
+    if name.chars().count() > 64 {
+        return Err("Column names are at most 64 characters".into());
     }
     if tb.columns.iter().enumerate().any(|(i, x)| i != c && x.eq_ignore_ascii_case(name)) {
         return Err(format!("There's already a column called \"{}\"", name));
@@ -325,12 +352,39 @@ pub fn rename_column(tb: &mut DraftTable, base: &[BaseRec], c: usize, name: &str
     Ok(())
 }
 
+/// Make column `c` the primary key. Every live row needs a value in it and
+/// no two rows may share one; saved rows are re-keyed when this is saved.
 pub fn set_id_column(tb: &mut DraftTable, base: &[BaseRec], c: usize) -> Result<(), String> {
     if c >= tb.columns.len() {
         return Err("No such column".into());
     }
-    if has_saved_data(tb, base) {
-        return Err("The ID column can't change once the table is on the blockchain.".into());
+    if c == tb.id_col {
+        return Ok(());
+    }
+    let rows = rows(tb, base);
+    let mut seen = HashSet::new();
+    for r in rows.iter().filter(|r| r.state != RowState::Deleted) {
+        let k = r.vals.get(c).map(|v| v.cell_text()).unwrap_or_default();
+        if k.is_empty() {
+            return Err(format!("\"{}\" can't be the ID: some rows have no value in it.", tb.columns[c]));
+        }
+        if !seen.insert(k.to_lowercase()) {
+            return Err(format!("\"{}\" can't be the ID: the value “{}” appears more than once.", tb.columns[c], k));
+        }
+    }
+    let _ = has_saved_data(tb, base);
+    // pending rows were matched to saved ones by the old ID: re-point them
+    let old = tb.id_col;
+    let saved: HashMap<String, Json> = rows.iter().filter_map(|r| r.base.as_ref().map(|b| (b.get(old).map(|v| v.cell_text()).unwrap_or_default(), b.get(c).cloned().unwrap_or(Json::Null)))).collect();
+    for g in tb.rows.iter_mut().filter(|g| g.sig.is_none() && g.deleted) {
+        let k = g.vals.get(old).map(|v| v.cell_text()).unwrap_or_default();
+        if let Some(v) = saved.get(&k) {
+            g.vals.resize(c.max(old) + 1, Json::Null);
+            g.vals[c] = v.clone();
+        }
+    }
+    if let Some(m) = tb.meta.get_mut(c) {
+        m.not_null = true;
     }
     tb.id_col = c;
     Ok(())
@@ -341,8 +395,11 @@ pub fn move_column(tb: &mut DraftTable, c: usize, to: usize) {
     if c >= n || to >= n || c == to {
         return;
     }
+    tb.fix_meta();
     let col = tb.columns.remove(c);
     tb.columns.insert(to, col);
+    let m = tb.meta.remove(c);
+    tb.meta.insert(to, m);
     for r in tb.rows.iter_mut() {
         r.vals.resize(n, Json::Null);
         let v = r.vals.remove(c);
@@ -365,16 +422,19 @@ pub fn adopt_columns(tb: &mut DraftTable, cols: &[String], id_name: Option<&str>
     let mut changed = false;
     if tb.columns.is_empty() {
         tb.columns = cols.to_vec();
+        tb.meta = cols.iter().map(|c| crate::schema::ColMeta::plain(c)).collect();
         tb.id_col = id_name.and_then(|n| cols.iter().position(|c| c == n)).unwrap_or(0);
         for r in tb.rows.iter_mut() {
             r.vals.resize(cols.len(), Json::Null);
         }
         return !cols.is_empty();
     }
+    tb.fix_meta();
     for c in cols {
-        if !tb.columns.contains(c) {
+        if !tb.meta.iter().any(|m| &m.key == c) && !tb.keys.retired.contains(c) {
             let at = tb.columns.len();
             tb.columns.push(c.clone());
+            tb.meta.push(crate::schema::ColMeta::plain(c));
             for r in tb.rows.iter_mut() {
                 if r.vals.len() >= at {
                     r.vals.push(Json::Null);

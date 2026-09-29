@@ -6,8 +6,8 @@ A database portal for [IQ Labs](https://iqlabs.dev) on-chain tables — browse e
 - **My tables**: everything your account has made in one place — databases your wallets own (with their tables and balances), drafts in this browser, and files your wallets inscribed.
 - **One-tap accounts**: "Create account" makes a wallet protected by a passkey (Face ID, Touch ID, Windows Hello or a phone). No wallet extension, no seed phrase, no name or email. Signing in on another device with the same passkey brings the same wallet back.
 - **Money in plain words**: *Add funds* shows the address and a QR code to send SOL to from an exchange; *Send* takes an address or a `name.sol`. Each database gets its own wallet automatically and is topped up from your balance when you save — people never have to manage wallets unless they open *Advanced*.
-- **Editor**: a spreadsheet (click a cell and type, Tab/Enter/arrows, copy and paste from Excel or Google Sheets, undo/redo, sort, filter, column menus) with phpMyAdmin-style tabs: *Browse*, *Structure*, *SQL*, *Import & export*, *Save*. Changes are held as ghost data until you press **Save to blockchain**, which shows the cost first.
-- **SQL console**: `SELECT` (WHERE, GROUP BY, ORDER BY, LIMIT, aggregates), `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `SHOW TABLES`, `SHOW CHANGES`, `DESCRIBE`, `COMMIT`, `ROLLBACK` — run against the saved rows plus your unsaved changes; `COMMIT` saves.
+- **Editor, laid out like phpMyAdmin**: databases and tables (and views) in a tree; a database has *Structure* (its tables with Browse / Structure / Search / Insert / Empty / Drop, create a table, import a spreadsheet as a table, views), *SQL*, *Search* (every table at once), *Export*, *Import*, *Operations* and *Save*; a table has *Browse* (a spreadsheet: type in cells, Tab/Enter/arrows, paste from Excel or Google Sheets, undo/redo, sort, filter), *Structure* (columns with types, "can be empty", defaults, auto-numbering, comments; Change / Drop / Primary / Unique / Index; keys, relations and rules; `SHOW CREATE TABLE`), *SQL*, *Search* (query by example, find and replace), *Insert* (a typed form), *Export* (CSV, JSON, SQL), *Import* (CSV, JSON, SQL), *Operations* (rename, comment, who can add rows, copy, compression, empty, delete) and *Save*. Every screen builds a SQL statement, runs it through the same engine as the SQL tab and shows it afterwards. Changes are held as ghost data until you press **Save to blockchain**, which shows the cost first.
+- **A MySQL-style SQL server in the browser**: joins, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, CTEs (incl. recursive), `GROUP BY … WITH ROLLUP`, window functions, ~100 functions, typed columns, `PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY` (with `CASCADE`/`SET NULL`)/`CHECK`/`NOT NULL`/`DEFAULT`/`AUTO_INCREMENT`, `ALTER TABLE` (add, drop, modify, change, rename and reorder columns; add and drop keys, relations and rules), `RENAME TABLE`, `TRUNCATE`, `DROP TABLE`, views, `GRANT`/`REVOKE`, `SHOW …`, `EXPLAIN`, and loading phpMyAdmin / mysqldump exports. Structure changes to saved tables cost one small write — rows already on chain aren't rewritten.
 - **Power users** can still use an encrypted account file holding many wallets (drop it anywhere on the page to sign in), import existing keys (Solana CLI `id.json`, base58 secret keys) and move SOL between wallets.
 - **Links and files in cells**: `https://…`, `name.sol` (opens in IQ's browser), `iq://table/<table>/<record>`, `iq://db/<database>` and `iq://tx/<signature>` are clickable. Attach a small file to a row and it's inscribed with IQ's own file instruction, then linked from the cell.
 - **Packing + compression**: hundreds of records per inscription, so a 0.001 SOL write carries a whole page of data.
@@ -21,7 +21,7 @@ Prototype. The Rust core is checked byte-for-byte against the official SDK (`@iq
 
 ## Deploy to IQ Pages
 
-`site/` holds the built app: one self-contained `index.html` (about 1.5 MB, WebAssembly embedded) and `iqpages.json`. With IQ's git CLI (`npm install -g @iqlabs-official/iq-git-cli`):
+`site/` holds the built app: one self-contained `index.html` (about 1.9 MB, WebAssembly embedded) and `iqpages.json`. With IQ's git CLI (`npm install -g @iqlabs-official/iq-git-cli`):
 
 ```bash
 cd site
@@ -49,7 +49,7 @@ python run.py --no-build   # serve the committed build as is
 ```bash
 rustup target add wasm32-unknown-unknown
 ./build.sh            # writes site/index.html, site/iqpages.json, dist/multi/
-cargo test --release  # 22 unit tests, incl. byte-for-byte SDK comparisons
+cargo test --release  # 33 unit tests, incl. byte-for-byte SDK comparisons
 ```
 
 No crates are used. If the wasm target can't be installed but `rust-src` can, `BUILD_STD=1 ./build.sh` builds the standard library from source.
@@ -70,10 +70,19 @@ No crates are used. If the wasm target can't be installed but `rust-src` can, `B
 - Contributors use the same flow with their own account; their rows show as unofficial.
 
 ### Editor
-- The sheet shows the saved rows (read from the chain, filtered to the database's own wallet and yours) with your unsaved changes on top: new rows are green, edited cells amber, deleted rows struck through. The Save tab and the bar above the sheet count them and show the cost.
-- Excel keys: type to replace, Enter/F2 to edit in place, Tab/Enter to move, arrows and Shift+arrows, Ctrl+C / Ctrl+V (tab-separated, so pasting from Excel or Sheets adds rows and columns as needed), Delete, Ctrl+Z / Ctrl+Y (a paste undoes in one step). Column menus sort, rename, set the ID column and delete columns; once a table has saved data, only adding columns is offered, since renaming would disconnect saved rows.
-- *Structure* holds table options (open to everyone / locked to the owner, compression) and columns; *Import & export* takes CSV/JSON and downloads the sheet; *Save* shows exactly what will be written and runs it with progress.
-- **SQL** (`src/sql.rs`, `src/sql_exec.rs`) is a small SQL dialect over the same model: reads see saved + unsaved rows; writes become unsaved changes like any edit, so `ROLLBACK`, Undo and the Save tab all work on them. Text comparisons are case-insensitive. `DROP TABLE` only removes tables that were never saved — on-chain data is permanent, and `DELETE` writes tombstones that hide rows rather than erasing them.
+- The sheet shows the saved rows (read from the chain, filtered to the database's own wallet and yours) with your unsaved changes on top: new rows are green, edited cells amber, deleted rows struck through, and cells a row still needs before it can be saved are outlined red. Headers show each column's type. The Save tab and the bar above the sheet count the changes and show the cost.
+- Excel keys: type to replace, Enter/F2 to edit in place, Tab/Enter to move, arrows and Shift+arrows, Ctrl+C / Ctrl+V (tab-separated, so pasting from Excel or Sheets adds rows and columns as needed), Delete, Ctrl+Z / Ctrl+Y (a paste undoes in one step). Column menus sort, rename, insert, move, set the ID column, open the column's type and rules, and delete columns.
+- New tables start the way most people want them: an automatic `id` number, then the named columns (untyped until you give them a type). Typing, pasting, the Insert form and SQL all go through one set of rules (`src/constraints.rs`): types are converted or rejected, keys must be unique, relations must point at existing rows (or cascade), rules must hold. The sheet lets you leave required cells for later and lists what's missing on the Save tab.
+- **SQL** (`src/sql/`, `src/sql_exec.rs`, `src/ddl.rs`) reads the saved + unsaved rows; writes become unsaved changes like any edit, so `ROLLBACK`, Undo and the Save tab all work on them. Comparisons follow MySQL's defaults (case-insensitive text, `'10' = 10`). It runs entirely in the page over rows read from the chain — there are no indexes, and none are needed at these sizes.
+- Views, and the rows of IQ Tables' own settings table (`_iqt`, hidden in the editor), are stored in the database like any table, so everyone who opens it sees them. Saved queries (bookmarks) stay in this browser.
+
+### Structure on chain
+A table's on-chain columns stay `id` and `p` forever; its *SQL* structure lives in **structure records** written into the table like packs (`{"id":"~s…","p":"IQT1s<json>"}`, compressed as `IQT1S`). Only records from the database's own wallet count, and the newest wins. A record holds the columns (display name, type, "can be empty", default, auto-numbering, comment), the primary key, unique keys and indexes, relations, rules and the table comment.
+
+- Records in packs are stored under **storage keys**, not display names, so renaming a column, reordering columns or changing a type is one structure record — the rows already on chain are read through the new structure, converted by type on the way out. Dropped columns' keys are retired, never reused. A column added to a saved table records the value older rows should show (its default).
+- Changing the primary key re-keys rows when they are read; `TRUNCATE` writes a record that hides everything saved before it.
+- `RENAME TABLE` and who-can-add-rows (`GRANT`/`REVOKE INSERT`, or Operations) use IQ's `update_table` instruction; the table's address never changes. `DROP TABLE` hides the rows and takes the table off the database's list with `update_db_root_table_list`. Both are allowed only for the database's creator — checked against the deployed program on devnet (see below).
+- Nothing on chain is ever erased: dropped tables, deleted rows and old structures stay in the chain's history; IQ Tables stops showing them.
 
 ### Packs
 A packed table has two on-chain columns, `id` and `p`. Each on-chain row is a *pack* of many records:
@@ -113,6 +122,9 @@ By default tables are read through IQ's gateway (fast, cached, with search and f
 | First write from a new wallet | ~0.05 SOL one-time rent (IQ user accounts: 4,213 + 4,215 bytes + user state) |
 | Create a database | ~0.0115 SOL rent (2,133-byte account) |
 | Create a table | ~0.015 SOL rent + 0.00093 SOL IQ table-creation fee |
+| Change a saved table's structure (`ALTER`, `TRUNCATE`) | one write: 0.001 SOL + 0.000005 SOL |
+| Rename a table or change who may add rows | 0.000005 SOL (plus rent if the table account has to grow) |
+| Drop a saved table | one write + 0.000005 SOL |
 
 Rent stays locked in the accounts; only the fees are spent. The simulation before each step shows the exact amount on the cluster you're using.
 
@@ -128,7 +140,12 @@ Rent stays locked in the accounts; only the fees are spent. The simulation befor
 | `src/accounts_flow.rs` | Passkeys, sign in/out, Add funds / Send, wallets, transfers, rescans, airdrops |
 | `src/sheet.rs` | Spreadsheet model: saved rows + unsaved changes, cell edits, paste, columns |
 | `src/editor.rs` | Editor state: selection, keys, undo/redo, save with automatic top-up |
-| `src/sql.rs`, `src/sql_exec.rs` | SQL tokenizer, parser and evaluator; running statements against a database |
+| `src/schema.rs` | Column types (conversion and display), column rules, keys, structure records |
+| `src/constraints.rs` | Applying changes under the table's rules (types, keys, relations with cascades, checks) |
+| `src/sql/` | SQL lexer, parser, expression evaluator (functions, regular expressions) and query engine |
+| `src/sql_exec.rs`, `src/ddl.rs` | Running statements against a database: DML, DDL, SHOW, dumps |
+| `src/dates.rs` | Dates and times for SQL (parsing, arithmetic, `DATE_FORMAT`) |
+| `src/ws_actions.rs` | What the editor's screens do (each builds and runs SQL) |
 | `src/app.rs` | State, routing, events, explorer and workspace flows |
 | `src/chain.rs` | Reading databases and rows straight from Solana |
 | `src/attach.rs` | Inscribing files into cells; the inscription viewer |
@@ -139,8 +156,8 @@ Rent stays locked in the accounts; only the fees are spent. The simulation befor
 | `tools/` | Reference fixtures from the official SDK and the end-to-end test (dev only) |
 
 ## Tests
-- `cargo test --release` (22 tests): hashes, Base58, Ed25519 signatures and 150 random PDAs against the SDK and noble; every instruction (`initialize_db_root`, `manage_table_creators`, `create_table` open/locked, `user_initialize`, `db_code_in`, `user_inventory_code_in`, `realloc_account`) byte-for-byte against the SDK's builder; full v1 transactions byte-identical to the SDK's `buildV1Transaction`; PBKDF2 and AES-GCM against Node; opening the SDK's `passwordEncrypt` output; parsing our own transactions back; account file round-trips and key-import formats; JSON escaping identical to `JSON.stringify`; codec and pack round-trips; merge rules; the spreadsheet model (edits, paste, saved-column rules); the SQL dialect against a draft database.
-- `cd tools && npm install && CHROME_PATH=/path/to/chrome npm run e2e` (89 checks): the built page in headless Chromium against a mock chain that verifies every signature (both wire formats), decodes every instruction with the program's IDL and compares its accounts and data with the SDK's builder, plus a mock IQ gateway and a virtual passkey authenticator. Covers: explore, search, HTML escaping; one-tap passkey accounts (nothing stored in the clear, same wallet on sign-in and on a fresh device), Add funds, sending to a `.sol` name; the spreadsheet (typing, Tab/Enter, paste from Excel, undo/redo, CSV import of 600 rows); SQL (DROP/CREATE/INSERT, WHERE/ORDER BY, GROUP BY, DELETE, SHOW CHANGES, COMMIT); saving with automatic database wallets and top-up; creating a file account (file opened with the SDK's `passwordDecrypt`, derivation checked independently); importing a CLI key file and pasted keys; refusing logout with unsaved keys; logging in by drag-and-drop; wrong passphrase; recovering a wallet made after the last save; "remember on this device"; dedicated database wallets and moving SOL; CSV import and packing; attaching a file (wallet setup + `user_inventory_code_in`); inscription with DbRoot realloc; locked vs open tables; web, record and file links; the file viewer and download; record links; My tables; editing a live record; unofficial contributions; growing pre-upgrade accounts before a v1 write; rejecting writes to a locked table at simulation; reading everything back straight from Solana with batched RPC; devnet airdrops; mobile layout.
+- `cargo test --release` (33 tests): hashes, Base58, Ed25519 signatures and 150 random PDAs against the SDK and noble; every instruction (`initialize_db_root`, `manage_table_creators`, `create_table` open/locked, `user_initialize`, `db_code_in`, `user_inventory_code_in`, `realloc_account`, `update_table` open/locked, `update_db_root_table_list`) byte-for-byte against the SDK's builder; full v1 transactions byte-identical to the SDK's `buildV1Transaction`; PBKDF2 and AES-GCM against Node; opening the SDK's `passwordEncrypt` output; parsing our own transactions back; account file round-trips and key-import formats; JSON escaping identical to `JSON.stringify`; codec and pack round-trips; merge rules; the spreadsheet model (edits, paste, saved-column rules); the SQL engine (joins, subqueries, grouping, window functions, functions), DDL and table rules, structure records, dumps and importing a phpMyAdmin export.
+- `cd tools && npm install && CHROME_PATH=/path/to/chrome npm run e2e` (133 checks): the built page in headless Chromium against a mock chain that verifies every signature (both wire formats), decodes every instruction with the program's IDL and compares its accounts and data with the SDK's builder, plus a mock IQ gateway and a virtual passkey authenticator. Covers: explore, search, HTML escaping; one-tap passkey accounts (nothing stored in the clear, same wallet on sign-in and on a fresh device), Add funds, sending to a `.sol` name; the spreadsheet (typing, Tab/Enter, paste from Excel, undo/redo, CSV import of 600 rows); SQL (DROP/CREATE/INSERT, WHERE/ORDER BY, GROUP BY, DELETE, SHOW CHANGES, COMMIT); saving with automatic database wallets and top-up; creating a file account (file opened with the SDK's `passwordDecrypt`, derivation checked independently); importing a CLI key file and pasted keys; refusing logout with unsaved keys; logging in by drag-and-drop; wrong passphrase; recovering a wallet made after the last save; "remember on this device"; dedicated database wallets and moving SOL; CSV import and packing; attaching a file (wallet setup + `user_inventory_code_in`); inscription with DbRoot realloc; locked vs open tables; web, record and file links; the file viewer and download; record links; My tables; editing a live record; unofficial contributions; phpMyAdmin-style administration of saved tables (the column form, `ALTER TABLE`, unique keys and rules enforced, the Insert form, query-by-example search with Edit links, find and replace, rename and writers via `update_table`, views, a JOIN over saved and unsaved rows, a MySQL-style dump, `TRUNCATE`, `DROP TABLE` via `update_db_root_table_list`, and a clean browser rebuilding the structure from the chain); growing pre-upgrade accounts before a v1 write; rejecting writes to a locked table at simulation; reading everything back straight from Solana with batched RPC; devnet airdrops; mobile layout.
 - `npm run qr`: decodes the generated QR with jsQR.
 
 ## Checked against the real program
@@ -150,6 +167,7 @@ IQ's program is deployed on devnet, and devnet has v1 transactions switched on. 
 - **Writer locks are enforced on chain**: an outsider's `db_code_in` to a locked table fails with the program's `NotAuthorized` (6000); the same write to an open table succeeds.
 - `user_initialize` creates full-size (post-upgrade) accounts on devnet, so no resize is needed for new wallets there.
 - The fees and sizes in the cost table above come from these runs.
+- **`update_table` and `update_db_root_table_list`** (used by rename, who-can-add-rows and `DROP TABLE`), built by the portal's Rust code for an existing devnet database: renaming a table, locking it to one writer and replacing the database's table list **succeeded** when signed by the database's creator, and each failed with `NotAuthorized` (6000) when signed by another funded wallet.
 - The deployed app itself was loaded in a real browser on devnet: it read balances and the database list (`getProgramAccounts`) straight from Solana.
 
 Still to do: a funded end-to-end run (the public devnet faucet was dry at the time), and mainnet.
@@ -158,7 +176,8 @@ Still to do: a funded end-to-end run (the public devnet faucet was dry at the ti
 1. **Its own domain**, so passkeys and browser storage belong to the portal alone (see [Deploy](#deploy-to-iq-pages)).
 2. **An RPC that accepts browser requests.** Solana's public mainnet endpoint answers browsers with `403 Access forbidden`, so balances, transfers and inscriptions need your own RPC URL in Settings (a free Helius, QuickNode or Triton key works). Reading tables doesn't need one — that goes through IQ's gateway.
 3. **v1 on mainnet**: Auto mode checks the v1 feature gate and uses legacy transactions (700-byte packs, ~5× more writes) until it's active.
-4. A first small real run (one database, one table, one pack, ~0.1 SOL) — the simulation step shows any program error and the exact cost before anything is sent.
+4. Know the limits: types, keys, relations and rules are enforced by IQ Tables (and any tool that reads the structure records), not by the chain — other programs can still write anything to an *open* table, and those rows show as unofficial. Auto-numbering on an open table can collide if two people add rows at the same time, since each browser numbers from the rows it has read; readers then keep the newer row under that id. Composite primary keys become an automatic `id` plus a unique key. There are no triggers, stored procedures or SQL users (`GRANT` maps to who may add rows).
+5. A first small real run (one database, one table, one pack, ~0.1 SOL) — the simulation step shows any program error and the exact cost before anything is sent.
 
 ## License
 MIT — see LICENSE.

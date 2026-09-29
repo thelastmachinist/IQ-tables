@@ -2,6 +2,7 @@
 //! been inscribed yet). Stored as JSON in the browser; exportable as a file.
 
 use crate::json::{self, Json};
+use crate::schema::{self, ColMeta, Doc, TableKeys};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TxFormat {
@@ -88,24 +89,164 @@ pub struct GhostRow {
     pub sig: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DraftTable {
+    /// On-chain name (the table's seed). Never changes once saved.
     pub name: String,
+    /// The table's name as people and SQL see it (RENAME TABLE changes it).
     pub title: String,
     pub columns: Vec<String>,
+    /// Per-column type and constraints, parallel to `columns`.
+    pub meta: Vec<ColMeta>,
     pub id_col: usize,
+    pub keys: TableKeys,
     pub open: bool,
+    /// Extra wallets allowed to add rows (GRANT), besides the database wallet.
+    pub writers: Vec<String>,
     pub compress: bool,
     /// Signature of create_table, or "existing" for tables already on chain.
     pub created: Option<String>,
     pub rows: Vec<GhostRow>,
+    /// The structure record as last read from / written to the chain.
+    pub chain_doc: Option<String>,
+    /// TRUNCATE is waiting to be saved: rows saved before are discarded.
+    pub clear: bool,
+    /// DROP TABLE is waiting to be saved.
+    pub dropped: bool,
+    /// Display name and writer list as last seen on chain (to spot renames
+    /// and privilege changes waiting to be saved).
+    pub chain_title: Option<String>,
+    pub chain_writers: Option<Vec<String>>,
 }
 
 impl DraftTable {
+    /// An untyped table (the pre-types layout).
+    pub fn plain(name: &str, columns: Vec<String>, id_col: usize) -> DraftTable {
+        let meta = columns.iter().map(|c| ColMeta::plain(c)).collect();
+        DraftTable { name: name.into(), title: name.into(), columns, meta, id_col, compress: true, ..Default::default() }
+    }
+    pub fn typed(name: &str, cols: Vec<(String, ColMeta)>, id_col: usize) -> DraftTable {
+        let (columns, meta) = cols.into_iter().unzip();
+        DraftTable { name: name.into(), title: name.into(), columns, meta, id_col, compress: true, ..Default::default() }
+    }
+    /// A new table the way most people want one: an automatic number as
+    /// the ID, then the given columns (untyped unless changed later).
+    pub fn starter(name: &str, cols: &[&str]) -> DraftTable {
+        use crate::schema::{IntKind, Ty};
+        let has_id = cols.iter().any(|c| c.eq_ignore_ascii_case("id"));
+        let mut v: Vec<(String, ColMeta)> = vec![];
+        if !has_id {
+            v.push(("id".into(), ColMeta { not_null: true, auto_inc: true, ..ColMeta::typed("id", Ty::Int(IntKind::Int, false)) }));
+        }
+        for c in cols {
+            v.push((c.to_string(), ColMeta::plain(c)));
+        }
+        let id = v.iter().position(|(n, _)| n.eq_ignore_ascii_case("id")).unwrap_or(0);
+        DraftTable::typed(name, v, id)
+    }
     pub fn ghosts(&self) -> usize {
         self.rows.iter().filter(|r| r.sig.is_none()).count()
     }
+    /// Keep `meta` in step with `columns` (older saved drafts have none).
+    pub fn fix_meta(&mut self) {
+        while self.meta.len() < self.columns.len() {
+            let c = self.columns[self.meta.len()].clone();
+            let used: Vec<String> = self.meta.iter().map(|m| m.key.clone()).collect();
+            self.meta.push(ColMeta::plain(&schema::fresh_key(&c, &used, &self.keys.retired)));
+        }
+        self.meta.truncate(self.columns.len());
+        if self.id_col >= self.columns.len() {
+            self.id_col = 0;
+        }
+    }
+    pub fn col_keys(&self) -> Vec<String> {
+        self.meta.iter().map(|m| m.key.clone()).collect()
+    }
+    pub fn pk_key(&self) -> String {
+        self.meta.get(self.id_col).map(|m| m.key.clone()).unwrap_or_default()
+    }
+    /// Who may write, as the chain will store it: nobody listed = anyone.
+    pub fn desired_writers(&self, db_wallet: Option<&str>) -> Vec<String> {
+        if self.open {
+            return vec![];
+        }
+        let mut v: Vec<String> = db_wallet.map(|w| vec![w.to_string()]).unwrap_or_default();
+        for w in &self.writers {
+            if !v.contains(w) {
+                v.push(w.clone());
+            }
+        }
+        v
+    }
+    /// A rename or a change of writers waits to be saved.
+    pub fn meta_changed(&self, db_wallet: Option<&str>) -> bool {
+        self.created.is_some()
+            && (self.chain_title.as_ref().map(|t| *t != self.title).unwrap_or(false) || self.chain_writers.as_ref().map(|w| *w != self.desired_writers(db_wallet)).unwrap_or(false))
+    }
+    /// Before changing the name or writers of a saved table, remember what the chain has.
+    pub fn remember_chain_meta(&mut self, db_wallet: Option<&str>) {
+        if self.created.is_some() {
+            if self.chain_title.is_none() {
+                self.chain_title = Some(self.title.clone());
+            }
+            if self.chain_writers.is_none() {
+                self.chain_writers = Some(self.desired_writers(db_wallet));
+            }
+        }
+    }
+    /// Tables IQ Tables keeps for itself (views and such).
+    pub fn is_system(&self) -> bool {
+        self.name.starts_with(SYSTEM_TABLE)
+    }
+    pub fn col(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+    }
+    pub fn doc(&self) -> Doc {
+        Doc {
+            cols: self.columns.iter().cloned().zip(self.meta.iter().cloned()).collect(),
+            pk: self.pk_key(),
+            keys: self.keys.clone(),
+            clear: self.clear,
+            dropped: self.dropped,
+        }
+    }
+    /// The structure without the one-off events, as text (for comparing).
+    pub fn doc_text(&self) -> String {
+        let mut d = self.doc();
+        d.clear = false;
+        d.dropped = false;
+        d.to_json().to_string()
+    }
+    /// Does saving need to write a structure record?
+    pub fn schema_changed(&self) -> bool {
+        if self.clear || self.dropped {
+            return true;
+        }
+        match &self.chain_doc {
+            Some(c) => *c != self.doc_text(),
+            None => !self.doc().is_trivial(),
+        }
+    }
+    /// Adopt a structure (read from the chain); pending rows follow their
+    /// columns by storage key.
+    pub fn apply_doc(&mut self, d: &Doc) {
+        let old_keys = self.col_keys();
+        let new_keys: Vec<String> = d.cols.iter().map(|(_, m)| m.key.clone()).collect();
+        if old_keys != new_keys {
+            for r in self.rows.iter_mut() {
+                let vals: Vec<Json> = new_keys.iter().map(|k| old_keys.iter().position(|o| o == k).and_then(|p| r.vals.get(p).cloned()).unwrap_or(Json::Null)).collect();
+                r.vals = vals;
+            }
+        }
+        self.columns = d.cols.iter().map(|(n, _)| n.clone()).collect();
+        self.meta = d.cols.iter().map(|(_, m)| m.clone()).collect();
+        self.id_col = d.pos(&d.pk).unwrap_or(0);
+        self.keys = d.keys.clone();
+    }
 }
+
+/// Name prefix of IQ Tables' own table in a database (views live there).
+pub const SYSTEM_TABLE: &str = "_iqt";
 
 #[derive(Clone, Debug)]
 pub struct Draft {
@@ -123,6 +264,8 @@ pub struct Draft {
     pub tables: Vec<DraftTable>,
     pub sel: usize,
     pub page: usize,
+    /// Saved queries (kept in this browser): (name, SQL).
+    pub bookmarks: Vec<(String, String)>,
 }
 
 impl Draft {
@@ -139,6 +282,7 @@ impl Draft {
             tables: vec![],
             sel: 0,
             page: 0,
+            bookmarks: vec![],
         }
     }
     pub fn ghosts(&self) -> usize {
@@ -184,20 +328,35 @@ pub fn drafts_to_json(ds: &[Draft]) -> Json {
                             d.tables
                                 .iter()
                                 .map(|t| {
-                                    json::obj(vec![
+                                    let mut o = json::obj(vec![
                                         ("name", json::s(&t.name)),
                                         ("title", json::s(&t.title)),
                                         ("columns", Json::Arr(t.columns.iter().map(|c| json::s(c)).collect())),
                                         ("idCol", json::n(t.id_col)),
+                                        ("schema", t.doc().to_json()),
                                         ("open", Json::Bool(t.open)),
                                         ("compress", Json::Bool(t.compress)),
                                         ("created", opt(&t.created)),
                                         ("rows", Json::Arr(t.rows.iter().map(row_to_json).collect())),
-                                    ])
+                                    ]);
+                                    if !t.writers.is_empty() {
+                                        o.set("writers", Json::Arr(t.writers.iter().map(|w| json::s(w)).collect()));
+                                    }
+                                    if let Some(c) = &t.chain_doc {
+                                        o.set("chainDoc", json::s(c));
+                                    }
+                                    if let Some(c) = &t.chain_title {
+                                        o.set("chainTitle", json::s(c));
+                                    }
+                                    if let Some(w) = &t.chain_writers {
+                                        o.set("chainWriters", Json::Arr(w.iter().map(|x| json::s(x)).collect()));
+                                    }
+                                    o
                                 })
                                 .collect(),
                         ),
                     ),
+                    ("bookmarks", Json::Arr(d.bookmarks.iter().map(|(n, q)| Json::Arr(vec![json::s(n), json::s(q)])).collect())),
                 ])
             })
             .collect(),
@@ -220,28 +379,54 @@ pub fn drafts_from_json(v: &Json) -> Vec<Draft> {
                 .get("tables")
                 .arr()
                 .iter()
-                .map(|t| DraftTable {
-                    name: t.get("name").str_or(""),
-                    title: t.get("title").str_or(""),
-                    columns: t.get("columns").arr().iter().map(|c| c.str_or("")).collect(),
-                    id_col: t.get("idCol").u64().unwrap_or(0) as usize,
-                    open: t.get("open").bool().unwrap_or(false),
-                    compress: t.get("compress").bool().unwrap_or(true),
-                    created: ostr(t.get("created")),
-                    rows: t
-                        .get("rows")
-                        .arr()
-                        .iter()
-                        .map(|r| GhostRow {
-                            vals: r.get("v").arr().to_vec(),
-                            deleted: r.get("d").bool().unwrap_or(false),
-                            sig: ostr(r.get("s")),
-                        })
-                        .collect(),
+                .map(|t| {
+                    let mut tb = DraftTable {
+                        name: t.get("name").str_or(""),
+                        title: t.get("title").str_or(""),
+                        columns: t.get("columns").arr().iter().map(|c| c.str_or("")).collect(),
+                        id_col: t.get("idCol").u64().unwrap_or(0) as usize,
+                        open: t.get("open").bool().unwrap_or(false),
+                        writers: t.get("writers").arr().iter().filter_map(|w| w.str().map(String::from)).collect(),
+                        compress: t.get("compress").bool().unwrap_or(true),
+                        created: ostr(t.get("created")),
+                        rows: t
+                            .get("rows")
+                            .arr()
+                            .iter()
+                            .map(|r| GhostRow {
+                                vals: r.get("v").arr().to_vec(),
+                                deleted: r.get("d").bool().unwrap_or(false),
+                                sig: ostr(r.get("s")),
+                            })
+                            .collect(),
+                        chain_doc: ostr(t.get("chainDoc")),
+                        chain_title: ostr(t.get("chainTitle")),
+                        chain_writers: match t.get("chainWriters") {
+                            Json::Arr(v) => Some(v.iter().filter_map(|w| w.str().map(String::from)).collect()),
+                            _ => None,
+                        },
+                        ..Default::default()
+                    };
+                    if tb.title.is_empty() {
+                        tb.title = tb.name.clone();
+                    }
+                    match Doc::from_json(t.get("schema")) {
+                        Some(d) => {
+                            tb.columns = d.cols.iter().map(|(n, _)| n.clone()).collect();
+                            tb.meta = d.cols.iter().map(|(_, m)| m.clone()).collect();
+                            tb.id_col = d.pos(&d.pk).unwrap_or(0);
+                            tb.keys = d.keys.clone();
+                            tb.clear = d.clear;
+                            tb.dropped = d.dropped;
+                        }
+                        None => tb.fix_meta(),
+                    }
+                    tb
                 })
                 .collect(),
             sel: 0,
             page: 0,
+            bookmarks: d.get("bookmarks").arr().iter().map(|b| (b.idx(0).str_or(""), b.idx(1).str_or(""))).collect(),
         })
         .collect()
 }

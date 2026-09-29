@@ -20,6 +20,7 @@ mod ffi {
         pub fn timer(id: u32, ms: u32);
         pub fn set_hash(p: *const u8, l: usize);
         pub fn passkey(id: u32, p: *const u8, l: usize);
+        pub fn tz() -> i32;
     }
 }
 
@@ -56,6 +57,10 @@ mod imp {
     }
     pub fn now_ms() -> f64 {
         unsafe { ffi::now() }
+    }
+    /// Minutes the browser's local time is ahead of UTC.
+    pub fn tz_offset_min() -> i32 {
+        unsafe { ffi::tz() }
     }
     pub fn random(buf: &mut [u8]) {
         unsafe { ffi::random(buf.as_mut_ptr(), buf.len()) }
@@ -104,6 +109,9 @@ mod imp {
     }
     pub fn now_ms() -> f64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
+    }
+    pub fn tz_offset_min() -> i32 {
+        0
     }
     pub fn random(buf: &mut [u8]) {
         let mut x = now_ms() as u64 | 1;

@@ -115,6 +115,7 @@
       take: (p) => { mem().set(staged, p); staged = null; },
       storage_set: (kp, kl, vp, vl) => { try { localStorage.setItem(str(kp, kl), str(vp, vl)); } catch (_) {} },
       now: () => Date.now(),
+      tz: () => -new Date().getTimezoneOffset(),
       random: (p, l) => crypto.getRandomValues(mem().subarray(p, p + l)),
       download: (np, nl, mp, ml, dp, dl) => {
         const a = document.createElement("a");

@@ -237,6 +237,30 @@ table.sheet tr.blank th { color: var(--accent); }
 .btn.primary-soft { border-color: var(--accent); color: var(--accent); }
 .btn.primary .muted { color: inherit; opacity: .7; }
 .savecard .big { margin: 4px 0; }
+.lastsql { display: flex; gap: 10px; align-items: baseline; background: var(--soft); border-radius: 8px; padding: 6px 10px; margin: 0 0 10px; font-size: .85rem; }
+.lastsql code { flex: 1; white-space: pre-wrap; word-break: break-word; }
+.formgrid.cols3 { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.acts { white-space: nowrap; }
+.acts .link { font-size: .88rem; }
+.btn.danger { color: var(--bad); border-color: var(--bad); background: var(--panel); }
+.btn.confirm { background: var(--bad); color: #fff; border-color: var(--bad); }
+.link.armed { font-weight: 700; text-decoration: underline; }
+.ty { font-size: .66rem; color: var(--muted); font-weight: 500; border: 1px solid var(--line); background: var(--panel); border-radius: 4px; padding: 0 4px; white-space: nowrap; }
+table.sheet td.req { box-shadow: inset 0 0 0 1px var(--bad); }
+.lg.req { background: transparent; border: 1px solid var(--bad); }
+.checks { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 6px 0; }
+.tree .grp { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 8px 0 2px 6px; }
+.tree .link.vw { padding: 3px 6px; color: var(--ink); max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.colform { border-color: var(--accent); }
+.dz { border-color: var(--bad-soft); }
+.writers { padding-left: 18px; margin: 8px 0; }
+.bms { gap: 4px 12px; }
+.bmk { display: inline-flex; gap: 2px; align-items: center; }
+input.bm { max-width: 320px; }
+table.grid.struct td { vertical-align: middle; }
+table.grid td.inval input:not([type=checkbox]), table.grid td.inval select, table.grid td.inval textarea { width: 100%; }
+table.res td.acts { width: 1%; }
+tfoot th { background: var(--soft); }
 @media (max-width: 860px) { .ed { grid-template-columns: 1fr; } .side { position: static; max-height: none; } }
 @media (max-width: 640px) {
   header.top { padding: 10px 16px; gap: 10px; }

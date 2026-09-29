@@ -189,6 +189,23 @@ out.ix.realloc = ser(
   iq.contract.reallocAccountInstruction(b, { payer: signer, target: root, system_program: SYS }, { new_size: new (require("@coral-xyz/anchor").BN)(4321) })
 );
 
+const utAccounts = { db_root: root, table: iq.contract.getTablePda(root, tseed, pid), signer };
+const utArgs = (writers) => ({
+  db_root_id: dbId,
+  table_seed: tseed,
+  table_name: Buffer.from("Parts we stock"),
+  column_names: ["id", "p"].map((s) => Buffer.from(s)),
+  id_col: Buffer.from("id"),
+  ext_keys: [],
+  gate_opt: null,
+  writers_opt: writers,
+});
+out.ix.updateTableLocked = ser(iq.contract.updateTableInstruction(b, utAccounts, utArgs([signer, creator])));
+out.ix.updateTableOpen = ser(iq.contract.updateTableInstruction(b, utAccounts, utArgs([])));
+out.ix.updateTableList = ser(
+  iq.contract.updateDbRootTableListInstruction(b, { db_root: root, signer }, { db_root_id: dbId, new_table_seeds: ["fasteners", "suppliers"].map((s) => Buffer.from(s)) })
+);
+
 // ATA derivation
 const owner = new PublicKey(rnd(32));
 const mint = new PublicKey(iq.constants.DEFAULT_IQ_MINT);

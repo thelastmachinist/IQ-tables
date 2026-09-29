@@ -13,7 +13,9 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+# drop the function-name section from the .wasm (~700 KB)
+strip = true

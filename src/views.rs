@@ -423,30 +423,40 @@ fn is_packed_table(tv: &TableView) -> bool {
     tv.decoded.iter().any(|d| d.is_some())
 }
 
-fn source_packs(tv: &TableView, official: Option<bool>) -> Vec<pack::SourcePack> {
+/// Every decoded pack (data and structure records), oldest first.
+fn all_packs(tv: &TableView) -> Vec<pack::SourcePack> {
     // gateway returns newest first; merge wants oldest first
-    tv.decoded
-        .iter()
-        .rev()
-        .filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok()))
-        .filter(|p| match (official, &tv.creator) {
-            (None, _) | (_, None) => true,
-            (Some(o), Some(c)) => (&p.signer == c) == o,
-        })
-        .cloned()
-        .collect()
+    tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect()
+}
+
+/// Records of one group of writers (None = all), with the owner's
+/// structure records applied, and the owner's latest structure.
+pub fn merged(tv: &TableView, official: Option<bool>) -> (Vec<pack::Merged>, Option<crate::schema::Doc>) {
+    let packs = all_packs(tv);
+    let creator = tv.creator.clone();
+    let is_owner = |s: &str| creator.as_deref().map(|c| c == s).unwrap_or(true);
+    let take = |p: &pack::SourcePack| match (official, &creator) {
+        (None, _) | (_, None) => true,
+        (Some(o), Some(c)) => (&p.signer == c) == o,
+    };
+    pack::merge_events(&packs, &is_owner, &take)
 }
 
 pub fn merged_records(tv: &TableView, who: Who) -> Vec<pack::Merged> {
     match who {
-        Who::Official => pack::merge(&source_packs(tv, Some(true))),
-        Who::Unofficial => pack::merge(&source_packs(tv, Some(false))),
+        Who::Official => merged(tv, Some(true)).0,
+        Who::Unofficial => merged(tv, Some(false)).0,
         Who::All => {
-            let mut v = pack::merge(&source_packs(tv, Some(true)));
-            v.extend(pack::merge(&source_packs(tv, Some(false))));
+            let mut v = merged(tv, Some(true)).0;
+            v.extend(merged(tv, Some(false)).0);
             v
         }
     }
+}
+
+/// The owner's latest structure record for a packed table, if any.
+pub fn table_doc(tv: &TableView) -> Option<crate::schema::Doc> {
+    merged(tv, Some(true)).1
 }
 
 /// Columns and rows for the current table view (filtered and sorted).
@@ -455,16 +465,28 @@ pub fn view_rows(tv: &TableView) -> (Vec<String>, Vec<VRow>) {
     let mut rows: Vec<VRow> = vec![];
     let official_of = |signer: &str| tv.creator.as_ref().map(|c| c == signer);
     if tv.mode == Mode::Records && is_packed_table(tv) {
-        let add = |recs: Vec<pack::Merged>, official: Option<bool>, rows: &mut Vec<VRow>, cols: &mut Vec<String>| {
+        // columns: the owner's structure (names, order, types), then any
+        // other keys found in rows (from other writers or older layouts)
+        let doc = table_doc(tv);
+        let mut keys: Vec<(String, Option<crate::schema::ColMeta>)> = vec![];
+        if let Some(d) = &doc {
+            for (n, m) in &d.cols {
+                cols.push(n.clone());
+                keys.push((m.key.clone(), Some(m.clone())));
+            }
+        }
+        let retired: Vec<String> = doc.as_ref().map(|d| d.keys.retired.clone()).unwrap_or_default();
+        let mut add = |recs: Vec<pack::Merged>, official: Option<bool>, rows: &mut Vec<VRow>, cols: &mut Vec<String>| {
             for m in recs {
                 for (c, _) in &m.vals {
-                    if !cols.contains(c) {
+                    if !keys.iter().any(|(k, _)| k == c) && !retired.contains(c) {
+                        keys.push((c.clone(), None));
                         cols.push(c.clone());
                     }
                 }
                 rows.push(VRow {
                     key: m.key.clone(),
-                    vals: vec![],
+                    vals: m.vals.iter().map(|(k, v)| Json::Arr(vec![Json::Str(k.clone()), v.clone()])).collect(),
                     signer: m.signer.clone(),
                     tx: m.tx.clone(),
                     time: m.time,
@@ -472,34 +494,30 @@ pub fn view_rows(tv: &TableView) -> (Vec<String>, Vec<VRow>) {
                     versions: m.versions,
                     packed: true,
                 });
-                let last = rows.last_mut().unwrap();
-                last.vals = m.vals.iter().map(|(_, v)| v.clone()).collect();
-                // stash names for re-alignment below
-                last.key = format!("{}\u{0}{}", m.key, m.vals.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join("\u{1}"));
             }
         };
         if tv.creator.is_none() {
-            add(pack::merge(&source_packs(tv, None)), None, &mut rows, &mut cols);
+            add(merged(tv, None).0, None, &mut rows, &mut cols);
         } else {
             if tv.who != Who::Unofficial {
-                add(pack::merge(&source_packs(tv, Some(true))), Some(true), &mut rows, &mut cols);
+                add(merged(tv, Some(true)).0, Some(true), &mut rows, &mut cols);
             }
             if tv.who != Who::Official {
-                add(pack::merge(&source_packs(tv, Some(false))), Some(false), &mut rows, &mut cols);
+                add(merged(tv, Some(false)).0, Some(false), &mut rows, &mut cols);
             }
         }
-        // align values to the union of columns
+        // align values to the columns, reading them through the types
         for r in rows.iter_mut() {
-            let (key, names) = r.key.split_once('\u{0}').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
-            let names: Vec<&str> = if names.is_empty() { vec![] } else { names.split('\u{1}').collect() };
-            let mut vals = vec![Json::Null; cols.len()];
-            for (i, n) in names.iter().enumerate() {
-                if let Some(p) = cols.iter().position(|c| c == n) {
-                    vals[p] = r.vals.get(i).cloned().unwrap_or(Json::Null);
-                }
-            }
-            r.vals = vals;
-            r.key = key;
+            let pairs: Vec<(String, Json)> = r.vals.iter().map(|p| (p.idx(0).str_or(""), p.idx(1).clone())).collect();
+            r.vals = keys
+                .iter()
+                .map(|(k, m)| match (pairs.iter().find(|(x, _)| x == k), m) {
+                    (Some((_, v)), Some(m)) => m.ty.read(v),
+                    (Some((_, v)), None) => v.clone(),
+                    (None, Some(m)) => m.fill.clone(),
+                    (None, None) => Json::Null,
+                })
+                .collect();
         }
     } else {
         if let Load::Ready(m) = &tv.meta {
@@ -580,11 +598,10 @@ fn table(app: &App, h: &mut String) {
         .clone()
         .or_else(|| tv.root.as_ref().and_then(|r| app.dbroots.ready()?.iter().find(|d| &d.pda == r).map(|d| d.name())))
         .unwrap_or_else(|| "database".into());
-    let title = tv
-        .label
-        .clone()
-        .or_else(|| tv.meta.ready().and_then(|m| m.get("name").str().map(String::from)))
-        .unwrap_or_else(|| solana::short(&tv.pda));
+    // the table's own name (RENAME TABLE changes it) before the database's hint
+    let meta_name = tv.meta.ready().and_then(|m| m.get("name").str().map(String::from)).filter(|n| !n.is_empty());
+    let title = meta_name.clone().or_else(|| tv.label.clone()).unwrap_or_else(|| solana::short(&tv.pda));
+    let stored_as = tv.label.clone().filter(|l| Some(l) != meta_name.as_ref() && meta_name.is_some());
     match &tv.root {
         Some(r) => h.push_str(&format!("<p class=\"crumbs\"><a href=\"#/\">Databases</a> › <a href=\"#/db/{}\">{}</a> › {}</p>", esc(r), esc(&dbname), esc(&title))),
         None => h.push_str(&format!("<p class=\"crumbs\"><a href=\"#/\">Databases</a> › {}</p>", esc(&title))),
@@ -592,6 +609,9 @@ fn table(app: &App, h: &mut String) {
     let packed = is_packed_table(tv);
     h.push_str(&format!("<h1>{}{}</h1>", esc(&title), if packed { " <span class=\"pill iqt\" title=\"Records are packed and compressed by IQ Tables\">IQT packed</span>" } else { "" }));
     h.push_str("<div class=\"kv\">");
+    if let Some(l) = &stored_as {
+        h.push_str(&format!("<div><span>Listed as</span><span class=\"mono small\">{}</span></div>", esc(l)));
+    }
     if let Load::Ready(m) = &tv.meta {
         let cols: Vec<String> = m.get("columns").arr().iter().map(|c| c.str_or("")).collect();
         h.push_str(&format!("<div><span>On-chain columns</span><span class=\"mono small\">{}</span></div>", esc(&cols.join(", "))));
@@ -623,8 +643,8 @@ fn table(app: &App, h: &mut String) {
     let (mut n_off, mut n_un) = (0usize, 0usize);
     if tv.creator.is_some() {
         if packed && tv.mode == Mode::Records {
-            n_off = pack::merge(&source_packs(tv, Some(true))).len();
-            n_un = pack::merge(&source_packs(tv, Some(false))).len();
+            n_off = merged(tv, Some(true)).0.len();
+            n_un = merged(tv, Some(false)).0.len();
         } else {
             for r in &tv.rows {
                 if tv.creator.as_deref() == r.get("__signer").str() {

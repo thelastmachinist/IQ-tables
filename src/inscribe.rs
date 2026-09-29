@@ -24,6 +24,14 @@ pub enum StepKind {
     /// Grow accounts made by the pre-upgrade program so v1 writes fit.
     Grow(Vec<(Pubkey, u64)>),
     Pack { t: usize, rows: Vec<usize>, payload: String, pack_id: String, count: usize },
+    /// A table-structure record (types, keys, renames; TRUNCATE / DROP).
+    Schema { t: usize, payload: String, doc: String },
+    /// Rename a table or change who may write to it (grow the account first if needed).
+    /// Rename / change writers; the table's own columns, ID column and
+    /// ext keys are kept as the chain has them.
+    UpdateTable { t: usize, realloc: Option<u64>, cols: Vec<String>, id_col: String, ext: Vec<String> },
+    /// Rewrite the database's table list (a dropped table comes off it).
+    TableList { seeds: Vec<Vec<u8>>, realloc: Option<u64> },
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +82,8 @@ pub struct Run {
     pub sent_at: f64,
     pub stop: bool,
     pub contributor: bool,
+    /// Dropped tables whose record is written: leave the editor when done.
+    pub dropped_done: Vec<String>,
 }
 
 impl Run {
@@ -98,9 +108,20 @@ impl Run {
             StepKind::Pack { t, count, pack_id, .. } => format!(
                 "Save {} rows to \"{}\" (pack {})",
                 count,
-                tables.get(*t).map(|x| x.name.as_str()).unwrap_or("?"),
+                tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?"),
                 pack_id
             ),
+            StepKind::Schema { t, .. } => {
+                let tb = tables.get(*t);
+                let what = match tb {
+                    Some(x) if x.dropped => "Delete",
+                    Some(x) if x.clear => "Empty and update the structure of",
+                    _ => "Save the structure of",
+                };
+                format!("{} \"{}\"", what, tb.map(|x| x.title.as_str()).unwrap_or("?"))
+            }
+            StepKind::UpdateTable { t, .. } => format!("Update the name / writers of \"{}\"", tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?")),
+            StepKind::TableList { .. } => "Update the database's list of tables".into(),
         }
     }
 }
@@ -112,7 +133,8 @@ fn guard(k: &StepKind) -> u64 {
         StepKind::Table(_) => iq::TABLE_COST_ESTIMATE,
         StepKind::UserInit => iq::USER_INIT_RENT_ESTIMATE,
         StepKind::Grow(_) => 50_000_000,
-        StepKind::Pack { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
+        StepKind::Pack { .. } | StepKind::Schema { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
+        StepKind::UpdateTable { realloc, .. } | StepKind::TableList { realloc, .. } => iq::TX_FEE + realloc.map(|r| iq::rent_exempt(r as usize) / 4).unwrap_or(0),
     }
 }
 
@@ -158,6 +180,7 @@ impl App {
             sent_at: 0.0,
             stop: false,
             contributor: false,
+            dropped_done: vec![],
         });
         self.prep();
     }
@@ -422,12 +445,33 @@ impl App {
             }
         }
         let tables = self.drafts[di].tables.clone();
+        let wallet_s = b58(&kp.pubkey);
         for (t, tb) in tables.iter().enumerate() {
             let on_chain = exists(8 + t);
             if on_chain {
                 if tb.created.is_none() {
                     self.drafts[di].tables[t].created = Some("existing".into());
                 }
+                // what the chain has now, for renames and writer changes; a
+                // table with no change of its own takes the chain's name and
+                // writers (so saving never changes what nobody asked to change)
+                if let Some(meta) = vals.get(8 + t).and_then(net::account_data).and_then(|d| iq::decode_table(&d)) {
+                    let owner = root.as_ref().map(|r| b58(&r.creator));
+                    let x = &mut self.drafts[di].tables[t];
+                    let chain_w: Vec<String> = meta.writers.iter().map(b58).collect();
+                    if x.chain_title.is_none() && !meta.name.is_empty() {
+                        x.title = meta.name.clone();
+                    }
+                    if x.chain_writers.is_none() {
+                        x.open = chain_w.is_empty();
+                        x.writers = chain_w.iter().filter(|w| Some(*w) != owner.as_ref()).cloned().collect();
+                    }
+                    x.chain_title = Some(meta.name.clone());
+                    x.chain_writers = Some(chain_w);
+                }
+                continue;
+            }
+            if tb.dropped {
                 continue;
             }
             if let Some(r) = &root {
@@ -454,7 +498,41 @@ impl App {
             }
         }
         let cap = if legacy { iq::INLINE_CAP_LEGACY } else { iq::INLINE_CAP_V1 };
+        let tables = self.drafts[di].tables.clone();
+        let mut list_change = false;
         for (t, tb) in tables.iter().enumerate() {
+            if !contributor && exists(8 + t) {
+                let desired = tb.desired_writers(Some(&wallet_s));
+                let chain_w = tb.chain_writers.clone().unwrap_or_default();
+                let title_differs = tb.chain_title.as_deref().map(|x| x != tb.title).unwrap_or(false);
+                let writers_differ = { let mut a = desired.clone(); let mut b = chain_w.clone(); a.sort(); b.sort(); a != b };
+                if !tb.dropped && (title_differs || writers_differ) {
+                    let meta = vals.get(8 + t).and_then(net::account_data).and_then(|d| iq::decode_table(&d));
+                    let (cols, id_col, ext) = match meta {
+                        Some(m) => (m.columns, m.id_col, m.ext_keys),
+                        None => (vec!["id".to_string(), "p".to_string()], "id".to_string(), vec![]),
+                    };
+                    let wpk: Vec<Pubkey> = desired.iter().filter_map(|w| solana::parse_pk(w)).collect();
+                    let seed = iq::seed_bytes(&tb.name);
+                    let spec = iq::TableSpec { db_id: &[], table_seed: &seed, hint: "", name: &tb.title, columns: &cols, id_col: &id_col, ext_keys: &ext, writers: Some(&wpk) };
+                    let need = iq::table_account_size(&spec);
+                    let have = len(8 + t);
+                    let realloc = (need > have).then(|| need + 64);
+                    steps.push(Step { kind: StepKind::UpdateTable { t, realloc, cols, id_col, ext }, sig: None, cost: None });
+                }
+            }
+            if tb.schema_changed() && !contributor {
+                let payload = pack::encode_schema(&tb.doc().to_json(), cap);
+                if pack::inscribed_size(&payload) > cap {
+                    self.fail(format!("The structure of \"{}\" is too large for one {} transaction ({} bytes).", tb.title, if legacy { "legacy" } else { "v1" }, pack::inscribed_size(&payload)));
+                    return;
+                }
+                steps.push(Step { kind: StepKind::Schema { t, payload, doc: tb.doc_text() }, sig: None, cost: None });
+            }
+            if tb.dropped {
+                list_change = true;
+                continue;
+            }
             let ghost_idx: Vec<usize> = tb.rows.iter().enumerate().filter(|(_, r)| r.sig.is_none()).map(|(i, _)| i).collect();
             if ghost_idx.is_empty() {
                 continue;
@@ -474,6 +552,34 @@ impl App {
                 Err(e) => {
                     self.fail(format!("Table \"{}\": {}", tb.name, e));
                     return;
+                }
+            }
+        }
+        // the database's table list: dropped tables come off, revived ones go back
+        if !contributor {
+            if let Some(rt) = &root {
+                let rp = iq::db_root_pda(self.drafts[di].name.as_bytes());
+                let pda_of = |h: &[u8]| -> Pubkey {
+                    let seed = match std::str::from_utf8(h) {
+                        Ok(s) if !s.is_empty() => iq::seed_bytes(s),
+                        _ => h.to_vec(),
+                    };
+                    iq::table_pda(&rp, &seed)
+                };
+                let dropped: Vec<Pubkey> = tables.iter().filter(|x| x.dropped && x.created.is_some()).map(|x| iq::table_pda(&rp, &iq::seed_bytes(&x.name))).collect();
+                let mut seeds: Vec<Vec<u8>> = rt.table_seeds.iter().filter(|h| !dropped.contains(&pda_of(h))).cloned().collect();
+                for x in tables.iter().filter(|x| !x.dropped && x.clear && x.created.is_some()) {
+                    let p = iq::table_pda(&rp, &iq::seed_bytes(&x.name));
+                    if !seeds.iter().any(|h| pda_of(h) == p) {
+                        seeds.push(x.name.as_bytes().to_vec());
+                    }
+                }
+                if seeds != rt.table_seeds || list_change && seeds.len() != rt.table_seeds.len() {
+                    let used = rt.used;
+                    let old: usize = rt.table_seeds.iter().map(|h| 4 + h.len()).sum();
+                    let new: usize = seeds.iter().map(|h| 4 + h.len()).sum();
+                    let realloc = (used + new > old + rt.account_len).then(|| (rt.account_len + 2048) as u64);
+                    steps.push(Step { kind: StepKind::TableList { seeds, realloc }, sig: None, cost: None });
                 }
             }
         }
@@ -509,6 +615,19 @@ impl App {
             r.state = RunState::Done;
             let spent = r.spent().map(ui::sol).unwrap_or_default();
             r.note(true, format!("Done. Spent {}.", spent));
+            let gone = std::mem::take(&mut r.dropped_done);
+            let key = r.draft.clone();
+            for name in gone {
+                if let Some(i) = self.draft_idx(&key) {
+                    if let Some(t) = self.drafts[i].tables.iter().position(|x| x.name == name && x.dropped) {
+                        self.drafts[i].tables.remove(t);
+                        self.drafts[i].sel = 0;
+                        self.table_removed(&key, t);
+                    }
+                }
+            }
+            self.save_drafts();
+            let r = self.run.as_mut().unwrap();
             let w = b58(&r.kp.pubkey);
             self.fetch_balance(&w);
             self.ok("Inscription complete");
@@ -558,7 +677,8 @@ impl App {
                     }
                 }
                 let cols = vec!["id".to_string(), "p".to_string()];
-                let writers = [kp.pubkey];
+                let desired = tb.desired_writers(Some(&b58(&kp.pubkey)));
+                let writers: Vec<Pubkey> = desired.iter().filter_map(|w| solana::parse_pk(w)).collect();
                 let creator = r.root_creator.unwrap_or(kp.pubkey);
                 ixs.push(iq::create_table(
                     &kp.pubkey,
@@ -581,10 +701,30 @@ impl App {
                     ixs.push(iq::realloc_account(&kp.pubkey, target, *size));
                 }
             }
-            StepKind::Pack { t, payload, .. } => {
+            StepKind::Pack { t, payload, .. } | StepKind::Schema { t, payload, .. } => {
                 let tb = &d.tables[*t];
                 let md = iq::inline_metadata(r.seq, &pack::row_json(payload));
                 ixs.push(iq::db_code_in_inline(&kp.pubkey, &db_id, &iq::seed_bytes(&tb.name), &md, r.iq_ata));
+            }
+            StepKind::UpdateTable { t, realloc, cols, id_col, ext } => {
+                let tb = &d.tables[*t];
+                let seed = iq::seed_bytes(&tb.name);
+                let root = iq::db_root_pda(&db_id);
+                if let Some(size) = realloc {
+                    ixs.push(iq::realloc_account(&kp.pubkey, &iq::table_pda(&root, &seed), *size));
+                }
+                let desired = tb.desired_writers(Some(&b58(&kp.pubkey)));
+                let writers: Vec<Pubkey> = desired.iter().filter_map(|w| solana::parse_pk(w)).collect();
+                ixs.push(iq::update_table(
+                    &kp.pubkey,
+                    &iq::TableSpec { db_id: &db_id, table_seed: &seed, hint: "", name: &tb.title, columns: cols, id_col, ext_keys: ext, writers: Some(&writers) },
+                ));
+            }
+            StepKind::TableList { seeds, realloc } => {
+                if let Some(size) = realloc {
+                    ixs.push(iq::realloc_account(&kp.pubkey, &iq::db_root_pda(&db_id), *size));
+                }
+                ixs.push(iq::update_db_root_table_list(&kp.pubkey, &db_id, seeds));
             }
         }
         let msg = solana::compile(&kp.pubkey, &ixs, bh);
@@ -664,7 +804,34 @@ impl App {
                 self.drafts[di].root_sig = Some(sig.clone());
                 self.run.as_mut().unwrap().root_creator = Some(self.run.as_ref().unwrap().kp.pubkey);
             }
-            StepKind::Table(t) => self.drafts[di].tables[*t].created = Some(sig.clone()),
+            StepKind::Table(t) => {
+                let signer_s = signer.clone();
+                let x = &mut self.drafts[di].tables[*t];
+                x.created = Some(sig.clone());
+                x.chain_title = Some(x.title.clone());
+                x.chain_writers = Some(x.desired_writers(Some(&signer_s)));
+            }
+            StepKind::UpdateTable { t, .. } => {
+                let signer_s = signer.clone();
+                let x = &mut self.drafts[di].tables[*t];
+                x.chain_title = Some(x.title.clone());
+                x.chain_writers = Some(x.desired_writers(Some(&signer_s)));
+            }
+            StepKind::TableList { .. } => {}
+            StepKind::Schema { t, payload, doc } => {
+                let x = &mut self.drafts[di].tables[*t];
+                x.chain_doc = Some(doc.clone());
+                x.clear = false;
+                let dropped = x.dropped.then(|| x.name.clone());
+                let root = iq::db_root_pda(self.drafts[di].name.as_bytes());
+                let tpda = b58(&iq::table_pda(&root, &iq::seed_bytes(&self.drafts[di].tables[*t].name)));
+                notify = Some((tpda, pack::row_json(payload)));
+                if let Some(n) = dropped {
+                    self.run.as_mut().unwrap().dropped_done.push(n);
+                }
+                let t = *t;
+                self.bump(&key, t);
+            }
             StepKind::UserInit => self.drafts[di].user_init_sig = Some(sig.clone()),
             StepKind::Grow(_) => {}
             StepKind::Pack { t, rows, payload, .. } => {

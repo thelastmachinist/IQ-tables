@@ -177,6 +177,31 @@ pub fn encode_payload(schema: &Schema, recs: &[Record], compress: bool) -> Strin
     }
 }
 
+/// A table-structure record ("IQT1s<json>", or "IQT1S<compressed json>").
+pub fn encode_schema(doc: &Json, cap: usize) -> String {
+    let plain = format!("{}s{}", MAGIC, doc);
+    if inscribed_size(&plain) <= cap {
+        return plain;
+    }
+    format!("{}S{}", MAGIC, codec::to_text(&codec::compress(doc.to_string().as_bytes())))
+}
+
+/// Decode any pack: data (schema + records) or a structure record.
+pub fn decode_any(p: &str) -> Result<(Schema, Vec<Record>, Option<Json>), String> {
+    let body = p.strip_prefix(MAGIC).ok_or("not an IQT1 pack")?;
+    let none = Schema { cols: vec!["id".into()], id: 0 };
+    match body.chars().next() {
+        Some('s') => Ok((none, vec![], Some(json::parse(&body[1..])?))),
+        Some('S') => {
+            let bytes = codec::from_text(&body[1..]).ok_or("bad text encoding")?;
+            let raw = codec::decompress(&bytes).ok_or("bad compressed stream")?;
+            let text = String::from_utf8(raw).map_err(|_| "bad structure record")?;
+            Ok((none, vec![], Some(json::parse(&text)?)))
+        }
+        _ => decode_payload(p).map(|(s, r)| (s, r, None)),
+    }
+}
+
 pub fn is_packed(v: &Json) -> bool {
     v.get("p").str().map(|p| p.starts_with(MAGIC)).unwrap_or(false)
 }
@@ -325,6 +350,8 @@ pub struct SourcePack {
     pub time: Option<i64>,
     pub schema: Schema,
     pub recs: Vec<Record>,
+    /// Set for a table-structure record.
+    pub meta: Option<Json>,
 }
 
 #[derive(Clone, Debug)]
@@ -339,9 +366,49 @@ pub struct Merged {
 
 /// Apply packs oldest-first: upserts replace by id, tombstones remove.
 pub fn merge(packs: &[SourcePack]) -> Vec<Merged> {
+    merge_events(packs, &|_| false, &|_| true).0
+}
+
+/// Merge with structure records applied in order: the official ones (from
+/// the table's owner) can clear everything saved before them and re-key the
+/// saved records by a new primary-key column. Returns the records and the
+/// latest official structure.
+pub fn merge_events(packs: &[SourcePack], official: &dyn Fn(&str) -> bool, take: &dyn Fn(&SourcePack) -> bool) -> (Vec<Merged>, Option<crate::schema::Doc>) {
     let mut order: Vec<String> = vec![];
     let mut map: std::collections::HashMap<String, Merged> = std::collections::HashMap::new();
+    let mut doc: Option<crate::schema::Doc> = None;
     for p in packs {
+        if let Some(m) = &p.meta {
+            if !official(&p.signer) {
+                continue;
+            }
+            let Some(d) = crate::schema::Doc::from_json(m) else { continue };
+            if d.clear {
+                map.clear();
+                order.clear();
+            }
+            if doc.as_ref().map(|x| x.pk != d.pk).unwrap_or(true) && !map.is_empty() {
+                // re-key what's saved so far by the (new) primary-key column
+                let old: Vec<Merged> = order.drain(..).filter_map(|k| map.remove(&k)).collect();
+                for mut m in old {
+                    if let Some((_, v)) = m.vals.iter().find(|(k, _)| *k == d.pk) {
+                        let nk = v.cell_text();
+                        if !nk.is_empty() {
+                            m.key = nk;
+                        }
+                    }
+                    if !map.contains_key(&m.key) {
+                        order.push(m.key.clone());
+                    }
+                    map.insert(m.key.clone(), m);
+                }
+            }
+            doc = Some(d);
+            continue;
+        }
+        if !take(p) {
+            continue;
+        }
         for r in &p.recs {
             let key = r.key(&p.schema);
             if r.deleted {
@@ -360,5 +427,5 @@ pub fn merge(packs: &[SourcePack]) -> Vec<Merged> {
             );
         }
     }
-    order.into_iter().filter_map(|k| map.remove(&k)).collect()
+    (order.into_iter().filter_map(|k| map.remove(&k)).collect(), doc)
 }

@@ -35,6 +35,8 @@ const IX_USER_INITIALIZE: [u8; 8] = [223, 157, 253, 44, 62, 158, 83, 137];
 const IX_DB_CODE_IN: [u8; 8] = [38, 100, 165, 242, 99, 137, 206, 108];
 const IX_REALLOC_ACCOUNT: [u8; 8] = [51, 237, 126, 233, 52, 244, 186, 244];
 const IX_USER_INVENTORY_CODE_IN: [u8; 8] = [81, 177, 5, 122, 213, 125, 21, 238];
+const IX_UPDATE_TABLE: [u8; 8] = [224, 23, 10, 48, 181, 73, 121, 187];
+const IX_UPDATE_DB_ROOT_TABLE_LIST: [u8; 8] = [57, 58, 185, 208, 50, 95, 94, 76];
 const ACC_DB_ROOT: [u8; 8] = [245, 92, 214, 180, 144, 59, 3, 240];
 const ACC_TABLE: [u8; 8] = [34, 100, 138, 97, 236, 129, 230, 112];
 const ACC_USER_STATE: [u8; 8] = [72, 177, 85, 249, 76, 167, 186, 126];
@@ -180,6 +182,31 @@ pub fn create_table(signer: &Pubkey, db_root_creator: &Pubkey, t: &TableSpec) ->
         ],
         b.0,
     )
+}
+
+/// `update_table`: change a table's display name and who may write to it
+/// (column list, ID column and extension keys are passed through as they are).
+pub fn update_table(signer: &Pubkey, t: &TableSpec) -> Instruction {
+    let root = db_root_pda(t.db_id);
+    let cols: Vec<Vec<u8>> = t.columns.iter().map(|c| c.as_bytes().to_vec()).collect();
+    let ext: Vec<Vec<u8>> = t.ext_keys.iter().map(|c| c.as_bytes().to_vec()).collect();
+    let mut b = Borsh::new(&IX_UPDATE_TABLE).bytes(t.db_id).bytes(t.table_seed).bytes(t.name.as_bytes()).vec_bytes(&cols).bytes(t.id_col.as_bytes()).vec_bytes(&ext).u8(0);
+    b = match t.writers {
+        Some(w) => b.u8(1).vec_pk(w),
+        None => b.u8(0),
+    };
+    ix(vec![AccountMeta::r(root), AccountMeta::w(table_pda(&root, t.table_seed)), AccountMeta::s(*signer)], b.0)
+}
+
+/// Bytes a Table account needs for these values (Anchor/Borsh layout).
+pub fn table_account_size(t: &TableSpec) -> u64 {
+    let v = |xs: &[String]| 4 + xs.iter().map(|x| 4 + x.len()).sum::<usize>();
+    (8 + v(t.columns) + 4 + t.id_col.len() + v(t.ext_keys) + 4 + t.name.len() + 8 + 32 + 8 + 1 + 4 + 32 * t.writers.map(|w| w.len()).unwrap_or(0)) as u64
+}
+
+/// `update_db_root_table_list`: replace the database's list of tables.
+pub fn update_db_root_table_list(signer: &Pubkey, db_id: &[u8], seeds: &[Vec<u8>]) -> Instruction {
+    ix(vec![AccountMeta::w(db_root_pda(db_id)), AccountMeta::s(*signer)], Borsh::new(&IX_UPDATE_DB_ROOT_TABLE_LIST).bytes(db_id).vec_bytes(seeds).0)
 }
 
 pub fn user_initialize(user: &Pubkey) -> Instruction {

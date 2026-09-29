@@ -62,6 +62,10 @@ impl AccountMeta {
     pub fn ws(pubkey: Pubkey) -> Self {
         AccountMeta { pubkey, is_signer: true, is_writable: true }
     }
+    /// Read-only signer.
+    pub fn s(pubkey: Pubkey) -> Self {
+        AccountMeta { pubkey, is_signer: true, is_writable: false }
+    }
 }
 
 #[derive(Clone, Debug)]

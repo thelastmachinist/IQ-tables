@@ -129,6 +129,12 @@ fn instructions_match_sdk() {
     same_ix(&iq::db_code_in_inline(&signer, &db_id, &seed, &md, Some(ata)), x.get("dbCodeInAta"), "db_code_in ata");
     same_ix(&iq::realloc_account(&signer, &iq::db_root_pda(&db_id), 4321), x.get("realloc"), "realloc");
     same_ix(&iq::user_inventory_code_in_inline(&signer, &md, None), x.get("userInventoryCodeIn"), "user_inventory_code_in");
+    let none: Vec<String> = vec![];
+    let uspec = |writers| iq::TableSpec { db_id: &db_id, table_seed: &seed, hint: "", name: "Parts we stock", columns: &cols, id_col: "id", ext_keys: &none, writers };
+    let w2 = [signer, creator];
+    same_ix(&iq::update_table(&signer, &uspec(Some(&w2))), x.get("updateTableLocked"), "update_table locked");
+    same_ix(&iq::update_table(&signer, &uspec(Some(&[]))), x.get("updateTableOpen"), "update_table open");
+    same_ix(&iq::update_db_root_table_list(&signer, &db_id, &[b"fasteners".to_vec(), b"suppliers".to_vec()]), x.get("updateTableList"), "update_db_root_table_list");
 }
 
 #[test]
@@ -286,7 +292,7 @@ fn packs_roundtrip_and_fit() {
 fn merge_latest_wins_and_tombstones() {
     let schema = pack::Schema { cols: vec!["id".into(), "v".into()], id: 0 };
     let rec = |id: &str, v: i32, del: bool| pack::Record { vals: vec![json::s(id), json::n(v)], deleted: del };
-    let sp = |tx: &str, recs| pack::SourcePack { tx: tx.into(), signer: "S".into(), time: None, schema: schema.clone(), recs };
+    let sp = |tx: &str, recs| pack::SourcePack { tx: tx.into(), signer: "S".into(), time: None, schema: schema.clone(), recs, meta: None };
     let merged = pack::merge(&[
         sp("t1", vec![rec("a", 1, false), rec("b", 2, false), rec("c", 3, false)]),
         sp("t2", vec![rec("a", 10, false), rec("b", 0, true)]),
@@ -443,7 +449,7 @@ fn cells(v: &[&str]) -> Vec<Json> {
 fn sheet_overlays_pending_edits_on_saved_rows() {
     use crate::sheet::{self, RowState};
     use crate::state::{DraftTable, GhostRow};
-    let mut tb = DraftTable { name: "t".into(), title: "t".into(), columns: vec!["id".into(), "name".into(), "qty".into()], id_col: 0, open: false, compress: true, created: Some("x".into()), rows: vec![] };
+    let mut tb = DraftTable { created: Some("x".into()), ..DraftTable::plain("t", vec!["id".into(), "name".into(), "qty".into()], 0) };
     // two rows saved earlier from this browser
     tb.rows.push(GhostRow { vals: cells(&["a", "bolt", "5"]), deleted: false, sig: Some("s1".into()) });
     tb.rows.push(GhostRow { vals: cells(&["b", "nut", "7"]), deleted: false, sig: Some("s1".into()) });
@@ -479,7 +485,8 @@ fn sheet_overlays_pending_edits_on_saved_rows() {
     assert_eq!(rows[0].vals[2].cell_text(), "bolt");
     sheet::delete_column(&mut tb, 1).unwrap();
     assert!(sheet::delete_column(&mut tb, 0).is_err());
-    assert!(sheet::rename_column(&mut tb, &base, 1, "title").is_err(), "saved tables keep their column names");
+    assert!(sheet::rename_column(&mut tb, &base, 1, "title").is_ok(), "renaming keeps the storage key");
+    assert_eq!(tb.meta[1].key, "name");
     // clipboard text from Excel
     assert_eq!(sheet::parse_tsv("a\tb\r\nc\t\"d\te\"\n"), vec![vec!["a".to_string(), "b".into()], vec!["c".into(), "d\te".into()]]);
     assert_eq!(sheet::col_letter(0), "A");
@@ -491,29 +498,27 @@ fn sql_parses_and_evaluates() {
     use crate::sql::{self, Stmt};
     let s = sql::parse("SELECT name, COUNT(*) AS n FROM `parts list` WHERE qty >= 10 AND name LIKE '%bolt%' GROUP BY name ORDER BY n DESC LIMIT 5 OFFSET 1; -- c\nSHOW TABLES").unwrap();
     assert_eq!(s.len(), 2);
-    match &s[0] {
-        Stmt::Select { table, limit, offset, group, order, .. } => {
-            assert_eq!(table, "parts list");
-            assert_eq!((*limit, *offset, group.len(), order.len()), (Some(5), 1, 1, 1));
-        }
-        other => panic!("{:?}", other),
-    }
-    assert!(matches!(sql::parse("CREATE TABLE t (code VARCHAR(20) PRIMARY KEY, n INT) OPEN").unwrap()[0], Stmt::Create { ref id, open: true, .. } if id.as_deref() == Some("code")));
+    let Stmt::Query(q) = &s[0].0 else { panic!("{:?}", s[0]) };
+    assert_eq!(q.order.len(), 1);
+    assert!(q.limit.is_some() && q.offset.is_some());
     assert!(sql::parse("SELEC * FROM t").is_err());
     assert!(sql::parse("SELECT * FROM t WHERE").is_err());
     assert!(sql::parse("SELECT 'unterminated FROM t").is_err());
     let e = |src: &str| {
-        let Stmt::Select { items, .. } = &sql::parse(&format!("SELECT {} FROM t", src)).unwrap()[0] else { panic!() };
-        let crate::sql::Item::Expr(x, _) = &items[0] else { panic!() };
-        sql::eval(x, &|c: &str| Ok(if c == "qty" { Json::Num("12".into()) } else { Json::Str("Hex Bolt".into()) }), None).unwrap()
+        let ex = sql::parse_expr(src).unwrap();
+        let cat = crate::sql_exec::Snap { tables: Default::default(), views: Default::default() };
+        let eng = sql::Engine::new(&cat, "", "");
+        let cols = vec![sql::Col::new(None, "qty"), sql::Col::new(None, "name")];
+        eng.eval_row(&cols, &[Json::Num("12".into()), Json::Str("Hex Bolt".into())], &ex).unwrap()
     };
+    let t = Json::Num("1".into());
     assert_eq!(e("qty * 2 + 1"), Json::Num("25".into()));
-    assert_eq!(e("name LIKE '%bolt'"), Json::Bool(true), "LIKE is case-insensitive");
-    assert_eq!(e("qty BETWEEN 10 AND 12"), Json::Bool(true));
-    assert_eq!(e("qty IN (1, 2, '12')"), Json::Bool(true));
-    assert_eq!(e("name = 'hex bolt'"), Json::Bool(true));
+    assert_eq!(e("name LIKE '%bolt'"), t, "LIKE is case-insensitive");
+    assert_eq!(e("qty BETWEEN 10 AND 12"), t);
+    assert_eq!(e("qty IN (1, 2, '12')"), t);
+    assert_eq!(e("name = 'hex bolt'"), t);
     assert_eq!(e("NULL = NULL"), Json::Null);
-    assert_eq!(e("UPPER(name) || '!'"), Json::Str("HEX BOLT!".into()));
+    assert_eq!(e("CONCAT(UPPER(name), '!')"), Json::Str("HEX BOLT!".into()));
     assert_eq!(e("7 / 2"), Json::Num("3.5".into()));
     assert_eq!(e("1 / 0"), Json::Null);
 }

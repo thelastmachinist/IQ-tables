@@ -146,7 +146,8 @@ function sameIx(ours, sdk, what) {
   sdk.keys.forEach((k, i) => {
     const o = ours.keys[i];
     const sameKey = sdk.keys.filter((x) => x.pubkey.equals(k.pubkey));
-    const expS = sameKey.some((x) => x.isSigner), expW = sameKey.some((x) => x.isWritable);
+    // the fee payer is writable in every transaction, whatever the instruction says
+    const expS = sameKey.some((x) => x.isSigner), expW = sameKey.some((x) => x.isWritable) || k.pubkey.toBase58() === chain.curPayer;
     if (o.isSigner !== expS || o.isWritable !== expW) bad();
   });
   if (!Buffer.from(ours.data).equals(Buffer.from(sdk.data))) throw new Error(`${what}: data differs from SDK`);
@@ -164,6 +165,7 @@ function encodeRoot(st, k, root, size) {
 function execute(st, tx) {
   const logs = [];
   debit(st, tx.feePayer.toBase58(), 5000 * tx.nsig, "tx fee");
+  chain.curPayer = tx.feePayer.toBase58();
   for (const ix of tx.instructions) {
     const prog = ix.programId.toBase58();
     if (prog === SYS) {
@@ -304,6 +306,37 @@ function execute(st, tx) {
       credit(st, FEE_RECEIVER, 1_000_000);
       st.pendingFiles = st.pendingFiles || [];
       st.pendingFiles.push({ signer: signer.toBase58(), metadata: a.metadata });
+    } else if (dec.name === "update_table") {
+      const root = iq.contract.getDbRootPda(Buffer.from(a.db_root_id), PID);
+      const seed = Buffer.from(a.table_seed);
+      const tpda = iq.contract.getTablePda(root, seed, PID);
+      sameIx(ix, iq.contract.updateTableInstruction(builder, { db_root: root, table: tpda, signer }, a), dec.name);
+      const r = decodeRoot(st, root.toBase58());
+      if (!r) throw new Error("db_root not found");
+      // as on devnet: only the database's creator may change a table (else NotAuthorized, 6000)
+      if (!r.creator.equals(signer)) throw new Error("custom program error: 0x1770 NotAuthorized");
+      const tacc = st.accounts.get(tpda.toBase58());
+      if (!tacc) throw new Error("table not found");
+      const cur = accCoder.decode("Table", tacc.data);
+      const cols = a.column_names.map((c) => Buffer.from(c).toString());
+      if (!cols.includes(Buffer.from(a.id_col).toString())) throw new Error("custom program error: 0x1782 IdColNotInColumns");
+      const next = { ...cur, name: a.table_name, column_names: a.column_names, id_col: a.id_col, ext_keys: a.ext_keys, writers: a.writers_opt === null ? cur.writers : a.writers_opt };
+      const enc = accCoder.encode("Table", next);
+      if (enc.length > tacc.data.length) throw new Error("custom program error: AccountDidNotSerialize (table account too small, realloc first)");
+      tacc.data = Buffer.concat([enc, Buffer.alloc(tacc.data.length - enc.length)]);
+      st.tableUpdates = (st.tableUpdates || 0) + 1;
+    } else if (dec.name === "update_db_root_table_list") {
+      const root = iq.contract.getDbRootPda(Buffer.from(a.db_root_id), PID);
+      sameIx(ix, iq.contract.updateDbRootTableListInstruction(builder, { db_root: root, signer }, a), dec.name);
+      const r = decodeRoot(st, root.toBase58());
+      if (!r) throw new Error("db_root not found");
+      if (!r.creator.equals(signer)) throw new Error("custom program error: 0x1770 NotAuthorized");
+      r.table_seeds = a.new_table_seeds.map((x) => Buffer.from(x));
+      const enc = accCoder.encode("DbRoot", r);
+      const racc = st.accounts.get(root.toBase58());
+      if (enc.length > racc.data.length) throw new Error("custom program error: AccountDidNotSerialize (DbRoot too small, realloc first)");
+      racc.data = Buffer.concat([enc, Buffer.alloc(racc.data.length - enc.length)]);
+      st.listUpdates = (st.listUpdates || 0) + 1;
     } else {
       throw new Error("unexpected instruction " + dec.name);
     }
@@ -326,6 +359,8 @@ function submit(raw, simulate) {
   if (simulate) return { tx, st, err, logs };
   if (!err) {
     chain.accounts = st.accounts;
+    chain.tableUpdates = (chain.tableUpdates || 0) + (st.tableUpdates || 0);
+    chain.listUpdates = (chain.listUpdates || 0) + (st.listUpdates || 0);
     const bt = ++blockTime;
     for (const p of st.pendingRows || []) {
       const list = chain.rows.get(p.table) || [];
@@ -545,7 +580,7 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     try { res = rpc(req.postData()); } catch (e) { res = { jsonrpc: "2.0", id: 1, error: { code: -1, message: "mock crashed: " + e.message } }; }
     return route.fulfill({ status: 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
   };
-  await page.route("**/*", async (route) => {
+  const handler = async (route) => {
     const req = route.request();
     const url = req.url();
     if (url.startsWith("https://iq.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: html });
@@ -555,7 +590,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     }
     if (url.startsWith("https://api.mainnet-beta.solana.com") || url.startsWith("https://api.devnet.solana.com")) return rpcRoute(route, req);
     return route.fulfill({ status: 404, body: "blocked in test: " + url });
-  });
+  };
+  await page.route("**/*", handler);
   // a passkey authenticator with the PRF extension (Face ID / Windows Hello stand-in)
   const cdp = await ctx.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
@@ -783,25 +819,31 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const rootPda = iq.contract.getDbRootPda(Buffer.from("e2e-parts"), PID).toBase58();
   const fastPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("fasteners"), PID).toBase58();
   const supPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("suppliers"), PID).toBase58();
-  // typing like a spreadsheet
+  // typing like a spreadsheet; the id column numbers rows by itself
+  check((await page.locator("table.sheet thead th").count()) === 4 && (await page.locator("table.sheet thead").innerText()).includes("id"), "a new sheet starts with an automatic id column");
   await cell(0, 0).click();
   await page.keyboard.type("A-1");
-  await page.keyboard.press("Tab");
-  await page.keyboard.type("Hex bolt");
   await page.keyboard.press("Enter");
   await page.waitForTimeout(100);
-  check((await sheetText()).includes("A-1\tHex bolt"), "click a cell, type, Tab and Enter — like Excel");
-  await cell(1, 0).click();
-  await page.evaluate(() => { const dt = new DataTransfer(); dt.setData("text/plain", "B-1\tNut\tsteel\tM8\nC-1\tWasher\tbrass\tM6\n"); document.getElementById("sheet").dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true })); });
+  check((await toast()).includes("whole number"), "the id column only takes numbers: " + (await toast()).slice(0, 80));
+  await cell(0, 1).click();
+  await page.keyboard.type("Hex bolt");
+  await page.keyboard.press("Tab");
+  await page.keyboard.type("zinc");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(100);
+  check((await sheetText()).includes("1\t1\tHex bolt\tzinc"), "click a cell, type, Tab and Enter — like Excel; the row got id 1");
+  await cell(1, 1).click();
+  await page.evaluate(() => { const dt = new DataTransfer(); dt.setData("text/plain", "Nut\tsteel\tM8\nWasher\tbrass\tM6\n"); document.getElementById("sheet").dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true })); });
   await page.waitForTimeout(150);
   const afterPaste = await sheetText();
-  check(afterPaste.includes("B-1\tNut\tsteel\tM8") && afterPaste.includes("C-1\tWasher"), "paste from Excel fills cells and adds a column when needed");
+  check(afterPaste.includes("2\tNut\tsteel\tM8") && afterPaste.includes("3\tWasher\tbrass\tM6"), "paste from Excel fills cells, numbers the rows and adds a column when needed");
   await page.keyboard.press("Control+z");
   await page.waitForTimeout(100);
-  check(!(await sheetText()).includes("B-1") && (await page.locator("table.sheet thead th").count()) === 4, "Ctrl+Z undoes the whole paste in one step");
+  check(!(await sheetText()).includes("Nut") && (await page.locator("table.sheet thead th").count()) === 4, "Ctrl+Z undoes the whole paste in one step");
   await page.keyboard.press("Control+y");
   await page.waitForTimeout(100);
-  check((await sheetText()).includes("C-1"), "Ctrl+Y redoes it");
+  check((await sheetText()).includes("Washer"), "Ctrl+Y redoes it");
   await shot("03-sheet");
 
   console.log("Editor: tables via the sidebar, import and SQL");
@@ -815,16 +857,22 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const rnd = (n) => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x % n; };
   const sups = ["Brazos Bolt & Nut, LLC", "Lone Star Fastener Co.", "Gulf Coast Supply", "Permian Industrial"];
   let csv = "part_no,name,material,thread,length_mm,qty,unit_price,supplier,updated\n";
+  const fastRows = [];
   for (let i = 0; i < 600; i++) {
     const k = kinds[rnd(6)], m = mats[rnd(5)], t = thr[rnd(5)], len = [10, 16, 20, 25, 30, 40, 50][rnd(7)];
-    csv += `FST-${String(1000 + i).padStart(6, "0")},"${k} ${t} x ${len}mm",${m},${t},${len},${rnd(5000)},${rnd(40)}.${String(rnd(100)).padStart(2, "0")},"${sups[rnd(4)]}",${1790000000000 + rnd(900000000) * 100}\n`;
+    const qty = rnd(5000), p1 = rnd(40), p2 = rnd(100), sup = sups[rnd(4)], up = rnd(900000000);
+    const part = `FST-${String(1000 + i).padStart(6, "0")}`;
+    fastRows.push({ part, material: m, qty, supplier: sup });
+    csv += `${part},"${k} ${t} x ${len}mm",${m},${t},${len},${qty},${p1}.${String(p2).padStart(2, "0")},"${sup}",${1790000000000 + up * 100}\n`;
   }
   await page.click("button[data-a='ed-tab'][data-arg='import']");
   await page.fill("textarea[data-arg^='csv:']", csv);
   await page.click("button[data-a='import-csv']");
   await waitText("Imported 600 rows");
-  await page.click("button[data-a='ed-tab'][data-arg='structure']");
-  await page.check("input[data-in='table-open']");
+  await page.click("button[data-a='ed-tab'][data-arg='operations']");
+  await page.click("button[data-a='op-access'][data-arg='open']");
+  await waitText("Anyone can add rows");
+  check((await page.locator(".lastsql").innerText()).includes("GRANT INSERT ON `fasteners` TO PUBLIC"), "Operations → Anyone runs GRANT … TO PUBLIC and shows it");
   await page.click("button[data-a='ed-tab'][data-arg='browse']");
   await cell(0, 0).click();
   await page.keyboard.type("FST-EDITED");
@@ -832,9 +880,9 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await page.waitForTimeout(100);
   check((await sheetText()).startsWith("1\tFST-EDITED"), "edited the first imported row in place");
   let out = await sql(`DROP TABLE sheet1; CREATE TABLE suppliers (name PRIMARY KEY, city, state, website, catalog, spec_file); INSERT INTO suppliers VALUES ('Brazos Bolt & Nut', 'Waco', 'TX', 'https://brazosbolt.example/catalog', 'iq://table/${fastPda}/FST-001001', NULL), ('Lone Star Fastener Co.', 'Austin', 'TX', NULL, NULL, NULL)`);
-  check(out.includes("Table sheet1 dropped") && out.includes("Table suppliers created") && out.includes("2 row(s) added"), "SQL: DROP TABLE, CREATE TABLE and INSERT");
+  check(out.includes("Table sheet1 dropped") && out.includes("Table suppliers created") && out.includes("2 row(s) inserted"), "SQL: DROP TABLE, CREATE TABLE and INSERT");
   out = await sql("SELECT name, city FROM suppliers WHERE state = 'tx' ORDER BY city; SELECT COUNT(*) AS n, material FROM fasteners WHERE material LIKE '%stainless' GROUP BY material ORDER BY n DESC LIMIT 1");
-  check(/Lone Star Fastener Co\.\s+Austin\s+Brazos Bolt & Nut\s+Waco/.test(out), "SQL: WHERE (case-insensitive) and ORDER BY over unsaved rows");
+  check(/Lone Star Fastener Co\.\s+Austin\s+(✎ edit\s+)?Brazos Bolt & Nut\s+Waco/.test(out), "SQL: WHERE (case-insensitive) and ORDER BY over unsaved rows");
   check(/\n\d+\s+(18-8|316) stainless/.test(out), "SQL: GROUP BY with COUNT(*)");
   out = await sql("DELETE FROM suppliers WHERE city = 'Austin'; SHOW CHANGES");
   check(out.includes("1 row(s) deleted") && /COMMIT would write \d+ pack/.test(out), "SQL: DELETE and SHOW CHANGES with a cost estimate");
@@ -875,7 +923,7 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   check(!acct(iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("sheet1"), PID).toBase58()), "the dropped table was never created");
   check(chain.txCount.v1 > 0, `v1 transactions used once the feature gate is on (${chain.txCount.v1} v1, ${chain.txCount.legacy} legacy)`);
   check((chain.reallocs || 0) >= 1, "DbRoot realloc path exercised (" + (chain.reallocs || 0) + ")");
-  check(chain.notifies.length === nPacks + 1, "IQ gateway notified for every pack (" + chain.notifies.length + ")");
+  check(chain.notifies.length === (chain.rows.get(fastPda) || []).length + (chain.rows.get(supPda) || []).length, "IQ gateway notified for every write (" + chain.notifies.length + ")");
   console.log("   instruction mix:", JSON.stringify(chain.ixSeen));
   await page.click("button[data-a='ed-tab'][data-arg='browse']");
   await page.waitForFunction(() => !document.querySelector(".pendbar"), null, { timeout: 20000 });
@@ -919,7 +967,7 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await cell(0, 5).click();
   await page.keyboard.type("9999");
   await page.keyboard.press("Enter");
-  await waitText("1 unsaved change(s) (1 edited)");
+  await waitText("1 row change (1 edited)");
   check((await page.locator("table.sheet td.chg").count()) === 1, "the edited cell is highlighted until saved");
   await page.click("button[data-a='inscribe']");
   await waitText("Saved ✓", 60000);
@@ -939,6 +987,205 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   check(/Files[\s\S]*torque-spec\.txt/.test(tm), "…and the files its wallets inscribed (IQ gateway /user/<wallet>/assets)");
   await shot("06-mine");
 
+  console.log("phpMyAdmin-style administration of saved tables");
+  const sqlBad = () => page.locator(".sqlout .sqlmsg.bad").allInnerTexts();
+  const lastSql = () => page.locator(".lastsql code").innerText().catch(() => "");
+  const effQty = (r) => (r.part === "FST-001123" ? 9999 : r.qty);
+  // suppliers (table 1): change a column with the form
+  await page.goto(`https://iq.test/#/ws/${dkey}/1`);
+  await page.waitForSelector("table.sheet");
+  await page.click("button[data-a='ed-tab'][data-arg='structure']");
+  await page.waitForSelector("table.struct");
+  await page.click("button[data-a='col-edit'][data-arg='2']");
+  await page.waitForSelector(".colform");
+  check((await page.inputValue("#ce-name")) === "state", "Change opens the column form filled in");
+  await page.selectOption("#ce-type", "enum");
+  await page.fill("#ce-param", "TX, OK, NM");
+  await page.fill("#ce-default", "TX");
+  await shot("06a-column-form");
+  await page.click("button[data-a='col-save']");
+  await page.waitForFunction(() => !document.querySelector(".colform"));
+  check((await lastSql()).includes("ALTER TABLE `suppliers` CHANGE `state` `state` ENUM('TX','OK','NM') DEFAULT 'TX'"), "column form → ALTER TABLE … CHANGE … ENUM … DEFAULT (shown like phpMyAdmin)");
+  await page.click("button[data-a='col-edit'][data-arg='new']");
+  await page.waitForSelector(".colform");
+  await page.fill("#ce-name", "rating");
+  await page.selectOption("#ce-type", "int");
+  await page.fill("#ce-default", "3");
+  await page.selectOption("select[data-arg='ce:place']", "name");
+  await page.click("button[data-a='col-save']");
+  await page.waitForFunction(() => !document.querySelector(".colform"));
+  check((await lastSql()).includes("ADD COLUMN `rating` INT DEFAULT 3 AFTER `name`"), "Add column form → ADD COLUMN … AFTER");
+  let out2 = await sql("ALTER TABLE suppliers RENAME COLUMN city TO town, ADD UNIQUE KEY web (website), ADD CONSTRAINT rating_range CHECK (rating BETWEEN 1 AND 5)");
+  check((await sqlBad()).length === 0, "SQL: ALTER TABLE with RENAME COLUMN, ADD UNIQUE and ADD CHECK in one statement" + ((await sqlBad()).join(" ")));
+  out2 = await sql("INSERT INTO suppliers (name, town, rating) VALUES ('Permian Industrial', 'Odessa', 9)");
+  check(/rating_range/.test((await sqlBad()).join(" ")), "CHECK constraint enforced on INSERT");
+  out2 = await sql("INSERT INTO suppliers (name, website) VALUES ('Copycat', 'https://brazosbolt.example/catalog')");
+  check(/unique|already/i.test((await sqlBad()).join(" ")), "UNIQUE key enforced");
+  // Insert tab: typed form
+  await page.click("button[data-a='ed-tab'][data-arg='insert']");
+  await page.fill("[data-arg='in:0']", "Permian Industrial");
+  await page.fill("[data-arg='in:1']", "4");
+  await page.fill("[data-arg='in:2']", "Odessa");
+  await page.click("button[data-a='insert-row']");
+  await waitText("1 row change (1 new)");
+  check((await lastSql()).includes("INSERT INTO `suppliers` (`name`, `rating`, `town`) VALUES ('Permian Industrial', 4, 'Odessa')"), "Insert tab → INSERT with typed values");
+  await page.click("button[data-a='ed-tab'][data-arg='browse']");
+  await page.waitForSelector("table.sheet");
+  const supSheet = await sheetText();
+  check(/Permian Industrial\t4\tOdessa\tTX/.test(supSheet) && /Brazos Bolt & Nut\t3\tWaco\tTX/.test(supSheet), "defaults fill the new row (TX) and the new column (3 for rows already saved)");
+  check((await page.locator("table.sheet thead").innerText()).includes("town"), "renamed column shows in the sheet");
+
+  // fasteners (table 0): types, rules, search, find & replace
+  await page.goto(`https://iq.test/#/ws/${dkey}/0`);
+  await page.waitForSelector("table.sheet");
+  out2 = await sql("ALTER TABLE fasteners MODIFY qty INT NOT NULL, MODIFY unit_price DECIMAL(8,2), ADD CONSTRAINT qty_ok CHECK (qty >= 0)");
+  check((await sqlBad()).length === 0, "SQL: MODIFY column types over 600 saved rows" + ((await sqlBad()).join(" ")));
+  out2 = await sql("UPDATE fasteners SET qty = -1 WHERE part_no = 'FST-001002'");
+  check(/qty_ok/.test((await sqlBad()).join(" ")), "CHECK enforced on UPDATE");
+  out2 = await sql("UPDATE fasteners SET qty = 'lots' WHERE part_no = 'FST-001001'");
+  check(/whole number/.test((await sqlBad()).join(" ")), "INT column rejects text");
+  await page.click("button[data-a='ed-tab'][data-arg='search']");
+  await page.selectOption("select[data-arg='sq:op:qty']", "gt");
+  await page.fill("#sq-qty", "4900");
+  await page.selectOption("select[data-arg='sq:op:material']", "eq");
+  await page.fill("#sq-material", "Brass");
+  await page.click("button[data-a='search-run']");
+  await page.waitForSelector("table.res");
+  const expBig = fastRows.filter((r) => effQty(r) > 4900 && r.material === "Brass").length;
+  const noteTxt = await page.locator(".card:has(table.res) p.muted").first().innerText();
+  check(noteTxt.startsWith(`${expBig} row`), `Search tab (qty > 4900 AND material = Brass): ${expBig} rows, like the data says (${noteTxt})`);
+  check((await page.locator("button[data-a='sql-edit']").count()) === expBig, "each result row has an Edit link");
+  await shot("06c-search");
+  const firstPart = (await page.locator("table.res tbody tr").first().locator("td").nth(1).innerText()).trim();
+  await page.locator("button[data-a='sql-edit']").first().click();
+  await page.waitForFunction(() => { const t = document.querySelector("table.sheet tbody"); return t && t.querySelectorAll("tr:not(.blank)").length === 1; }, null, { timeout: 5000 });
+  check((await sheetText()).includes(firstPart), "Edit opens that row in the sheet");
+  await page.click("button[data-a='ed-tab'][data-arg='search']");
+  await page.click("button[data-a='search-clear']");
+  await openDetails("Find and replace");
+  await page.selectOption("select[data-arg='rp:col']", "material");
+  await page.fill("#rp-find", "Brass");
+  await page.fill("#rp-with", "Bronze");
+  await page.click("button[data-a='replace-run']");
+  const nBrass = fastRows.filter((r) => r.material === "Brass").length;
+  await waitText(`${nBrass} row(s) changed`);
+  check((await lastSql()).startsWith("UPDATE `fasteners` SET `material` = REPLACE(`material`, 'Brass', 'Bronze')"), `Find and replace → UPDATE … REPLACE (${nBrass} rows)`);
+  // Browse shows types in the headers
+  await page.click("button[data-a='ed-tab'][data-arg='browse']");
+  await page.click("button[data-a='ed-tab'][data-arg='structure']");
+  await shot("06g-structure");
+  await page.click("button[data-a='ed-tab'][data-arg='insert']");
+  await shot("06h-insert");
+  await page.click("button[data-a='ed-tab'][data-arg='browse']");
+  check((await page.locator("table.sheet thead .ty").allInnerTexts()).includes("123"), "sheet headers show column types");
+
+  // Operations: rename, writers; database: a view and a scratch table
+  await page.goto(`https://iq.test/#/ws/${dkey}/1`);
+  await page.click("button[data-a='ed-tab'][data-arg='operations']");
+  await page.fill("#op-name", "vendors");
+  await page.click("button[data-a='op-rename']");
+  await waitText("▦ vendors");
+  check((await lastSql()) === "RENAME TABLE `suppliers` TO `vendors`", "Operations → RENAME TABLE");
+  const extraW = Keypair.fromSeed(Buffer.alloc(32, 11)).publicKey.toBase58();
+  await page.fill("#op-writer", extraW);
+  await page.click("button[data-a='op-writer-add']");
+  await page.waitForFunction(() => document.querySelectorAll(".writers li").length === 2);
+  check((await lastSql()) === `GRANT INSERT ON \`vendors\` TO '${extraW}'`, "Operations → allow a wallet (GRANT INSERT)");
+  await shot("06d-operations");
+  await page.goto(`https://iq.test/#/ws/${dkey}`);
+  await page.waitForSelector("button[data-a='ed-tab'][data-arg='operations']");
+  check((await page.locator("nav.tabs2 button").allInnerTexts()).map((x) => x.trim()).join(",").startsWith("Structure,SQL,Search,Export,Import,Operations,Save"), "database tabs like phpMyAdmin");
+  await openDetails("Create a view");
+  await page.fill("#vw-name", "stainless_stock");
+  await page.fill("#vw-sql", "SELECT material, SUM(qty) AS total FROM fasteners WHERE material LIKE '%stainless' GROUP BY material");
+  await page.click("button[data-a='view-create']");
+  await waitText("👁 stainless_stock");
+  await shot("06e-database");
+  out2 = await sql("SELECT * FROM stainless_stock ORDER BY material");
+  const sums = {};
+  for (const r of fastRows) if (r.material.endsWith("stainless")) sums[r.material] = (sums[r.material] || 0) + effQty(r);
+  check(out2.includes(`18-8 stainless\t${sums["18-8 stainless"]}`) && out2.includes(`316 stainless\t${sums["316 stainless"]}`), "a view is queried like a table (SUM over 600 rows)");
+  out2 = await sql("SELECT v.name, COUNT(f.part_no) AS parts FROM vendors v LEFT JOIN fasteners f ON f.supplier LIKE CONCAT(v.name, '%') GROUP BY v.name ORDER BY v.name");
+  const bz = fastRows.filter((r) => r.supplier.startsWith("Brazos Bolt & Nut")).length, pm = fastRows.filter((r) => r.supplier.startsWith("Permian Industrial")).length;
+  check(out2.includes(`Brazos Bolt & Nut\t${bz}`) && out2.includes(`Permian Industrial\t${pm}`), `JOIN + GROUP BY across saved and unsaved rows (${bz}, ${pm})`);
+  out2 = await sql("CREATE TABLE scratch (id INT AUTO_INCREMENT PRIMARY KEY, note VARCHAR(20) NOT NULL); INSERT INTO scratch (note) VALUES ('a'), ('b'), ('c')");
+  check((await sqlBad()).length === 0, "CREATE TABLE with types + INSERT");
+  await page.click("button[data-a='ed-tab'][data-arg='sql']");
+  await shot("06f-sql");
+  const dump = await download(async () => { await page.click("button[data-a='ed-tab'][data-arg='export']"); await page.click("button[data-a='export'][data-arg='db-sql']"); });
+  check(dump.name === "e2e-parts.sql" && dump.text.includes("CREATE TABLE `vendors`") && dump.text.includes("`state` ENUM('TX','OK','NM') DEFAULT 'TX'") && dump.text.includes("CONSTRAINT `rating_range` CHECK") && dump.text.includes("CREATE OR REPLACE VIEW `stainless_stock`"), "Export → a MySQL-style .sql dump with types, keys, rules and views");
+  await page.click("button[data-a='ed-tab'][data-arg='save']");
+  const plan2 = (await text()).replace(/\s+/g, " ");
+  check(plan2.includes("vendors: new structure") && plan2.includes("rename to “vendors”") && plan2.includes("change who can add rows") && plan2.includes("fasteners: new structure"), "Save lists structure, rename and writer changes");
+  const tuBefore = chain.tableUpdates || 0;
+  await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
+  await waitText("Saved ✓", 60000);
+  check(!(await page.locator(".run").textContent()).includes("failed"), "saved without errors");
+  const supMeta2 = accCoder.decode("Table", acct(supPda).data);
+  check(Buffer.from(supMeta2.name).toString() === "vendors" && supMeta2.writers.map((w) => w.toBase58()).includes(extraW) && supMeta2.writers.length === 2, "update_table: the table's name and writers changed on chain (checked against the SDK builder)");
+  check(supMeta2.column_names.map((c) => Buffer.from(c).toString()).join(",") === "id,p", "…keeping its on-chain columns");
+  check((chain.tableUpdates || 0) === tuBefore + 1, "one update_table transaction");
+  const isSchema = (r) => typeof r.p === "string" && /^IQT1[sS]/.test(r.p);
+  check((chain.rows.get(supPda) || []).some(isSchema) && (chain.rows.get(fastPda) || []).some(isSchema), "structure records written to both tables (one small write each)");
+  const iqtPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("_iqt"), PID).toBase58();
+  const scratchPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("scratch"), PID).toBase58();
+  check(!!acct(iqtPda) && !!acct(scratchPda), "views table and scratch table created");
+  // TRUNCATE and DROP a saved table
+  await page.click("button[data-a='ed-tab'][data-arg='structure']");
+  await page.waitForSelector("tr:has-text('scratch') button[data-a='op-truncate']");
+  await page.click("tr:has-text('scratch') button[data-a='op-truncate']");
+  check((await page.locator("tr:has-text('scratch') button[data-a='op-truncate']").innerText()).includes("Click again"), "Empty asks for a second click");
+  await page.click("tr:has-text('scratch') button[data-a='op-truncate']");
+  await waitText("will be emptied");
+  await page.click("button[data-a='ed-tab'][data-arg='save']");
+  await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
+  await waitText("Saved ✓", 60000);
+  await page.goto(`https://iq.test/#/t/${rootPda}/${scratchPda}`);
+  await page.waitForFunction(() => /showing 0 record/.test(document.getElementById("app").innerText), null, { timeout: 20000 });
+  check(true, "after TRUNCATE is saved, readers see the table empty");
+  await page.goto(`https://iq.test/#/ws/${dkey}`);
+  await page.waitForSelector("tr:has-text('scratch') button[data-a='op-drop']");
+  await page.click("tr:has-text('scratch') button[data-a='op-drop']");
+  await page.click("tr:has-text('scratch') button[data-a='op-drop']");
+  await page.waitForFunction(() => ![...document.querySelectorAll(".side a.tb")].some((a) => a.textContent.includes("scratch")));
+  await page.click("button[data-a='ed-tab'][data-arg='save']");
+  check((await text()).includes("scratch: delete the table"), "Save lists the dropped table");
+  await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
+  await waitText("Saved ✓", 60000);
+  const root3 = accCoder.decode("DbRoot", acct(rootPda).data);
+  const seeds3 = root3.table_seeds.map((x) => Buffer.from(x).toString());
+  check(!seeds3.includes("scratch") && seeds3.includes("fasteners") && seeds3.includes("suppliers") && chain.listUpdates === 1, "DROP TABLE: update_db_root_table_list took it off the database's list (" + seeds3.join(",") + ")");
+  await page.goto(`https://iq.test/#/db/${rootPda}`);
+  await waitText("fasteners");
+  check(!(await text()).includes("scratch"), "Explore no longer lists the dropped table");
+
+  // a clean browser reads the structure back from the chain
+  {
+    const ctx2 = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const p2 = await ctx2.newPage();
+    p2.on("pageerror", (e) => consoleErrors.push("pageerror(2): " + e.message));
+    await p2.route("**/*", handler);
+    await p2.goto(`https://iq.test/#/t/${rootPda}/${supPda}`);
+    await p2.waitForSelector("table.data td:has-text('Permian Industrial')", { timeout: 20000 });
+    const h2 = await p2.locator("table.data thead").innerText();
+    const r2 = (await p2.locator("table.data tbody tr:has-text('Permian Industrial')").innerText()).replace(/\s+/g, " ");
+    const b2 = (await p2.locator("table.data tbody tr:has-text('Brazos')").innerText()).replace(/\s+/g, " ");
+    check(/town/i.test(h2) && /rating/i.test(h2) && !/city/i.test(h2), "Explore shows the renamed and added columns from the structure record");
+    check(r2.includes("Odessa") && r2.includes("TX") && / 4 /.test(" " + r2 + " ") && / 3 /.test(" " + b2 + " "), "…with defaults applied to rows saved before the change");
+    check((await p2.locator("#app").innerText()).includes("vendors"), "…and the table's new name");
+    await p2.click("td:has-text('Permian Industrial')");
+    await p2.click("button:has-text('Edit in the Editor')");
+    await p2.waitForFunction(() => location.hash.startsWith("#/ws/"));
+    await p2.waitForSelector("table.sheet");
+    await p2.click("button[data-a='ed-tab'][data-arg='structure']");
+    await p2.waitForSelector("table.struct");
+    const st2 = (await p2.locator("#app").innerText()).replace(/\s+/g, " ");
+    check(st2.includes("Choice: TX, OK, NM") && st2.includes("rating_range") && st2.includes("web") && st2.includes("Whole number"), "the editor rebuilds types, keys and rules from the chain");
+    check(await p2.waitForSelector(".side button[data-a='view-open']:has-text('stainless_stock')", { timeout: 10000 }).then(() => true).catch(() => false), "…and the database's views");
+    await ctx2.close();
+  }
+  await shot("06b-structure");
+
   console.log("Unofficial contribution from a second person");
   await menu("Sign out");
   await page.goto("https://iq.test/#/account");
@@ -953,9 +1200,11 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await waitText("Imported 1 new wallet");
   const oa = otherKp.publicKey.toBase58();
   check((await addrOf("other")) === oa, "pasted \"label: base58-key\" imported");
-  await page.goto(`https://iq.test/#/ws/${dkey}/0`);
-  await page.click("button[data-a='ed-tab'][data-arg='structure']");
-  await page.click("button[data-a='del-draft']");
+  await page.goto(`https://iq.test/#/ws/${dkey}`);
+  await page.click("button[data-a='ed-tab'][data-arg='operations']");
+  await page.click("button[data-a='del-draft-confirm']");
+  await page.click("button[data-a='del-draft-confirm']");
+  await page.waitForFunction(() => location.hash === "#/ws");
   await page.goto("https://iq.test/#/ws");
   await page.fill("#newdb", "e2e-parts");
   await page.press("#newdb", "Enter");

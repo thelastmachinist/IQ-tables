@@ -2448,6 +2448,64 @@
     ]
    ],
    "data": "33ed7ee934f4baf4e110000000000000"
+  },
+  "updateTableLocked": {
+   "program": "9KLLchQVJpGkw4jPuUmnvqESdR7mtNCYr3qS4iQLabs",
+   "keys": [
+    [
+     "25nUg5qck3x73DyL4c2ACuPbTjzyJyLTRzyEsmEPYDMY",
+     false,
+     false
+    ],
+    [
+     "6fswS8iTuX6xM4ETisQLGZXqRjM26mDy522Gp4Yc51Dm",
+     false,
+     true
+    ],
+    [
+     "HQFr1tQDB5G59onGSzqchBXhynoCwGNEB5kh9KmwRaAV",
+     true,
+     false
+    ]
+   ],
+   "data": "e0170a30b54979bb0b0000006d792d70617274732d6462200000002ac9551907b090b5b0e0e6861b5c616ffd235df060db474c991c103310456d610e00000050617274732077652073746f636b02000000020000006964010000007002000000696400000000000102000000f3b022841b7fc7bf685f08b201b54de9b2f10675d1b1f4e21a79ab82c4b85aea97f21d8c4065c1198abd7e55863b8d7e7308db28bc69d863c2d695553cca3bf8"
+  },
+  "updateTableOpen": {
+   "program": "9KLLchQVJpGkw4jPuUmnvqESdR7mtNCYr3qS4iQLabs",
+   "keys": [
+    [
+     "25nUg5qck3x73DyL4c2ACuPbTjzyJyLTRzyEsmEPYDMY",
+     false,
+     false
+    ],
+    [
+     "6fswS8iTuX6xM4ETisQLGZXqRjM26mDy522Gp4Yc51Dm",
+     false,
+     true
+    ],
+    [
+     "HQFr1tQDB5G59onGSzqchBXhynoCwGNEB5kh9KmwRaAV",
+     true,
+     false
+    ]
+   ],
+   "data": "e0170a30b54979bb0b0000006d792d70617274732d6462200000002ac9551907b090b5b0e0e6861b5c616ffd235df060db474c991c103310456d610e00000050617274732077652073746f636b02000000020000006964010000007002000000696400000000000100000000"
+  },
+  "updateTableList": {
+   "program": "9KLLchQVJpGkw4jPuUmnvqESdR7mtNCYr3qS4iQLabs",
+   "keys": [
+    [
+     "25nUg5qck3x73DyL4c2ACuPbTjzyJyLTRzyEsmEPYDMY",
+     false,
+     true
+    ],
+    [
+     "HQFr1tQDB5G59onGSzqchBXhynoCwGNEB5kh9KmwRaAV",
+     true,
+     false
+    ]
+   ],
+   "data": "393ab9d0325f5e4c0b0000006d792d70617274732d6462020000000900000066617374656e65727309000000737570706c69657273"
   }
  },
  "ata": {
@@ -2590,8 +2648,8 @@
  "sdkPassword": {
   "password": "hunter2 but longer",
   "plaintext": "7b2268656c6c6f223a224951205461626c6573222c226e223a34327d",
-  "salt": "65e267009af46a9bcc07e667164be181",
-  "iv": "5855fe28134e6930c81b0c2a",
-  "ciphertext": "67ae39a5e556f250eeff5a2be88192fee67b0bd9e46b3fcc578695ab5ca5374b67d88255b074b894387d6c2a"
+  "salt": "c7e276e6fe10e84a4ee9aa1f84f59308",
+  "iv": "d356199c0264e9ce2e9f664f",
+  "ciphertext": "8be7def28a75e2a36ecb7b366d401f24d60f62202f4fbbcc3e7cfe86cdc124235d2174985a933a202a527572"
  }
 }

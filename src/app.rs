@@ -105,6 +105,8 @@ pub enum P {
     Rows(String, u32),
     RootInfo(String, u32),
     NameCheck { draft: String, name: String },
+    /// The Table account behind an editor table (its name and writers).
+    BaseAcct(String),
     Balance(String),
     Confirm { what: String, sig: String, since: f64, after: After },
     ConfirmTick { what: String, sig: String, since: f64, after: After },
@@ -463,8 +465,20 @@ impl App {
             ["mine"] => Route::Mine,
             ["account"] => Route::Account,
             ["ws"] => Route::Workspace,
-            ["ws", key] => Route::Draft(key.to_string()),
+            ["ws", key] => {
+                // opening a database shows its tables, as in phpMyAdmin
+                self.ed.scope_db = true;
+                self.ed.tab = "structure".into();
+                self.ed.col_edit = None;
+                Route::Draft(key.to_string())
+            }
             ["ws", key, t] => {
+                // from the database's screens, a table opens on Browse
+                if self.ed.scope_db && self.ed.tab != "structure" {
+                    self.ed.tab = "browse".into();
+                }
+                self.ed.scope_db = false;
+                self.ed.col_edit = None;
                 if let (Some(i), Ok(t)) = (self.draft_idx(key), t.parse::<usize>()) {
                     if t < self.drafts[i].tables.len() {
                         self.drafts[i].sel = t;
@@ -807,7 +821,11 @@ impl App {
             }
             (_, "table-open") => {
                 let v = val == "true";
-                self.edit_table(arg, move |d, t| d.tables[t].open = v)
+                self.edit_table(arg, move |d, t| {
+                    let w = d.wallet.clone();
+                    d.tables[t].remember_chain_meta(w.as_deref());
+                    d.tables[t].open = v;
+                })
             }
             (_, "table-compress") => {
                 let v = val == "true";
@@ -1051,6 +1069,13 @@ impl App {
                     self.base_loaded(&pda);
                 }
             }
+            P::BaseAcct(pda) => {
+                if http_ok {
+                    if let Some(m) = net::rpc_result(&text()).ok().and_then(|r| net::account_data(r.get("value"))).and_then(|d| iq::decode_table(&d)) {
+                        self.adopt_table_meta(&pda, &m);
+                    }
+                }
+            }
             P::NameCheck { draft, name } => {
                 let cur = self.draft_idx(&draft).map(|i| self.drafts[i].name.clone());
                 if cur.as_deref() == Some(&name) {
@@ -1151,31 +1176,34 @@ impl App {
 
     fn new_draft(&mut self) {
         let name = self.form.get("new-db").cloned().unwrap_or_default().trim().to_string();
+        match self.create_draft(&name, true) {
+            Ok(key) => {
+                self.form.remove("new-db");
+                self.ed.tab = "browse".into();
+                host::set_hash(&format!("#/ws/{}/0", key));
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    /// A new database in the editor (with a first sheet if `starter`).
+    pub fn create_draft(&mut self, name: &str, starter: bool) -> Result<String, String> {
+        let name = name.trim().to_string();
         if name.is_empty() {
-            self.err("Give the database a name");
-            return;
+            return Err("Give the database a name".into());
         }
         if name.len() > iq::MAX_DB_ID_BYTES {
-            self.err(format!("Database names are at most {} bytes (this one is {})", iq::MAX_DB_ID_BYTES, name.len()));
-            return;
+            return Err(format!("Database names are at most {} bytes (this one is {})", iq::MAX_DB_ID_BYTES, name.len()));
         }
         if self.drafts.iter().any(|d| d.name == name) {
-            self.err(format!("You already have a database called \"{}\" here", name));
-            return;
+            return Err(format!("You already have a database called \"{}\" here", name));
         }
         let key = self.new_key();
         let mut d = Draft::new(key.clone(), name.clone());
-        // start with a sheet to type into, like a new spreadsheet
-        d.tables.push(DraftTable {
-            name: "sheet1".into(),
-            title: "sheet1".into(),
-            columns: vec!["id".into(), "name".into(), "notes".into()],
-            id_col: 0,
-            open: false,
-            compress: true,
-            created: None,
-            rows: vec![],
-        });
+        if starter {
+            // start with a sheet to type into, like a new spreadsheet
+            d.tables.push(DraftTable::starter("sheet1", &["name", "notes"]));
+        }
         // its own wallet, made automatically when signed in
         if let Some(a) = self.account.as_mut() {
             let w = a.new_wallet(&format!("db: {}", name), &format!("Wallet of database \"{}\"", name));
@@ -1183,11 +1211,10 @@ impl App {
             d.wallet = Some(w.address());
         }
         self.drafts.push(d);
-        self.form.remove("new-db");
         self.save_drafts();
         self.persist_account();
-        self.ed.tab = "browse".into();
-        host::set_hash(&format!("#/ws/{}/0", key));
+        self.check_name(&key);
+        Ok(key)
     }
 
     pub fn check_name(&mut self, key: &str) {
@@ -1215,19 +1242,13 @@ impl App {
         let mut columns: Vec<String> = cols_raw.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         columns.dedup();
         if columns.is_empty() {
-            columns = vec!["id".into(), "name".into()];
+            columns = vec!["name".into()];
         }
+        let names: Vec<&str> = columns.iter().map(|c| c.as_str()).collect();
         let d = &mut self.drafts[i];
-        d.tables.push(DraftTable {
-            name: name.clone(),
-            title: name,
-            columns,
-            id_col: 0,
-            open,
-            compress: true,
-            created: None,
-            rows: vec![],
-        });
+        let mut tb = DraftTable::starter(&name, &names);
+        tb.open = open;
+        d.tables.push(tb);
         d.sel = d.tables.len() - 1;
         d.page = 0;
         for k in ["tname", "tcols", "topen"] {
@@ -1308,7 +1329,7 @@ impl App {
         self.save_drafts();
     }
 
-    fn import_text(&mut self, arg: &str, text: &str) {
+    pub fn import_text(&mut self, arg: &str, text: &str) {
         let mut it = arg.splitn(2, ':');
         let (k, t) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("0").parse::<usize>().unwrap_or(0));
         let Some(i) = self.draft_idx(&k) else { return };
@@ -1343,34 +1364,76 @@ impl App {
             let rows = csv.into_iter().map(|r| r.iter().map(|c| ui::typed(c)).collect()).collect();
             (header, rows)
         };
-        // A fresh table adopts the file's columns.
+        // A fresh table adopts the file's columns; the first column is the
+        // ID when its values are all there and all different.
         if tb.created.is_none() && tb.rows.is_empty() {
             let mut cols: Vec<String> = header.iter().filter(|h| !h.is_empty()).cloned().collect();
             cols.dedup();
-            if !cols.is_empty() {
-                tb.columns = cols;
-                tb.id_col = 0;
+            if !cols.is_empty() && cols != tb.columns {
+                let first_ok = {
+                    let mut seen = std::collections::HashSet::new();
+                    !rows.is_empty() && rows.iter().all(|r| r.first().map(|v| !v.is_null() && seen.insert(v.cell_text())).unwrap_or(false))
+                };
+                let name = tb.name.clone();
+                let (open, title) = (tb.open, tb.title.clone());
+                *tb = if first_ok {
+                    DraftTable::plain(&name, cols, 0)
+                } else {
+                    let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+                    DraftTable::starter(&name, &names)
+                };
+                tb.open = open;
+                tb.title = title;
             }
         }
-        let map: Vec<Option<usize>> = header.iter().map(|h| tb.columns.iter().position(|c| c == h)).collect();
+        let tb = tb.clone();
+        let map: Vec<Option<usize>> = header.iter().map(|h| tb.col(h)).collect();
         let unknown: Vec<&String> = header.iter().zip(&map).filter(|(_, m)| m.is_none()).map(|(h, _)| h).collect();
         let n = rows.len();
+        let cur = self.sheet_rows(&k, t);
+        let by_id: std::collections::HashMap<String, crate::sheet::SRow> =
+            cur.iter().filter(|r| r.state != crate::sheet::RowState::Deleted).map(|r| (r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default(), r.clone())).collect();
+        let nc = tb.columns.len();
+        let mut changes = vec![];
+        let mut updated = 0;
         for r in rows {
-            let mut vals = vec![Json::Null; tb.columns.len()];
+            let mut vals = vec![Json::Null; nc];
+            let mut given = vec![false; nc];
             for (j, v) in r.into_iter().enumerate() {
                 if let Some(Some(c)) = map.get(j) {
                     vals[*c] = v;
+                    given[*c] = true;
                 }
             }
-            tb.rows.push(GhostRow { vals, deleted: false, sig: None });
+            let id = vals[tb.id_col].cell_text();
+            match by_id.get(&id).filter(|_| !id.is_empty()) {
+                Some(row) => {
+                    let mut nv = row.vals.clone();
+                    nv.resize(nc, Json::Null);
+                    for c in 0..nc {
+                        if given[c] {
+                            nv[c] = vals[c].clone();
+                        }
+                    }
+                    changes.push(crate::constraints::Change::Update { row: row.clone(), vals: nv, set: given });
+                    updated += 1;
+                }
+                None => changes.push(crate::constraints::Change::Insert { vals, given }),
+            }
         }
-        let msg = if unknown.is_empty() {
-            format!("Imported {} rows (not saved yet)", n)
-        } else {
-            format!("Imported {} rows, not saved yet (ignored columns not in the table: {})", n, unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
-        };
+        let fk = self.fk_checks();
+        if let Err(e) = self.apply_changes(&k, t, changes, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
+            self.err(format!("Nothing was imported: {}", e));
+            return;
+        }
+        let mut msg = format!("Imported {} rows (not saved yet)", n);
+        if updated > 0 {
+            msg = format!("Imported {} rows — {} updated existing rows with the same ID (not saved yet)", n, updated);
+        }
+        if !unknown.is_empty() {
+            msg.push_str(&format!(". Ignored columns not in the table: {}", unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
         self.form.remove(&format!("csv:{}", arg));
-        self.bump(&k, t);
         self.save_drafts();
         self.ok(msg);
     }
@@ -1424,7 +1487,7 @@ impl App {
         }
         for n in names {
             if !self.drafts[i].tables.iter().any(|t| t.name == n) {
-                self.drafts[i].tables.push(DraftTable { name: n.clone(), title: n, columns: vec![], id_col: 0, open: true, compress: true, created: Some("existing".into()), rows: vec![] });
+                self.drafts[i].tables.push(DraftTable { open: true, created: Some("existing".into()), ..DraftTable::plain(&n, vec![], 0) });
             }
         }
         let t = wanted.and_then(|w| self.drafts[i].tables.iter().position(|t| t.name == w)).unwrap_or(0);
@@ -1466,9 +1529,11 @@ impl App {
         let ck = (key.to_string(), t);
         let stale = self.plans.get(&ck).map(|p| p.rev != rev || p.cap != cap).unwrap_or(true);
         if stale {
-            let result = match self.draft_idx(key).and_then(|i| self.drafts[i].tables.get(t)) {
+            let result = match self.draft_idx(key).and_then(|i| self.drafts[i].tables.get(t)).filter(|tb| !tb.dropped) {
                 Some(tb) => {
-                    let schema = pack::Schema { cols: tb.columns.clone(), id: tb.id_col };
+                    let mut tb = tb.clone();
+                    tb.fix_meta();
+                    let schema = pack::Schema { cols: tb.col_keys(), id: tb.id_col };
                     let recs: Vec<pack::Record> = tb
                         .rows
                         .iter()
@@ -1482,7 +1547,7 @@ impl App {
                     if recs.is_empty() {
                         Ok(vec![])
                     } else if let Some(bad) = recs.iter().position(|r| r.key(&schema).is_empty()) {
-                        Err(format!("Row {} has no value in the id column \"{}\"", bad + 1, schema.id_col()))
+                        Err(format!("Row {} has no value in the ID column \"{}\"", bad + 1, tb.columns.get(tb.id_col).cloned().unwrap_or_default()))
                     } else {
                         pack::plan(&schema, &recs, cap, tb.compress)
                     }
@@ -1515,12 +1580,13 @@ pub fn decode_row(r: &Json) -> Option<Result<pack::SourcePack, String>> {
     if !p.starts_with(pack::MAGIC) {
         return None;
     }
-    Some(pack::decode_payload(p).map(|(schema, recs)| pack::SourcePack {
+    Some(pack::decode_any(p).map(|(schema, recs, meta)| pack::SourcePack {
         tx: r.get("__txSignature").str_or(""),
         signer: r.get("__signer").str_or(""),
         time: r.get("__blockTime").f64().map(|f| f as i64),
         schema,
         recs,
+        meta,
     }))
 }
 

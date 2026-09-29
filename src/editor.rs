@@ -46,6 +46,19 @@ pub struct Ed {
     pub sql_hist: Vec<String>,
     pub sql_wait: Option<(String, String)>,
     pub scroll: bool,
+    /// Session state of the SQL console: @variables, LAST_INSERT_ID, FOREIGN_KEY_CHECKS.
+    pub sql_vars: HashMap<String, Json>,
+    pub last_insert_id: u64,
+    /// The last statement the UI ran for you (shown like phpMyAdmin does).
+    pub last_sql: Option<String>,
+    /// Showing the database (its tables) rather than one table.
+    pub scope_db: bool,
+    /// Column form open on the Structure tab: Some(column) or Some(usize::MAX) for a new one.
+    pub col_edit: Option<usize>,
+    /// A destructive button waiting for its second click ("action:arg").
+    pub confirm: Option<String>,
+    pub search_out: Vec<crate::sql_exec::Out>,
+    pub import_out: Vec<crate::sql_exec::Out>,
 }
 
 #[derive(Default)]
@@ -106,6 +119,9 @@ impl App {
                 gen,
             },
         );
+        // the table's name and writers as the chain has them
+        let params = crate::json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", pda)).unwrap();
+        self.rpc("getAccountInfo", params, crate::app::P::BaseAcct(pda.clone()));
         if self.use_rpc() {
             self.rpc_rows(&pda, gen, None);
         } else {
@@ -123,12 +139,15 @@ impl App {
         }
     }
 
-    /// A base finished loading: adopt its columns, run a waiting SQL query.
+    /// A base finished loading: adopt the table's structure (the owner's
+    /// latest structure record, or the columns seen in its packs), then run
+    /// a waiting SQL query.
     pub fn base_loaded(&mut self, pda: &str) {
         let Some(tv) = self.bases.get(pda) else { return };
+        let packs: Vec<pack::SourcePack> = tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
         let mut cols: Vec<String> = vec![];
         let mut id_name: Option<String> = None;
-        for p in tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())) {
+        for p in packs.iter().rev().filter(|p| p.meta.is_none()) {
             for c in &p.schema.cols {
                 if !cols.contains(c) {
                     cols.push(c.clone());
@@ -137,12 +156,47 @@ impl App {
             id_name = Some(p.schema.id_col().to_string());
         }
         let mut touched = vec![];
+        let mut gone = vec![];
         for di in 0..self.drafts.len() {
             for t in 0..self.drafts[di].tables.len() {
                 let key = self.drafts[di].key.clone();
-                if self.table_pda_of(&key, t).map(|(_, p)| p == pda).unwrap_or(false) {
-                    if sheet::adopt_columns(&mut self.drafts[di].tables[t], &cols, id_name.as_deref()) {
+                if !self.table_pda_of(&key, t).map(|(_, p)| p == pda).unwrap_or(false) {
+                    continue;
+                }
+                let mut owners: Vec<String> = self.drafts[di].wallet.iter().cloned().collect();
+                if let Some(c) = self.creator_of(&key) {
+                    owners = vec![c];
+                }
+                let official = |s: &str| owners.is_empty() || owners.iter().any(|o| o == s);
+                let (_, doc) = pack::merge_events(&packs, &official, &|_| false);
+                let tb = &mut self.drafts[di].tables[t];
+                match doc {
+                    Some(d) => {
+                        let mut plain = d.clone();
+                        plain.clear = false;
+                        plain.dropped = false;
+                        let text = plain.to_json().to_string();
+                        if tb.chain_doc.as_deref() == Some(text.as_str()) {
+                            continue;
+                        }
+                        if d.dropped && !tb.dropped && tb.ghosts() == 0 {
+                            gone.push((key.clone(), t));
+                            continue;
+                        }
+                        let local_edit = match &tb.chain_doc {
+                            Some(c) => tb.doc_text() != *c,
+                            None => !tb.columns.is_empty() && !tb.doc().is_trivial(),
+                        };
+                        if !local_edit {
+                            tb.apply_doc(&plain);
+                        }
+                        tb.chain_doc = Some(text);
                         touched.push((key, t));
+                    }
+                    None => {
+                        if sheet::adopt_columns(tb, &cols, id_name.as_deref()) {
+                            touched.push((key, t));
+                        }
                     }
                 }
             }
@@ -150,13 +204,47 @@ impl App {
         for (k, t) in touched {
             self.bump(&k, t);
         }
+        for (k, t) in gone.into_iter().rev() {
+            if let Some(i) = self.draft_idx(&k) {
+                self.drafts[i].tables.remove(t);
+                self.drafts[i].sel = 0;
+                self.table_removed(&k, t);
+            }
+        }
         self.save_drafts();
         if let Some((key, text)) = self.ed.sql_wait.take() {
             self.ed.sql_out = self.run_sql(&key, &text);
         }
     }
 
-    fn creator_of(&self, key: &str) -> Option<String> {
+    /// A table's on-chain name and writers, for editor tables that match it
+    /// and have no rename or writer change of their own waiting.
+    pub fn adopt_table_meta(&mut self, pda: &str, m: &iq::TableMeta) {
+        for di in 0..self.drafts.len() {
+            let key = self.drafts[di].key.clone();
+            let owner = self.creator_of(&key).or_else(|| self.drafts[di].wallet.clone());
+            for t in 0..self.drafts[di].tables.len() {
+                if !self.table_pda_of(&key, t).map(|(_, p)| p == pda).unwrap_or(false) {
+                    continue;
+                }
+                let taken = |d: &crate::state::Draft, n: &str| d.tables.iter().enumerate().any(|(j, x)| j != t && !x.dropped && (x.title.eq_ignore_ascii_case(n) || x.name.eq_ignore_ascii_case(n)));
+                let name_ok = !m.name.is_empty() && m.name.len() <= 64 && !taken(&self.drafts[di], &m.name);
+                let tb = &mut self.drafts[di].tables[t];
+                if tb.chain_title.is_none() && name_ok {
+                    tb.title = m.name.clone();
+                }
+                if tb.chain_writers.is_none() {
+                    let ws: Vec<String> = m.writers.iter().map(b58).collect();
+                    tb.open = ws.is_empty();
+                    tb.writers = ws.into_iter().filter(|w| Some(w) != owner.as_ref()).collect();
+                }
+                self.bump(&key, t);
+            }
+        }
+        self.save_drafts();
+    }
+
+    pub fn creator_of(&self, key: &str) -> Option<String> {
         match self.name_checks.get(key) {
             Some(Load::Ready(Some(c))) => Some(c.clone()),
             _ => None,
@@ -171,6 +259,10 @@ impl App {
         let Some(tb) = self.drafts[i].tables.get(t) else { return (Rc::new(vec![]), BaseState::Local) };
         if tb.created.is_none() {
             return (Rc::new(sheet::local_base(tb)), BaseState::Local);
+        }
+        if tb.clear {
+            // TRUNCATE / DROP waiting to be saved: nothing saved counts
+            return (Rc::new(vec![]), BaseState::Chain);
         }
         let Some((_, pda)) = self.table_pda_of(key, t) else { return (Rc::new(vec![]), BaseState::Local) };
         let Some(tv) = self.bases.get(&pda) else {
@@ -188,7 +280,7 @@ impl App {
             (None, true) => BaseState::Chain,
             (None, false) => BaseState::Loading,
         };
-        let stamp = format!("{}:{}:{}:{}", tv.gen, tv.rows.len(), tb.rows.iter().filter(|r| r.sig.is_some()).count(), tb.columns.len());
+        let stamp = format!("{}:{}:{}:{}", tv.gen, tv.rows.len(), tb.rows.iter().filter(|r| r.sig.is_some()).count(), tb.col_keys().join(","));
         if let Some((s, b)) = self.base_cache.get(&pda) {
             if *s == stamp {
                 return (b.clone(), state);
@@ -198,19 +290,19 @@ impl App {
         if let Some(w) = &self.drafts[i].wallet {
             allowed.push(w.clone());
         }
-        if let Some(c) = self.creator_of(key) {
-            allowed.push(c);
+        let creator = self.creator_of(key);
+        if let Some(c) = &creator {
+            allowed.push(c.clone());
         }
-        let packs: Vec<pack::SourcePack> = tv
-            .decoded
-            .iter()
-            .rev()
-            .filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok()))
-            .filter(|p| allowed.is_empty() || allowed.contains(&p.signer))
-            .cloned()
-            .collect();
+        let packs: Vec<pack::SourcePack> = tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
+        let owner: Vec<String> = match &creator {
+            Some(c) => vec![c.clone()],
+            None => self.drafts[i].wallet.iter().cloned().collect(),
+        };
+        let official = |s: &str| owner.is_empty() || owner.iter().any(|o| o == s);
+        let take = |p: &pack::SourcePack| allowed.is_empty() || allowed.contains(&p.signer);
         let seen: std::collections::HashSet<String> = tv.rows.iter().map(|r| r.get("__txSignature").str_or("")).collect();
-        let mut out: Vec<BaseRec> = pack::merge(&packs).into_iter().map(|m| BaseRec { key: m.key, vals: m.vals, signer: m.signer }).collect();
+        let mut out: Vec<BaseRec> = pack::merge_events(&packs, &official, &take).0.into_iter().map(|m| BaseRec { key: m.key, vals: m.vals, signer: m.signer }).collect();
         // our own recent writes the chain read doesn't include yet
         for r in tb.rows.iter().filter(|r| r.sig.as_ref().map(|s| !seen.contains(s)).unwrap_or(false)) {
             let k = r.vals.get(tb.id_col).map(|v| v.cell_text()).unwrap_or_default();
@@ -221,7 +313,7 @@ impl App {
                 }
                 continue;
             }
-            let rec = BaseRec { key: k, vals: tb.columns.iter().cloned().zip(r.vals.iter().cloned()).collect(), signer: self.drafts[i].wallet.clone().unwrap_or_default() };
+            let rec = BaseRec { key: k, vals: tb.col_keys().into_iter().zip(r.vals.iter().cloned()).collect(), signer: self.drafts[i].wallet.clone().unwrap_or_default() };
             match pos {
                 Some(p) => out[p] = rec,
                 None => out.push(rec),
@@ -269,7 +361,18 @@ impl App {
         let snap = self.drafts[i].tables.get(t)?.clone();
         let r = f(&mut self.drafts[i].tables[t], &base);
         let after = &self.drafts[i].tables[t];
-        if after.rows != snap.rows || after.columns != snap.columns || after.id_col != snap.id_col || after.open != snap.open || after.name != snap.name {
+        if after.rows != snap.rows
+            || after.columns != snap.columns
+            || after.id_col != snap.id_col
+            || after.open != snap.open
+            || after.name != snap.name
+            || after.title != snap.title
+            || after.writers != snap.writers
+            || after.clear != snap.clear
+            || after.dropped != snap.dropped
+            || after.meta != snap.meta
+            || after.keys != snap.keys
+        {
             let u = self.undo.entry((key.to_string(), t)).or_default();
             u.undo.push(snap);
             if u.undo.len() > 100 {
@@ -347,27 +450,42 @@ impl App {
     }
 
     /// Put `val` into display cell (r, c); the blank line below the last row
-    /// creates a new row.
+    /// creates a new row. The table's rules apply (types, keys, links); a
+    /// new row's other required cells can be filled in afterwards.
     fn set_display_cell(&mut self, key: &str, t: usize, r: usize, c: usize, val: Json) -> Result<bool, String> {
         let (rows, order) = self.sheet_view(key, t);
-        match order.get(r).map(|&i| rows[i].clone()) {
-            Some(row) => self.edit_tb(key, t, |tb, _| sheet::set_cell(tb, &row, c, val)).unwrap_or(Ok(false)),
+        let n = self.ncols(key, t);
+        if c >= n {
+            return Ok(false);
+        }
+        let change = match order.get(r).map(|&i| rows[i].clone()) {
+            Some(row) => {
+                if row.state == RowState::Deleted {
+                    return Err("This row is marked for deletion. Undo the delete first.".into());
+                }
+                let mut vals = row.vals.clone();
+                vals.resize(n, Json::Null);
+                if vals[c] == val {
+                    return Ok(false);
+                }
+                vals[c] = val;
+                let mut set = vec![false; n];
+                set[c] = true;
+                crate::constraints::Change::Update { row, vals, set }
+            }
             None => {
                 if val.is_null() {
                     return Ok(false);
                 }
-                self.edit_tb(key, t, |tb, _| {
-                    let n = tb.columns.len();
-                    let mut vals = vec![Json::Null; n];
-                    if c < n {
-                        vals[c] = val;
-                    }
-                    tb.rows.push(GhostRow { vals, deleted: false, sig: None });
-                    Ok(true)
-                })
-                .unwrap_or(Ok(false))
+                let mut vals = vec![Json::Null; n];
+                let mut given = vec![false; n];
+                vals[c] = val;
+                given[c] = true;
+                crate::constraints::Change::Insert { vals, given }
             }
-        }
+        };
+        let fk = self.fk_checks();
+        self.apply_changes(key, t, vec![change], &crate::constraints::Opts { strict: false, fk_checks: fk }).map(|a| a.inserted + a.updated + a.deleted > 0)
     }
 
     pub fn commit_edit(&mut self, text: &str) {
@@ -399,16 +517,45 @@ impl App {
 
     fn clear_range(&mut self, key: &str, t: usize) {
         let ((r0, c0), (r1, c1)) = self.range();
-        let mut errs = vec![];
+        let (rows, order) = self.sheet_view(key, t);
+        let n = self.ncols(key, t);
+        let mut changes = vec![];
         for r in r0..=r1 {
-            for c in c0..=c1 {
-                if let Err(e) = self.set_display_cell(key, t, r, c, Json::Null) {
-                    errs.push(e);
+            let Some(&i) = order.get(r) else { continue };
+            let row = rows[i].clone();
+            if row.state == RowState::Deleted {
+                continue;
+            }
+            let mut vals = row.vals.clone();
+            vals.resize(n, Json::Null);
+            let mut set = vec![false; n];
+            let mut any = false;
+            for c in c0..=c1.min(n.saturating_sub(1)) {
+                if !vals[c].is_null() {
+                    vals[c] = Json::Null;
+                    set[c] = true;
+                    any = true;
                 }
             }
+            if any {
+                changes.push(crate::constraints::Change::Update { row, vals, set });
+            }
         }
-        if let Some(e) = errs.first() {
-            self.err(e.clone());
+        if changes.is_empty() {
+            return;
+        }
+        let fk = self.fk_checks();
+        if let Err(e) = self.apply_changes(key, t, changes, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
+            self.err(e);
+        }
+    }
+
+    /// Fold the last two undo steps into one (a paste that also added columns).
+    fn merge_last_undo(&mut self, key: &str, t: usize) {
+        if let Some(u) = self.undo.get_mut(&(key.to_string(), t)) {
+            if u.undo.len() >= 2 {
+                u.undo.pop();
+            }
         }
     }
 
@@ -421,56 +568,72 @@ impl App {
         }
         let (r0, c0) = self.ed.sel;
         let width = grid.iter().map(|r| r.len()).max().unwrap_or(0);
-        let (rows, order) = self.sheet_view(&key, t);
-        let targets: Vec<Option<SRow>> = (0..grid.len()).map(|i| order.get(r0 + i).map(|&x| rows[x].clone())).collect();
-        let errs = self
-            .edit_tb(&key, t, |tb, _| {
-                // grow the table to fit, like a spreadsheet does (one undo step)
+        // grow the table to fit, like a spreadsheet does
+        let grew = self.ncols(&key, t) < c0 + width;
+        if grew {
+            self.edit_tb(&key, t, |tb, _| {
                 while tb.columns.len() < c0 + width {
                     let n = sheet::next_column_name(tb);
                     if sheet::add_column(tb, &n, None).is_err() {
                         break;
                     }
                 }
-                let ncol = tb.columns.len();
-                let mut updates = vec![];
-                let mut fresh = vec![];
-                for (i, line) in grid.iter().enumerate() {
-                    let mut vals = targets[i].as_ref().map(|r| r.vals.clone()).unwrap_or_default();
-                    vals.resize(ncol, Json::Null);
+            });
+        }
+        let (rows, order) = self.sheet_view(&key, t);
+        let n = self.ncols(&key, t);
+        let mut changes = vec![];
+        for (i, line) in grid.iter().enumerate() {
+            match order.get(r0 + i).map(|&x| rows[x].clone()) {
+                Some(row) => {
+                    if row.state == RowState::Deleted {
+                        continue;
+                    }
+                    let mut vals = row.vals.clone();
+                    vals.resize(n, Json::Null);
+                    let mut set = vec![false; n];
                     for (j, cell) in line.iter().enumerate() {
-                        if c0 + j < ncol {
+                        if c0 + j < n {
                             vals[c0 + j] = ui::typed(cell);
+                            set[c0 + j] = true;
                         }
                     }
-                    match &targets[i] {
-                        Some(row) => {
-                            let mut row = row.clone();
-                            row.vals.resize(ncol, Json::Null);
-                            if let Some(b) = row.base.as_mut() {
-                                b.resize(ncol, Json::Null);
-                            }
-                            updates.push((row, vals));
-                        }
-                        None => {
-                            if vals.iter().any(|v| !v.is_null()) {
-                                fresh.push(vals);
-                            }
+                    changes.push(crate::constraints::Change::Update { row, vals, set });
+                }
+                None => {
+                    let mut vals = vec![Json::Null; n];
+                    let mut given = vec![false; n];
+                    for (j, cell) in line.iter().enumerate() {
+                        if c0 + j < n {
+                            vals[c0 + j] = ui::typed(cell);
+                            given[c0 + j] = !vals[c0 + j].is_null();
                         }
                     }
+                    if vals.iter().any(|v| !v.is_null()) {
+                        changes.push(crate::constraints::Change::Insert { vals, given });
+                    }
                 }
-                let e = sheet::apply_rows(tb, updates);
-                for vals in fresh {
-                    tb.rows.push(GhostRow { vals, deleted: false, sig: None });
+            }
+        }
+        let fk = self.fk_checks();
+        match self.apply_changes(&key, t, changes, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
+            Ok(_) => {
+                if grew {
+                    self.merge_last_undo(&key, t);
                 }
-                e
-            })
-            .unwrap_or_default();
-        self.ed.anchor = (r0, c0);
-        self.ed.sel = (r0 + grid.len() - 1, c0 + width - 1);
-        match errs.first() {
-            Some(e) => self.err(e.clone()),
-            None => self.ok(format!("Pasted {} row(s) × {} column(s)", grid.len(), width)),
+                self.ed.anchor = (r0, c0);
+                self.ed.sel = (r0 + grid.len() - 1, c0 + width - 1);
+                self.ok(format!("Pasted {} row(s) × {} column(s)", grid.len(), width));
+            }
+            Err(e) => {
+                if grew {
+                    self.undo(&key, t, false);
+                    if let Some(u) = self.undo.get_mut(&(key.clone(), t)) {
+                        u.redo.pop();
+                    }
+                }
+                self.err(format!("Nothing was pasted: {}", e));
+            }
         }
     }
 
@@ -652,6 +815,9 @@ impl App {
             (_, "ed-tab") => {
                 self.ed.tab = arg.to_string();
                 self.ed.menu = None;
+                self.ed.last_sql = None;
+                self.ed.col_edit = None;
+                self.ed.confirm = None;
             }
             (_, "sheet-filter") => {
                 self.ed.filter = val.to_string();
@@ -764,8 +930,23 @@ impl App {
                 let ((r0, _), (r1, _)) = self.range();
                 let (rows, order) = self.sheet_view(&k, t);
                 let picked: Vec<SRow> = (r0..=r1).filter_map(|r| order.get(r).map(|&i| rows[i].clone())).collect();
-                let refs: Vec<&SRow> = picked.iter().collect();
-                self.edit_tb(&k, t, |tb, _| sheet::delete_rows(tb, &refs));
+                // rows already marked come back; the others go (links are checked)
+                let restore: Vec<&SRow> = picked.iter().filter(|r| r.state == RowState::Deleted).collect();
+                if !restore.is_empty() {
+                    self.edit_tb(&k, t, |tb, _| sheet::delete_rows(tb, &restore));
+                }
+                let del: Vec<crate::constraints::Change> = picked.iter().filter(|r| r.state != RowState::Deleted).map(|r| crate::constraints::Change::Delete { row: r.clone() }).collect();
+                if !del.is_empty() {
+                    let fk = self.fk_checks();
+                    match self.apply_changes(&k, t, del, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
+                        Ok(a) => {
+                            if !a.cascaded.is_empty() {
+                                self.ok(format!("Deleted. {}", a.cascaded.join("; ")));
+                            }
+                        }
+                        Err(e) => self.err(e),
+                    }
+                }
             }
             (_, "sheet-undo") => {
                 let (k, t) = cur?;
@@ -813,7 +994,7 @@ impl App {
             }
             ("paste", "sheet") => self.paste(val),
             ("down", w) | ("drag", w) if matches!(w, "scell" | "colh" | "rowh") => self.sheet_pointer(kind, w, arg, val),
-            _ => return None,
+            _ => return self.ws_event(kind, action, arg, val),
         }
         Some(true)
     }
@@ -891,17 +1072,21 @@ impl App {
         if d.root_sig.is_none() {
             total += iq::DB_ROOT_COST_ESTIMATE;
         }
-        total += d.tables.iter().filter(|t| t.created.is_none()).count() as u64 * iq::TABLE_COST_ESTIMATE;
+        total += d.tables.iter().filter(|t| t.created.is_none() && !t.dropped).count() as u64 * iq::TABLE_COST_ESTIMATE;
         if d.user_init_sig.is_none() {
             total += iq::USER_INIT_RENT_ESTIMATE;
         }
+        let wallet = d.wallet.clone();
+        let structure = d.tables.iter().filter(|t| t.schema_changed()).count();
+        let meta = d.tables.iter().filter(|t| t.meta_changed(wallet.as_deref())).count() + d.tables.iter().filter(|t| t.dropped).count().min(1);
         let n = d.tables.len();
-        let mut packs = 0;
+        let mut packs = structure;
         for t in 0..n {
             if let Ok(p) = self.plan_for(key, t, cap) {
                 packs += p.len();
             }
         }
+        total += meta as u64 * iq::TX_FEE;
         total += packs as u64 * (iq::FEE_DIRECT_WRITE + iq::TX_FEE);
         (total, packs)
     }
@@ -933,6 +1118,18 @@ impl App {
         let wallet = self.drafts[i].wallet.clone().unwrap();
         if self.keypair(&wallet).is_none() {
             self.err("This database's wallet isn't in the account you're signed in with.");
+            return;
+        }
+        // rows typed in bit by bit must be complete before they're saved
+        let mut problems = vec![];
+        for t in 0..self.drafts[i].tables.len() {
+            if !self.drafts[i].tables[t].dropped {
+                problems.extend(self.row_problems(key, t));
+            }
+        }
+        if !problems.is_empty() {
+            self.ed.tab = "save".into();
+            self.err(format!("Fill these in first: {}{}", problems.iter().take(3).cloned().collect::<Vec<_>>().join("; "), if problems.len() > 3 { format!(" (+{} more)", problems.len() - 3) } else { String::new() }));
             return;
         }
         self.ed.tab = "save".into();
