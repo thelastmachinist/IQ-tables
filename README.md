@@ -14,7 +14,7 @@ Everything is **dependency-free Rust** compiled to WebAssembly: SHA-256/512, Kec
 
 ## Status
 
-Prototype. The Rust core is checked byte-for-byte against the official SDK (`@iqlabs-official/solana-sdk` 0.2.0), and the whole app passes an end-to-end test against a mock chain that validates every instruction with the program's IDL. **It has not yet written to mainnet.** See [Before using it on mainnet](#before-using-it-on-mainnet).
+Prototype. The Rust core is checked byte-for-byte against the official SDK (`@iqlabs-official/solana-sdk` 0.2.0), the whole app passes an end-to-end test against a mock chain that validates every instruction with the program's IDL, and its transactions have been dry-run against IQ's deployed program on devnet (see [Checked against the real program](#checked-against-the-real-program)). **It has not yet written to mainnet.** See [Before using it on mainnet](#before-using-it-on-mainnet).
 
 ## Deploy to IQ Pages
 
@@ -93,13 +93,15 @@ Like the SDK, Auto mode uses v1 transactions only when the cluster's v1 feature 
 ### Reading
 By default tables are read through IQ's gateway (fast, cached, with search and files). Settings → *Read tables from → Solana directly* reads live instead: the database list via `getProgramAccounts`, table metadata via `getAccountInfo`, and rows by walking the table's transaction history (`getSignaturesForAddress` + batched `getTransaction`) and decoding each inline `db_code_in`. Devnet always reads this way, since the gateway serves mainnet.
 
-### Costs (from IQ Labs' own cost model)
+### Costs (measured against IQ's program on devnet)
 | Item | Cost |
 |---|---|
 | Each pack or file (direct write) | 0.001 SOL program fee + 0.000005 SOL network fee |
-| First write from a new wallet | ~0.062 SOL one-time rent (IQ user accounts) |
-| Create a database | ~0.002–0.003 SOL rent |
-| Create a table | rent + IQ's table-creation fee (not published; the simulation shows the exact amount before sending) |
+| First write from a new wallet | ~0.05 SOL one-time rent (IQ user accounts: 4,213 + 4,215 bytes + user state) |
+| Create a database | ~0.0115 SOL rent (2,133-byte account) |
+| Create a table | ~0.015 SOL rent + 0.00093 SOL IQ table-creation fee |
+
+Rent stays locked in the accounts; only the fees are spent. The simulation before each step shows the exact amount on the cluster you're using.
 
 ## Source map
 | File | What |
@@ -125,9 +127,21 @@ By default tables are read through IQ's gateway (fast, cached, with search and f
 - `cd tools && npm install && CHROME_PATH=/path/to/chrome npm run e2e` (71 checks): the built page in headless Chromium against a mock chain that verifies every signature (both wire formats), decodes every instruction with the program's IDL and compares its accounts and data with the SDK's builder, plus a mock IQ gateway. Covers: explore, search, HTML escaping; creating an account (file opened with the SDK's `passwordDecrypt`, derivation checked independently); importing a CLI key file and pasted keys; refusing logout with unsaved keys; logging in by drag-and-drop; wrong passphrase; recovering a wallet made after the last save; "remember on this device"; dedicated database wallets and moving SOL; CSV import and packing; attaching a file (wallet setup + `user_inventory_code_in`); inscription with DbRoot realloc; locked vs open tables; web, record and file links; the file viewer and download; record links; My tables; editing a live record; unofficial contributions; growing pre-upgrade accounts before a v1 write; rejecting writes to a locked table at simulation; reading everything back straight from Solana with batched RPC; devnet airdrops; mobile layout.
 - `npm run qr`: decodes the generated QR with jsQR.
 
+## Checked against the real program
+IQ's program is deployed on devnet, and devnet has v1 transactions switched on. The portal's own Rust code built these transactions, which were run through `simulateTransaction` on devnet (signature checks off, so nothing was signed or sent):
+
+- **One v1 transaction doing the whole flow** — `initialize_db_root`, `manage_table_creators`, `create_table` (locked), `user_initialize`, `db_code_in` with a 1,486-byte pack, `user_inventory_code_in` with a text file: **succeeded**. Every instruction encoding matches the deployed program.
+- **Writer locks are enforced on chain**: an outsider's `db_code_in` to a locked table fails with the program's `NotAuthorized` (6000); the same write to an open table succeeds.
+- `user_initialize` creates full-size (post-upgrade) accounts on devnet, so no resize is needed for new wallets there.
+- The fees and sizes in the cost table above come from these runs.
+- The deployed app itself was loaded in a real browser on devnet: it read balances and the database list (`getProgramAccounts`) straight from Solana.
+
+Still to do: a funded end-to-end run (the public devnet faucet was dry at the time), and mainnet.
+
 ## Before using it on mainnet
 1. **An RPC that accepts browser requests.** Solana's public mainnet endpoint answers browsers with `403 Access forbidden`, so balances, transfers and inscriptions need your own RPC URL in Settings (a free Helius, QuickNode or Triton key works). Reading tables doesn't need one — that goes through IQ's gateway.
-2. **Writer locks, table-creation fee, schema checks**: the mock follows the SDK and IDL; a first real run (one small database, one table, one pack, ~0.1 SOL) confirms them. The simulation step shows any program error and the exact cost before anything is sent.
+2. **v1 on mainnet**: Auto mode checks the v1 feature gate and uses legacy transactions (700-byte packs, ~5× more writes) until it's active.
+3. A first small real run (one database, one table, one pack, ~0.1 SOL) — the simulation step shows any program error and the exact cost before anything is sent.
 
 ## License
 MIT — see LICENSE.

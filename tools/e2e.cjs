@@ -39,7 +39,7 @@ const SYS = "11111111111111111111111111111111";
 const FEE_RECEIVER = iq.constants.DEFAULT_WRITE_FEE_RECEIVER;
 const builder = iq.contract.createInstructionBuilder();
 const LAMPORTS = 1_000_000_000;
-const TABLE_FEE = 10_000_000; // assumed for the mock; the real amount isn't published
+const TABLE_FEE = 930_000; // measured against the deployed program on devnet
 
 const results = [];
 const check = (ok, what) => {

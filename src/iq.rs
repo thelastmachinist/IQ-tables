@@ -470,8 +470,14 @@ pub fn decode_user_state_seq(data: &[u8]) -> Option<u64> {
 // (verified there against mainnet transfers to the fee receiver).
 pub const FEE_DIRECT_WRITE: u64 = 1_000_000; // 0.001 SOL
 pub const TX_FEE: u64 = 5_000; // per signature
-/// One-time rent for a wallet's first IQ write (user_inventory + code_account + user_state).
-pub const USER_INIT_RENT_ESTIMATE: u64 = 62_000_000;
+/// One-time rent for a wallet's first IQ write (user_inventory + code_account
+/// + user_state). Measured on devnet: ~0.051 SOL; kept a little above.
+pub const USER_INIT_RENT_ESTIMATE: u64 = 55_000_000;
+/// Measured against the deployed program (devnet dry-runs): a new DbRoot is
+/// 2,133 bytes (~0.0115 SOL rent); a table is ~0.015 SOL rent for its two
+/// accounts plus IQ's 0.00093 SOL table-creation fee.
+pub const DB_ROOT_COST_ESTIMATE: u64 = 12_000_000;
+pub const TABLE_COST_ESTIMATE: u64 = 17_000_000;
 /// Rent-exempt minimum for an empty system account; the payer must keep this.
 pub const RENT_FLOOR: u64 = 890_880;
 

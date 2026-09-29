@@ -864,16 +864,16 @@ fn draft(app: &mut App, key: &str, h: &mut String) {
     let mut total: u64 = 0;
     let mut lines: Vec<String> = vec![];
     if d.root_sig.is_none() {
-        total += 3_000_000;
-        lines.push(format!("Create the database{} · ~0.003 SOL rent", if d.lock_creators { " and lock table creation to its wallet" } else { "" }));
+        total += iq::DB_ROOT_COST_ESTIMATE;
+        lines.push(format!("Create the database{} · ~0.012 SOL rent", if d.lock_creators { " and lock table creation to its wallet" } else { "" }));
     }
     let new_tables = d.tables.iter().filter(|t| t.created.is_none()).count();
     if new_tables > 0 {
-        total += new_tables as u64 * 5_000_000;
-        lines.push(format!("{} new table(s) · ~0.005 SOL rent each + IQ's table-creation fee (exact amount shown when simulated)", new_tables));
+        total += new_tables as u64 * iq::TABLE_COST_ESTIMATE;
+        lines.push(format!("{} new table(s) · ~0.016 SOL each (rent + IQ's ~0.001 SOL table fee; exact amount shown when simulated)", new_tables));
     }
     if d.user_init_sig.is_none() {
-        lines.push("First write from a new wallet: one-time IQ account setup · ~0.062 SOL rent".into());
+        lines.push("First write from a new wallet: one-time IQ account setup · ~0.05 SOL rent".into());
         total += iq::USER_INIT_RENT_ESTIMATE;
     }
     let mut packs_total = 0usize;
@@ -908,7 +908,7 @@ fn draft(app: &mut App, key: &str, h: &mut String) {
             h.push_str(&format!("<li>{}</li>", l));
         }
         h.push_str("</ul>");
-        h.push_str(&format!("<p>Estimated total: <b>{}</b> <span class=\"muted small\">+ table fees · each write is 0.001 SOL to IQ Labs + 0.000005 network fee</span></p>", ui::sol(total)));
+        h.push_str(&format!("<p>Estimated total: <b>{}</b> <span class=\"muted small\">each write is 0.001 SOL to IQ Labs + 0.000005 network fee; rent stays locked in the accounts</span></p>", ui::sol(total)));
     }
     let running = app.run.as_ref().map(|r| r.busy()).unwrap_or(false);
     h.push_str(&format!(

@@ -436,7 +436,7 @@ impl App {
                         "The database wallet has {} but this needs about {}{}. Fund it first.",
                         ui::sol(bal),
                         ui::sol(need + iq::RENT_FLOOR),
-                        if stage == Stage::Init { " (its first IQ write includes a one-time ~0.062 SOL account setup)" } else { "" }
+                        if stage == Stage::Init { " (its first IQ write includes a one-time ~0.05 SOL account setup)" } else { "" }
                     ));
                     return true;
                 }

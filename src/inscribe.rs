@@ -108,8 +108,8 @@ impl Run {
 /// Minimum balance to attempt a step (simulation catches the exact amount).
 fn guard(k: &StepKind) -> u64 {
     match k {
-        StepKind::Root => 5_000_000,
-        StepKind::Table(_) => 10_000_000,
+        StepKind::Root => iq::DB_ROOT_COST_ESTIMATE,
+        StepKind::Table(_) => iq::TABLE_COST_ESTIMATE,
         StepKind::UserInit => iq::USER_INIT_RENT_ESTIMATE,
         StepKind::Grow(_) => 50_000_000,
         StepKind::Pack { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,

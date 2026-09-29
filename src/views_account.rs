@@ -253,9 +253,9 @@ pub fn mine(app: &App, h: &mut String) {
     let addrs: Vec<String> = app.account.as_ref().map(|a| a.addresses()).unwrap_or_default();
     match &app.account {
         Some(a) => h.push_str(&format!(
-            "<p>Everything made by <b>{}</b>'s {} wallet(s) — {} in total. <a href=\"#/account\">Manage wallets →</a></p></section>",
-            esc(&a.name),
+            "<p>Everything made by the {} wallet(s) in <b>{}</b> — {} in total. <a href=\"#/account\">Manage wallets →</a></p></section>",
             a.wallets.len(),
+            esc(&a.name),
             esc(&total_balance(app).map(ui::sol).unwrap_or_default())
         )),
         None => h.push_str("<p>Log in to see the databases, tables and files your wallets have made. Drafts in this browser are listed below either way.</p><a class=\"btn primary\" href=\"#/account\">Log in</a></section>"),
