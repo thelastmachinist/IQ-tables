@@ -21,6 +21,8 @@ pub struct Settings {
     pub notify_gateway: bool,
     /// "gateway" (IQ's cached HTTP API) or "rpc" (straight from Solana).
     pub source: String,
+    /// IQ SDK speed profile for sending the parts of big uploads.
+    pub upload_speed: String,
 }
 
 impl Default for Settings {
@@ -33,6 +35,7 @@ impl Default for Settings {
             simulate: true,
             notify_gateway: true,
             source: "gateway".into(),
+            upload_speed: crate::upload::DEFAULT_PROFILE.into(),
         }
     }
 }
@@ -54,6 +57,7 @@ impl Settings {
             ("simulate", Json::Bool(self.simulate)),
             ("notify", Json::Bool(self.notify_gateway)),
             ("source", json::s(&self.source)),
+            ("upload_speed", json::s(&self.upload_speed)),
         ])
     }
     pub fn from_json(v: &Json) -> Self {
@@ -70,6 +74,7 @@ impl Settings {
             simulate: v.get("simulate").bool().unwrap_or(true),
             notify_gateway: v.get("notify").bool().unwrap_or(true),
             source: if v.get("source").str() == Some("rpc") { "rpc".into() } else { "gateway".into() },
+            upload_speed: crate::upload::profile(&v.get("upload_speed").str_or(crate::upload::DEFAULT_PROFILE)).name.into(),
         }
     }
     pub fn chain(&self) -> &'static str {
@@ -116,6 +121,8 @@ pub struct DraftTable {
     /// A checkpoint (OPTIMIZE TABLE) is waiting to be saved: the whole table
     /// is rewritten so readers can skip its history.
     pub checkpoint: bool,
+    /// A crowdfunded file's manifest (crowd.rs), written with the structure.
+    pub crowd: Option<Json>,
     /// Display name and writer list as last seen on chain (to spot renames
     /// and privilege changes waiting to be saved).
     pub chain_title: Option<String>,
@@ -212,6 +219,7 @@ impl DraftTable {
             clear: self.clear,
             dropped: self.dropped,
             snap: vec![],
+            crowd: self.crowd.clone(),
         }
     }
     /// The structure without the one-off events, as text (for comparing).
@@ -246,6 +254,9 @@ impl DraftTable {
         self.meta = d.cols.iter().map(|(_, m)| m.clone()).collect();
         self.id_col = d.pos(&d.pk).unwrap_or(0);
         self.keys = d.keys.clone();
+        if d.crowd.is_some() {
+            self.crowd = d.crowd.clone();
+        }
     }
 }
 
@@ -358,6 +369,9 @@ pub fn drafts_to_json(ds: &[Draft]) -> Json {
                                     if t.checkpoint {
                                         o.set("checkpoint", Json::Bool(true));
                                     }
+                                    if let Some(c) = &t.crowd {
+                                        o.set("crowd", c.clone());
+                                    }
                                     o
                                 })
                                 .collect(),
@@ -413,6 +427,7 @@ pub fn drafts_from_json(v: &Json) -> Vec<Draft> {
                             _ => None,
                         },
                         checkpoint: t.get("checkpoint").bool().unwrap_or(false),
+                        crowd: Some(t.get("crowd").clone()).filter(|c| !c.is_null()),
                         ..Default::default()
                     };
                     if tb.title.is_empty() {

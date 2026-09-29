@@ -21,6 +21,11 @@ mod ffi {
         pub fn set_hash(p: *const u8, l: usize);
         pub fn passkey(id: u32, p: *const u8, l: usize);
         pub fn tz() -> i32;
+        pub fn file_read(id: u32, fid: u32, start: f64, len: f64);
+        pub fn fetch_bytes(id: u32, up: *const u8, ul: usize, start: f64, len: f64);
+        pub fn blob_part(bid: u32, p: *const u8, l: usize);
+        pub fn blob_save(bid: u32, np: *const u8, nl: usize, mp: *const u8, ml: usize);
+        pub fn blob_drop(bid: u32);
     }
 }
 
@@ -82,6 +87,25 @@ mod imp {
     pub fn passkey(id: u32, req: &str) {
         unsafe { ffi::passkey(id, req.as_ptr(), req.len()) }
     }
+    /// Read `len` bytes at `start` of a file the page keeps open; the bytes
+    /// arrive through on_async.
+    pub fn file_read(id: u32, fid: u32, start: u64, len: u64) {
+        unsafe { ffi::file_read(id, fid, start as f64, len as f64) }
+    }
+    /// GET with a byte range (`len` 0 = the whole thing); raw bytes back.
+    pub fn fetch_bytes(id: u32, url: &str, start: u64, len: u64) {
+        unsafe { ffi::fetch_bytes(id, url.as_ptr(), url.len(), start as f64, len as f64) }
+    }
+    /// Downloads built from pieces: append, then save (or drop).
+    pub fn blob_part(bid: u32, data: &[u8]) {
+        unsafe { ffi::blob_part(bid, data.as_ptr(), data.len()) }
+    }
+    pub fn blob_save(bid: u32, name: &str, mime: &str) {
+        unsafe { ffi::blob_save(bid, name.as_ptr(), name.len(), mime.as_ptr(), mime.len()) }
+    }
+    pub fn blob_drop(bid: u32) {
+        unsafe { ffi::blob_drop(bid) }
+    }
 }
 
 /// Native stand-ins so the crate builds and unit-tests off the browser.
@@ -129,6 +153,15 @@ mod imp {
     pub fn passkey(id: u32, req: &str) {
         OUT.with(|o| o.borrow_mut().push(format!("passkey:{}:{}", id, req)));
     }
+    pub fn file_read(id: u32, fid: u32, start: u64, len: u64) {
+        OUT.with(|o| o.borrow_mut().push(format!("file_read:{}:{}:{}:{}", id, fid, start, len)));
+    }
+    pub fn fetch_bytes(id: u32, url: &str, start: u64, len: u64) {
+        OUT.with(|o| o.borrow_mut().push(format!("fetch_bytes:{}:{}:{}:{}", id, url, start, len)));
+    }
+    pub fn blob_part(_bid: u32, _d: &[u8]) {}
+    pub fn blob_save(_bid: u32, _n: &str, _m: &str) {}
+    pub fn blob_drop(_bid: u32) {}
 }
 
 pub use imp::*;

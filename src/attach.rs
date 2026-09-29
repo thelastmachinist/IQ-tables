@@ -29,8 +29,25 @@ pub enum Stage {
     Write,
     /// Part `i` of a file sent in parts.
     Chunk(usize),
+    /// The rest of a session's parts, several at a time (upload.rs).
+    Batch,
     /// The code-in that points at the parts.
     Final,
+    /// A crowdfunded piece: the row in the project's table saying where it is.
+    Register,
+}
+
+/// A piece of a crowdfunded file (crowd.rs) being uploaded as an IQ file.
+#[derive(Clone, Debug)]
+pub struct CrowdPiece {
+    pub pda: String,
+    pub piece: usize,
+    pub sha256: String,
+    pub db_id: String,
+    /// The table's name in its database (its seed).
+    pub table: String,
+    /// Signature of the IQ file holding the piece, once written.
+    pub piece_sig: Option<String>,
 }
 
 #[derive(Clone)]
@@ -57,11 +74,16 @@ pub struct Job {
     pub session_exists: Option<bool>,
     /// Signature of the last part sent.
     pub last: Option<String>,
+    /// Set for a piece of a crowdfunded file (not a cell).
+    pub crowd: Option<Box<CrowdPiece>>,
 }
 
 impl Job {
     pub fn cell(&self) -> String {
-        format!("{}:{}:{}", self.key, self.t, self.r)
+        match &self.crowd {
+            Some(c) => format!("crowd:{}:{}", c.pda, c.piece),
+            None => format!("{}:{}:{}", self.key, self.t, self.r),
+        }
     }
 }
 
@@ -284,10 +306,41 @@ impl App {
             seq: None,
             session_exists: None,
             last: None,
+            crowd: None,
         };
         if let Some(m) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) {
             self.fetch_balance(&m);
         }
+        self.attach_check(job);
+    }
+
+    /// Upload a piece of a crowdfunded file from `wallet`, then record it in
+    /// the project's table.
+    pub fn attach_crowd_piece(&mut self, wallet: String, filename: String, bytes: &[u8], piece: CrowdPiece) {
+        let data = base64_encode(bytes);
+        let ftype = "application/octet-stream".to_string();
+        let metadata = iq::file_metadata(&ftype, &filename, &data);
+        let legacy_only = self.settings.tx_format == TxFormat::Legacy;
+        let job = Job {
+            key: String::new(),
+            t: 0,
+            r: 0,
+            c: 0,
+            wallet,
+            filename,
+            legacy: legacy_only || metadata.len() <= iq::INLINE_CAP_LEGACY,
+            metadata,
+            iq_ata: None,
+            stage: Stage::Write,
+            funded: false,
+            data,
+            filetype: ftype,
+            chunks: vec![],
+            seq: None,
+            session_exists: None,
+            last: None,
+            crowd: Some(Box::new(piece)),
+        };
         self.attach_check(job);
     }
 
@@ -296,8 +349,14 @@ impl App {
     }
 
     fn attach_fail(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        let crowd = self.attach_status.as_ref().map(|(c, _)| c.starts_with("crowd:")).unwrap_or(false);
         self.attach_status = None;
-        self.err(msg);
+        if crowd {
+            self.crowd_piece_failed(&msg);
+        } else {
+            self.err(msg);
+        }
     }
 
     fn attach_check(&mut self, job: Job) {
@@ -321,12 +380,17 @@ impl App {
     }
 
     fn attach_send(&mut self, job: Job) {
+        if job.stage == Stage::Batch {
+            return self.attach_batch_start(job);
+        }
         let msg = match &job.stage {
             Stage::Init => "Setting up the wallet's IQ account (one time)…".to_string(),
             Stage::Grow(_) => "Enlarging the wallet's IQ accounts for 4 KB writes (one time)…".to_string(),
             Stage::Write => format!("Inscribing {}…", job.filename),
             Stage::Chunk(i) => format!("Inscribing {} — part {} of {}…", job.filename, i + 1, job.chunks.len()),
+            Stage::Batch => format!("Inscribing {}…", job.filename),
             Stage::Final => format!("Finishing {}…", job.filename),
+            Stage::Register => "Recording the piece in the table…".to_string(),
         };
         self.attach_status_set(&job, &msg);
         let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
@@ -354,14 +418,67 @@ impl App {
                 job.stage = if job.chunks.is_empty() { Stage::Write } else { Stage::Chunk(0) };
                 self.attach_send(job);
             }
+            Stage::Write | Stage::Final if job.crowd.is_some() => {
+                // the piece is on chain; now say where it is
+                if let Some(c) = job.crowd.as_mut() {
+                    c.piece_sig = Some(sig.to_string());
+                }
+                job.stage = Stage::Register;
+                self.attach_send(job);
+            }
+            Stage::Register => {
+                self.attach_status = None;
+                let Some(c) = job.crowd else { return };
+                let tx = c.piece_sig.clone().unwrap_or_default();
+                if self.settings.notify_gateway {
+                    let row = crate::pack::row_json(&crate::crowd::registration_payload(c.piece, &c.sha256, &tx));
+                    let body = format!("{{\"txSignature\":\"{}\",\"signer\":\"{}\",\"row\":{}}}", sig, job.wallet, row);
+                    let id = self.nid();
+                    self.pending.insert(id, P::Ignore);
+                    let url = format!("{}/table/{}/notify", self.gateway_url(), c.pda);
+                    host::fetch(id, "POST", &url, &body, "application/json");
+                }
+                self.crowd_piece_done(c.piece, c.sha256, tx, job.wallet.clone());
+            }
             Stage::Write | Stage::Final => self.attach_done(job, sig),
             Stage::Chunk(i) => {
                 job.last = Some(sig.to_string());
                 job.session_exists = Some(true);
-                job.stage = if i + 1 < job.chunks.len() { Stage::Chunk(i + 1) } else { Stage::Final };
+                job.stage = match (i + 1 < job.chunks.len(), job.seq.is_some()) {
+                    // a session's other parts go out together
+                    (true, true) => Stage::Batch,
+                    (true, false) => Stage::Chunk(i + 1),
+                    (false, _) => Stage::Final,
+                };
                 self.attach_send(job);
             }
+            Stage::Batch => {}
         }
+    }
+
+    fn attach_batch_start(&mut self, job: Job) {
+        let (Some(seq), Some(kp)) = (job.seq, self.keypair(&job.wallet)) else {
+            return self.attach_fail("Log in with the account that holds this database's wallet.");
+        };
+        let same = self.uploads.get("attach").map(|b| b.kp.pubkey == kp.pubkey && b.same_upload(seq, &job.chunks)).unwrap_or(false);
+        if same {
+            // funded again after running short: continue where it stopped
+            self.up_resume("attach");
+            return;
+        }
+        let (legacy, chunks) = (job.legacy, job.chunks.clone());
+        let speed = self.settings.upload_speed.clone();
+        let b = crate::upload::Batch::new(crate::upload::Owner::Attach(Box::new(job)), kp, legacy, seq, chunks, 1, &speed);
+        self.up_begin("attach", b);
+    }
+
+    pub fn attach_batch_done(&mut self, mut job: Job) {
+        job.stage = Stage::Final;
+        self.attach_send(job);
+    }
+
+    pub fn attach_batch_failed(&mut self, msg: String) {
+        self.attach_fail(msg);
     }
 
     fn attach_done(&mut self, job: Job, sig: &str) {
@@ -478,7 +595,7 @@ impl App {
                 let write = match job.chunks.len() {
                     0 => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
                     n => crate::pack::write_cost(n),
-                };
+                } + if job.crowd.is_some() { iq::FEE_DIRECT_WRITE + iq::TX_FEE } else { 0 };
                 let (stage, need) = if !exists(0) {
                     (Stage::Init, iq::USER_INIT_RENT_ESTIMATE + write + iq::TX_FEE)
                 } else {
@@ -492,7 +609,9 @@ impl App {
                         }
                     }
                     let first = match (&job.stage, job.chunks.is_empty()) {
+                        (Stage::Register, _) => Stage::Register,
                         (Stage::Chunk(i), false) => Stage::Chunk(*i),
+                        (Stage::Batch, false) => Stage::Batch,
                         (Stage::Final, false) => Stage::Final,
                         (_, false) => Stage::Chunk(0),
                         _ => Stage::Write,
@@ -519,7 +638,8 @@ impl App {
                         }
                     }
                     self.attach_fail(format!(
-                        "The database wallet has {} but this needs about {}{}. Fund it first.",
+                        "{} has {} but this needs about {}{}. Fund it first.",
+                        if job.crowd.is_some() { "Your balance" } else { "The database wallet" },
                         ui::sol(bal),
                         ui::sol(need + iq::RENT_FLOOR),
                         if stage == Stage::Init { " (its first IQ write includes a one-time ~0.05 SOL account setup)" } else { "" }
@@ -550,6 +670,13 @@ impl App {
                     Stage::Init => vec![iq::user_initialize(&kp.pubkey)],
                     Stage::Grow(list) => list.iter().map(|(t, n)| iq::realloc_account(&kp.pubkey, t, *n)).collect(),
                     Stage::Write => vec![iq::user_inventory_code_in_inline(&kp.pubkey, &job.metadata, job.iq_ata)],
+                    Stage::Batch => return false,
+                    Stage::Register => {
+                        let Some(c) = job.crowd.as_ref() else { return false };
+                        let payload = crate::crowd::registration_payload(c.piece, &c.sha256, c.piece_sig.as_deref().unwrap_or(""));
+                        let md = iq::inline_metadata(0, &crate::pack::row_json(&payload));
+                        vec![iq::db_code_in_inline(&kp.pubkey, c.db_id.as_bytes(), &iq::seed_bytes(&c.table), &md, job.iq_ata)]
+                    }
                     Stage::Chunk(i) => match job.seq {
                         None => vec![iq::send_code(&kp.pubkey, &job.chunks[*i], job.last.as_deref().filter(|_| *i > 0).unwrap_or("Genesis"))],
                         Some(seq) => {
@@ -588,7 +715,9 @@ impl App {
                         Stage::Init => "Wallet setup".to_string(),
                         Stage::Grow(_) => "Account resize".to_string(),
                         Stage::Write | Stage::Final => format!("File {}", job.filename),
+                        Stage::Register => format!("Record of {}", job.filename),
                         Stage::Chunk(i) => format!("Part {} of {}", i + 1, job.filename),
+                        Stage::Batch => format!("Parts of {}", job.filename),
                     };
                     let now = host::now_ms();
                     self.timer(1200, P::ConfirmTick { what, sig, since: now, after: After::Attach(job) });

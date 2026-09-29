@@ -477,6 +477,7 @@ fn db_structure(app: &mut App, key: &str, h: &mut String) {
         options(&[o("locked", "Only you"), o("open", "Anyone (their rows show as unofficial)")], form(app, "ct:open"))
     ));
     h.push_str("<p class=\"small\">Have a spreadsheet? <label class=\"link\">Import a CSV / JSON file as a new table<input type=\"file\" accept=\".csv,.tsv,.txt,.json,text/csv,application/json\" data-file=\"import-csv-new\" hidden></label></p></section>");
+    crate::crowd::editor_card(app, key, h);
     // views
     let views = app.views(key);
     h.push_str("<section class=\"card\"><h3>Views</h3><p class=\"small muted\">A view is a saved SELECT you can query like a table — handy for joins and reports.</p>");

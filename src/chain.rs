@@ -267,6 +267,10 @@ impl App {
         if let Some(t) = self.tv_mut(&page.pda, page.gen) {
             t.loading = false;
             t.cursor = page.next;
+            if !t.load_all && crate::crowd::looks_crowd(&t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).collect::<Vec<_>>()) {
+                t.load_all = true;
+                t.who = crate::app::Who::All;
+            }
             if page.last || t.cursor.is_none() {
                 t.done = true;
                 t.load_all = false;

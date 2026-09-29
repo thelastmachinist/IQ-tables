@@ -647,6 +647,7 @@ fn table(app: &App, h: &mut String) {
         None => h.push_str("<div><span>Official wallet</span><span class=\"muted\">unknown (database not in the list yet)</span></div>"),
     }
     h.push_str("</div>");
+    crate::crowd::card(app, h);
 
     let (cols, rows) = view_rows(tv);
     // counts for the filter chips
@@ -841,6 +842,11 @@ fn settings(app: &App, h: &mut String) {
         if s.tx_format == crate::state::TxFormat::V1 { "selected" } else { "" },
         if s.tx_format == crate::state::TxFormat::Legacy { "selected" } else { "" }
     ));
+    h.push_str("<label>Upload speed for big rows and files<select data-in=\"set\" data-arg=\"upload_speed\">");
+    for p in crate::upload::PROFILES.iter() {
+        h.push_str(&format!("<option value=\"{}\" {}>{}</option>", p.name, if s.upload_speed == p.name { "selected" } else { "" }, p.label));
+    }
+    h.push_str("</select><span class=\"small muted\">IQ's own upload profiles. Faster needs an RPC that takes that many requests; if it says \"too many requests\", IQ Tables slows down by itself.</span></label>");
     h.push_str(&format!(
         "<label class=\"check\"><input type=\"checkbox\" data-in=\"set\" data-arg=\"simulate\" {}> Simulate every transaction before sending (shows exact costs, catches errors for free)</label>",
         if s.simulate { "checked" } else { "" }

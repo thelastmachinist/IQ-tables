@@ -30,6 +30,8 @@ pub enum StepKind {
     /// One part of a record sent with IQ's chunked upload (`send_code` for a
     /// linked list, `create_session` + `post_chunk` for a session).
     Chunk { job: usize, i: usize },
+    /// The rest of a session's parts, sent several at a time (upload.rs).
+    Batch { job: usize },
     /// The `db_code_in` that makes a chunked record appear.
     Finalize { job: usize },
     /// Rename a table or change who may write to it (grow the account first if needed).
@@ -163,6 +165,14 @@ impl Run {
                 ),
                 None => "Upload part".into(),
             },
+            StepKind::Batch { job } => match self.jobs.get(*job) {
+                Some(j) => format!(
+                    "Upload parts 2–{} of \"{}\" (several at a time)",
+                    j.chunks.len(),
+                    tables.get(j.table()).map(|x| x.title.as_str()).unwrap_or("?")
+                ),
+                None => "Upload parts".into(),
+            },
             StepKind::Finalize { job } => match self.jobs.get(*job) {
                 Some(j) => format!("{} — one write in {} parts", self.describe(&Step { kind: j.what.clone(), sig: None, cost: None }, tables), j.chunks.len()),
                 None => "Finish upload".into(),
@@ -182,6 +192,7 @@ fn guard(k: &StepKind) -> u64 {
         StepKind::Grow(_) => 50_000_000,
         StepKind::Pack { .. } | StepKind::Schema { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
         StepKind::Chunk { .. } => iq::SESSION_RENT_ESTIMATE + iq::TX_FEE,
+        StepKind::Batch { .. } => 100 * iq::TX_FEE,
         StepKind::Finalize { .. } => iq::FEE_SESSION_WRITE + iq::TX_FEE,
         StepKind::UpdateTable { realloc, .. } | StepKind::TableList { realloc, .. } => iq::TX_FEE + realloc.map(|r| iq::rent_exempt(r as usize) / 4).unwrap_or(0),
     }
@@ -208,9 +219,16 @@ fn push_chunked(steps: &mut Vec<Step>, jobs: &mut Vec<Job>, kind: StepKind, payl
     });
     let n = chunks.len();
     let job = jobs.len();
+    let session = seq.is_some();
     jobs.push(Job { what: kind, chunks, seq, exists: None, last: None });
-    for i in 0..n {
-        steps.push(Step { kind: StepKind::Chunk { job, i }, sig: None, cost: None });
+    if session {
+        // the first part opens the session; the rest go out together
+        steps.push(Step { kind: StepKind::Chunk { job, i: 0 }, sig: None, cost: None });
+        steps.push(Step { kind: StepKind::Batch { job }, sig: None, cost: None });
+    } else {
+        for i in 0..n {
+            steps.push(Step { kind: StepKind::Chunk { job, i }, sig: None, cost: None });
+        }
     }
     steps.push(Step { kind: StepKind::Finalize { job }, sig: None, cost: None });
 }
@@ -313,6 +331,50 @@ impl App {
         }
     }
 
+    /// Send the rest of a session's parts together (upload.rs).
+    fn run_batch_start(&mut self) {
+        let Some(r) = self.run.as_mut() else { return };
+        let StepKind::Batch { job } = r.steps[r.i].kind.clone() else { return };
+        let Some(j) = r.jobs.get(job) else { return };
+        let Some(seq) = j.seq else { return };
+        let kp = r.kp.clone();
+        let (legacy, chunks) = (r.legacy, j.chunks.clone());
+        r.state = RunState::Working(format!("Step {}/{} · sending {} parts", r.i + 1, r.steps.len(), chunks.len().saturating_sub(1)));
+        // a stopped batch for the same upload keeps the parts already on chain
+        let same = self.uploads.get("run").map(|b| matches!(b.owner, crate::upload::Owner::Run) && b.kp.pubkey == kp.pubkey && b.same_upload(seq, &chunks)).unwrap_or(false);
+        if same {
+            self.up_resume("run");
+        } else {
+            let speed = self.settings.upload_speed.clone();
+            let b = crate::upload::Batch::new(crate::upload::Owner::Run, kp, legacy, seq, chunks, 1, &speed);
+            self.up_begin("run", b);
+        }
+    }
+
+    pub fn run_batch_done(&mut self, sig: String, cost: u64) {
+        let Some(r) = self.run.as_mut() else { return };
+        if !matches!(r.steps.get(r.i).map(|s| &s.kind), Some(StepKind::Batch { .. })) {
+            return;
+        }
+        let i = r.i;
+        r.steps[i].cost = Some(cost);
+        r.sig = Some(sig);
+        self.complete_step();
+    }
+
+    pub fn run_batch_failed(&mut self, m: String) {
+        self.fail(m);
+    }
+
+    pub fn run_batch_stopped(&mut self) {
+        if let Some(r) = self.run.as_mut() {
+            r.stop = false;
+            let m = "Stopped. The parts already sent are kept — Resume sends the rest.".to_string();
+            r.note(false, m.clone());
+            r.state = RunState::Paused(m);
+        }
+    }
+
     fn fail(&mut self, m: impl Into<String>) {
         let m = m.into();
         if let Some(r) = self.run.as_mut() {
@@ -370,6 +432,8 @@ impl App {
                     } {
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", b58(&sess))).unwrap();
                         self.rpc("getAccountInfo", params, P::Run(RunOp::Session));
+                    } else if matches!(r.steps[r.i].kind, StepKind::Batch { .. }) {
+                        self.run_batch_start();
                     } else if matches!(r.steps[r.i].kind, StepKind::Table(_)) {
                         let root = b58(&iq::db_root_pda(self.draft_name().as_bytes()));
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", root)).unwrap();
@@ -828,6 +892,7 @@ impl App {
                     }
                 }
             }
+            StepKind::Batch { .. } => return self.run_batch_start(),
             StepKind::Finalize { job } => {
                 let jb = &r.jobs[*job];
                 let n = jb.chunks.len();
@@ -972,7 +1037,7 @@ impl App {
                 x.chain_writers = Some(x.desired_writers(Some(&signer_s)));
             }
             StepKind::TableList { .. } => {}
-            StepKind::Chunk { .. } | StepKind::Finalize { .. } => {}
+            StepKind::Chunk { .. } | StepKind::Batch { .. } | StepKind::Finalize { .. } => {}
             StepKind::Schema { t, payload, doc, rows, checkpoint } => {
                 let x = &mut self.drafts[di].tables[*t];
                 x.chain_doc = Some(doc.clone());
