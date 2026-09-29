@@ -6,8 +6,9 @@
     python run.py --port 9000  pick a different port
     python run.py --no-open    don't open a browser tab
 
-Serving over http://localhost matters: wallet extensions such as Phantom don't
-inject into file:// pages. Rebuilding needs Rust with the WebAssembly target:
+Serving over http://localhost gives the page a normal web origin, so browser
+storage ("remember my account on this device") and file drops behave as they
+will on IQ Pages. Rebuilding needs Rust with the WebAssembly target:
     rustup target add wasm32-unknown-unknown
 If only rust-src is available, --build-std builds the standard library from source.
 """

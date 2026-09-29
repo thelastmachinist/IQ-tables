@@ -175,6 +175,16 @@ for (const [name, ata] of [["dbCodeIn", undefined], ["dbCodeInAta", iqAta]]) {
     )
   );
 }
+out.ix.userInventoryCodeIn = ser(
+  iq.contract.userInventoryCodeInInstruction(b, {
+    user: signer,
+    user_inventory: iq.contract.getUserInventoryPda(signer, pid),
+    system_program: SYS,
+    receiver: new PublicKey(iq.constants.DEFAULT_WRITE_FEE_RECEIVER),
+    session: undefined,
+    iq_ata: undefined,
+  }, { on_chain_path: "", metadata, session: null })
+);
 out.ix.realloc = ser(
   iq.contract.reallocAccountInstruction(b, { payer: signer, target: root, system_program: SYS }, { new_size: new (require("@coral-xyz/anchor").BN)(4321) })
 );
@@ -224,5 +234,22 @@ const v1b = buildV1Transaction(
 );
 out.v1CodeIn = { raw: hex(v1b.raw), signature: v1b.signature };
 
-fs.writeFileSync(process.argv[2] || "fixtures.json", JSON.stringify(out, null, 1));
-console.log("wrote fixtures:", Object.keys(out).join(", "));
+// password encryption (IQ SDK passwordEncrypt = PBKDF2-SHA256 250k -> AES-256-GCM)
+out.pbkdf2 = [
+  ["password", "73616c74", 1], ["password", "73616c74", 2], ["password", "73616c74", 4096],
+  ["correct horse battery staple", hex(rnd(16)), 250000], ["", hex(rnd(16)), 3], ["x".repeat(100), hex(rnd(8)), 7],
+].map(([pw, salt, it]) => ({ pw, salt, it, key: crypto.pbkdf2Sync(pw, Buffer.from(salt, "hex"), it, 32, "sha256").toString("hex") }));
+out.gcm = [0, 1, 15, 16, 17, 64, 100, 1000].map((n) => {
+  const key = rnd(32), iv = rnd(12), pt = rnd(n);
+  const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([c.update(pt), c.final(), c.getAuthTag()]);
+  return { key: hex(key), iv: hex(iv), pt: hex(pt), ct: hex(ct) };
+});
+
+(async () => {
+  const pt = Buffer.from(JSON.stringify({ hello: "IQ Tables", n: 42 }));
+  const sealed = await iq.crypto.passwordEncrypt("hunter2 but longer", pt);
+  out.sdkPassword = { password: "hunter2 but longer", plaintext: pt.toString("hex"), ...sealed };
+  fs.writeFileSync(process.argv[2] || "fixtures.json", JSON.stringify(out, null, 1));
+  console.log("wrote fixtures:", Object.keys(out).join(", "));
+})();

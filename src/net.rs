@@ -65,8 +65,48 @@ pub fn parse_dbroots(v: &Json) -> Vec<DbRootInfo> {
             }
         })
         .collect();
-    out.sort_by(|a, b| (a.id.is_none(), a.name().to_lowercase()).cmp(&(b.id.is_none(), b.name().to_lowercase())));
+    sort_roots(&mut out);
     out
+}
+
+pub fn sort_roots(v: &mut [DbRootInfo]) {
+    v.sort_by(|a, b| (a.id.is_none(), a.name().to_lowercase()).cmp(&(b.id.is_none(), b.name().to_lowercase())));
+}
+
+/// A table hint stored in a DbRoot → (readable name, table seed). Names are
+/// hashed exactly like the SDK's `toSeedBytes`; raw 32-byte hints are seeds.
+pub fn hint_seed(h: &[u8]) -> (Option<String>, Vec<u8>) {
+    match std::str::from_utf8(h) {
+        Ok(s) if !s.is_empty() && !s.chars().any(|c| c.is_control()) => (Some(s.to_string()), crate::iq::seed_bytes(s)),
+        _ if h.len() == 32 => (None, h.to_vec()),
+        _ => (None, crate::crypto::keccak::keccak256(h).to_vec()),
+    }
+}
+
+/// Gateway-shaped database info from a DbRoot account read off the chain.
+pub fn dbroot_info(pda: &str, r: &crate::iq::DbRoot) -> DbRootInfo {
+    use crate::solana::{b58, parse_pk};
+    let root = parse_pk(pda);
+    let mut tables: Vec<TableRef> = vec![];
+    for (list, public) in [(&r.table_seeds, true), (&r.global_table_seeds, false)] {
+        for h in list.iter() {
+            let (label, seed) = hint_seed(h);
+            let Some(rp) = root else { continue };
+            let tp = b58(&crate::iq::table_pda(&rp, &seed));
+            if tables.iter().any(|t| t.pda == tp) {
+                continue;
+            }
+            tables.push(TableRef { label, hex: crate::crypto::hex(&seed), pda: tp, public });
+        }
+    }
+    DbRootInfo {
+        pda: pda.to_string(),
+        id: String::from_utf8(r.id.clone()).ok().filter(|s| !s.is_empty() && !s.chars().any(|c| c.is_control())),
+        id_hex: crate::crypto::hex(&r.id),
+        creator: b58(&r.creator),
+        table_creators: r.table_creators.iter().map(b58).collect(),
+        tables,
+    }
 }
 
 pub fn rpc_body(method: &str, params: Json) -> String {

@@ -3,8 +3,9 @@
 //    IDL coder, checks accounts/data against the SDK's own instruction builder,
 //    verifies Ed25519 signatures (legacy and v1 wire formats) and applies the
 //    effects (DbRoot, tables, writer locks, rows, fees);
-//  * a mock IQ gateway serving rows straight from that chain;
-//  * two fake Wallet Standard wallets.
+//  * a mock IQ gateway serving rows, files and file listings from that chain.
+// Logs in the way users do: an account file (created, saved, dropped on the
+// page, unlocked with its passphrase) plus imported Solana CLI / base58 keys.
 // Dev-only. Run from tools/: npm install && npm run e2e
 const fs = require("fs");
 const path = require("path");
@@ -55,7 +56,14 @@ const chain = {
   notifies: [],
   txCount: { v1: 0, legacy: 0 },
   ixSeen: {},
+  txs: new Map(), // sig -> { raw (base64), blockTime }
+  addrSigs: new Map(), // address -> [sig] oldest first
+  files: new Map(), // sig -> { metadata, signer, blockTime }
+  assets: new Map(), // wallet -> [asset] oldest first
+  batches: 0,
 };
+const FEATURE = "Feature111111111111111111111111111111111111";
+const V1_GATE = "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL";
 const acct = (k) => chain.accounts.get(k);
 const lam = (k) => (acct(k) ? acct(k).lamports : 0);
 const setAcct = (k, a) => chain.accounts.set(k, a);
@@ -108,7 +116,7 @@ function parseTx(raw) {
       keys: x.idx.map((i) => ({ pubkey: keys[i], isSigner: i < nsig, isWritable: isW(i) })),
       data: x.data,
     }));
-    return { sig: bs58.encode(raw.subarray(msgEnd, msgEnd + 64)), feePayer: keys[0], signers: keys.slice(0, nsig), instructions, nsig, blockhash };
+    return { sig: bs58.encode(raw.subarray(msgEnd, msgEnd + 64)), feePayer: keys[0], signers: keys.slice(0, nsig), instructions, nsig, blockhash, allKeys: keys.map((k) => k.toBase58()) };
   }
   chain.txCount.legacy++;
   const tx = Transaction.from(raw);
@@ -121,6 +129,7 @@ function parseTx(raw) {
     signers: msg.accountKeys.slice(0, nsig),
     instructions: tx.instructions,
     nsig,
+    allKeys: msg.accountKeys.map((k) => k.toBase58()),
   };
 }
 
@@ -266,6 +275,8 @@ function execute(st, tx) {
       if (meta.writers.length && !meta.writers.some((w) => w.equals(signer))) throw new Error("custom program error: 0x1770 NotAuthorized (signer not in writers)");
       if (a.on_chain_path !== "" || a.session) throw new Error("expected an inline write");
       if (Buffer.byteLength(a.metadata) > 3400) throw new Error("metadata over the inline cap: " + Buffer.byteLength(a.metadata));
+      const invLen = st.accounts.get(iq.contract.getUserInventoryPda(signer, PID).toBase58()).data.length;
+      if (Buffer.byteLength(a.metadata) > 700 && invLen < 4213) throw new Error("custom program error: AccountDataTooSmall (pre-upgrade user_inventory, needs realloc)");
       const md = JSON.parse(a.metadata);
       if (md.total_chunks !== 1 || md.method !== 0) throw new Error("bad metadata envelope");
       const row = JSON.parse(md.data);
@@ -275,6 +286,23 @@ function execute(st, tx) {
       credit(st, FEE_RECEIVER, 1_000_000);
       st.pendingRows = st.pendingRows || [];
       st.pendingRows.push({ table: tpda.toBase58(), row, signer: signer.toBase58() });
+    } else if (dec.name === "user_inventory_code_in") {
+      const inv = iq.contract.getUserInventoryPda(signer, PID);
+      sameIx(ix, iq.contract.userInventoryCodeInInstruction(builder, {
+        user: signer, user_inventory: inv, system_program: new PublicKey(SYS), receiver: new PublicKey(FEE_RECEIVER), session: undefined, iq_ata: undefined,
+      }, a), dec.name);
+      const invAcc = st.accounts.get(inv.toBase58());
+      if (!invAcc) throw new Error("custom program error: user not initialized");
+      if (a.on_chain_path !== "" || a.session) throw new Error("expected an inline file");
+      const bytes = Buffer.byteLength(a.metadata);
+      if (bytes > 3400) throw new Error("metadata over the inline cap");
+      if (bytes > 700 && invAcc.data.length < 4213) throw new Error("custom program error: AccountDataTooSmall");
+      const md = JSON.parse(a.metadata);
+      if (md.total_chunks !== 1 || md.method !== 0 || typeof md.data !== "string" || !md.filename || !md.filetype) throw new Error("bad file metadata envelope");
+      debit(st, signer.toBase58(), 1_000_000, "write fee");
+      credit(st, FEE_RECEIVER, 1_000_000);
+      st.pendingFiles = st.pendingFiles || [];
+      st.pendingFiles.push({ signer: signer.toBase58(), metadata: a.metadata });
     } else {
       throw new Error("unexpected instruction " + dec.name);
     }
@@ -297,10 +325,23 @@ function submit(raw, simulate) {
   if (simulate) return { tx, st, err, logs };
   if (!err) {
     chain.accounts = st.accounts;
+    const bt = ++blockTime;
     for (const p of st.pendingRows || []) {
       const list = chain.rows.get(p.table) || [];
-      list.push({ ...p.row, __txSignature: tx.sig, __signer: p.signer, __blockTime: ++blockTime });
+      list.push({ ...p.row, __txSignature: tx.sig, __signer: p.signer, __blockTime: bt });
       chain.rows.set(p.table, list);
+    }
+    for (const f of st.pendingFiles || []) {
+      chain.files.set(tx.sig, { ...f, blockTime: bt });
+      const list = chain.assets.get(f.signer) || [];
+      list.push({ signature: tx.sig, slot: 1000, err: null, memo: null, blockTime: bt, confirmationStatus: "finalized", onChainPath: "", metadata: f.metadata });
+      chain.assets.set(f.signer, list);
+    }
+    chain.txs.set(tx.sig, { raw: Buffer.from(raw).toString("base64"), blockTime: bt });
+    for (const k of new Set(tx.allKeys)) {
+      const l = chain.addrSigs.get(k) || [];
+      l.push(tx.sig);
+      chain.addrSigs.set(k, l);
     }
   }
   chain.sigs.set(tx.sig, { err });
@@ -308,7 +349,15 @@ function submit(raw, simulate) {
 }
 
 function rpc(body) {
-  const { method, params, id } = JSON.parse(body);
+  const parsed = JSON.parse(body);
+  if (Array.isArray(parsed)) {
+    chain.batches++;
+    return parsed.map((p) => rpcOne(p));
+  }
+  return rpcOne(parsed);
+}
+
+function rpcOne({ method, params, id }) {
   const ok = (result) => ({ jsonrpc: "2.0", id, result });
   const ctx = { context: { slot: 1000 } };
   const info = (k) => {
@@ -336,6 +385,41 @@ function rpc(body) {
       const r = submit(raw, false);
       if (r.err && !(params[1] && params[1].skipPreflight)) return { jsonrpc: "2.0", id, error: { code: -32002, message: "Transaction simulation failed: " + r.err } };
       return ok(r.tx.sig);
+    }
+    case "getProgramAccounts": {
+      if (params[0] !== PID.toBase58()) return ok([]);
+      const filters = (params[1] && params[1].filters) || [];
+      const out = [];
+      for (const [k, a] of chain.accounts) {
+        if (a.owner !== PID.toBase58()) continue;
+        const pass = filters.every((f) => {
+          if (!f.memcmp) return true;
+          const want = Buffer.from(bs58.decode(f.memcmp.bytes));
+          return a.data.subarray(f.memcmp.offset, f.memcmp.offset + want.length).equals(want);
+        });
+        if (pass) out.push({ pubkey: k, account: info(k) });
+      }
+      return ok(out);
+    }
+    case "getSignaturesForAddress": {
+      const all = [...(chain.addrSigs.get(params[0]) || [])].reverse();
+      const cfg = params[1] || {};
+      let start = 0;
+      if (cfg.before) start = all.indexOf(cfg.before) + 1;
+      return ok(all.slice(start, start + (cfg.limit || 1000)).map((s) => ({ signature: s, slot: 1000, err: chain.sigs.get(s) && chain.sigs.get(s).err ? {} : null, memo: null, blockTime: (chain.txs.get(s) || {}).blockTime, confirmationStatus: "confirmed" })));
+    }
+    case "getTransaction": {
+      const t = chain.txs.get(params[0]);
+      if (!t) return ok(null);
+      const raw = Buffer.from(t.raw, "base64");
+      return ok({ slot: 1000, blockTime: t.blockTime, version: raw[0] === 129 ? 1 : "legacy", meta: { err: null, fee: 5000 }, transaction: [t.raw, "base64"] });
+    }
+    case "requestAirdrop": {
+      credit(chain, params[0], params[1]);
+      const sig = bs58.encode(Buffer.from(Array.from({ length: 64 }, () => Math.random() * 256 | 0)));
+      chain.sigs.set(sig, { err: null });
+      chain.airdrops = (chain.airdrops || 0) + 1;
+      return ok(sig);
     }
     case "getSignatureStatuses": return ok({ ...ctx, value: params[0].map((s) => {
       const st = chain.sigs.get(s);
@@ -403,54 +487,59 @@ function gateway(url, method, body) {
     const rows = all.slice(start, start + limit);
     return { tablePda: m[1], rows, count: rows.length, nextCursor: start + limit < all.length ? rows[rows.length - 1].__txSignature : null, cached: false };
   }
+  m = p.match(/^\/data\/([^/]+)$/);
+  if (m) {
+    const f = chain.files.get(m[1]);
+    if (!f) return { error: "not found" };
+    const md = JSON.parse(f.metadata);
+    const data = md.data;
+    delete md.data;
+    return { data, metadata: JSON.stringify(md), signature: m[1], signer: f.signer, blockTime: f.blockTime, slot: 1000 };
+  }
+  m = p.match(/^\/user\/([^/]+)\/assets$/);
+  if (m) return [...(chain.assets.get(m[1]) || [])].reverse();
   m = p.match(/^\/table\/([^/]+)\/notify$/);
   if (m && method === "POST") { chain.notifies.push({ table: m[1], body: JSON.parse(body) }); return { ok: true }; }
   return { error: "mock: no route " + p };
 }
 
-// ----------------------------------------------------------------- wallets
-const walletKeys = {
-  "Test Wallet": Keypair.fromSeed(Buffer.alloc(32, 7)),
-  "Other Wallet": Keypair.fromSeed(Buffer.alloc(32, 9)),
-};
-for (const kp of Object.values(walletKeys)) setAcct(kp.publicKey.toBase58(), { lamports: 10 * LAMPORTS, data: Buffer.alloc(0), owner: SYS });
+// -------------------------------------------------------------------- keys
+const { sha256 } = require("@noble/hashes/sha2");
+// "funder": a Solana CLI keypair file the user imports; "other": a base58 key a
+// second user pastes. Both start with 10 SOL. "other" also has IQ accounts from
+// the pre-upgrade program (900 bytes), so its first v1 write must grow them.
+const funderKp = Keypair.fromSeed(Buffer.alloc(32, 7));
+const otherKp = Keypair.fromSeed(Buffer.alloc(32, 9));
+for (const kp of [funderKp, otherKp]) setAcct(kp.publicKey.toBase58(), { lamports: 10 * LAMPORTS, data: Buffer.alloc(0), owner: SYS });
+{
+  const o = otherKp.publicKey;
+  setAcct(iq.contract.getUserInventoryPda(o, PID).toBase58(), { lamports: rent(900), data: Buffer.alloc(900), owner: PID.toBase58() });
+  setAcct(iq.contract.getCodeAccountPda(o, PID).toBase58(), { lamports: rent(900), data: Buffer.alloc(900), owner: PID.toBase58() });
+  const us = accCoder.encode("UserState", { owner: o, trail_anchor: Buffer.alloc(0), metadata: Buffer.alloc(0), total_session_files: new anchor.BN(3) });
+  setAcct(iq.contract.getUserPda(o, PID).toBase58(), { lamports: rent(us.length), data: us, owner: PID.toBase58() });
+}
+// v1 transactions are live on the mock cluster (the feature gate the SDK checks)
+setAcct(V1_GATE, { lamports: 1, data: Buffer.from([1, 0x40, 0x42, 0x0f, 0, 0, 0, 0, 0]), owner: FEATURE });
 
-const walletInit = (names) => `
-(() => {
-  const mk = (name) => {
-    const w = { version: "1.0.0", name, icon: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxIDEiPjxyZWN0IHdpZHRoPSIxIiBoZWlnaHQ9IjEiIGZpbGw9IiM4ODgiLz48L3N2Zz4=", chains: ["solana:mainnet", "solana:devnet"], accounts: [],
-      features: {
-        "standard:connect": { version: "1.0.0", connect: async () => { const address = await window.__walletAddress(name); const account = { address, publicKey: new Uint8Array(32), chains: w.chains, features: [] }; w.accounts = [account]; return { accounts: [account] }; } },
-        "standard:disconnect": { version: "1.0.0", disconnect: async () => { w.accounts = []; } },
-        "solana:signMessage": { version: "1.0.0", signMessage: async ({ message }) => { const s = await window.__walletSign(name, Array.from(message)); return [{ signedMessage: message, signature: new Uint8Array(s) }]; } },
-        "solana:signAndSendTransaction": { version: "1.0.0", supportedTransactionVersions: ["legacy"], signAndSendTransaction: async ({ transaction, chain }) => { const s = await window.__walletSend(name, Array.from(transaction), chain); if (typeof s === "string") throw new Error(s); return [{ signature: new Uint8Array(s) }]; } },
-      } };
-    return w;
-  };
-  const ws = ${JSON.stringify(names)}.map(mk);
-  window.addEventListener("wallet-standard:app-ready", (e) => e.detail.register(...ws));
-})();`;
+const PASS = "correct horse battery staple";
+const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; };
 
 // -------------------------------------------------------------------- run
 (async () => {
   const html = fs.readFileSync(path.join(ROOT, "site", "index.html"), "utf8");
   // CHROME_PATH: any Chromium/Chrome binary; otherwise Playwright's installed browser.
   const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || undefined, args: ["--no-sandbox"] });
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
   const page = await ctx.newPage();
   const consoleErrors = [];
   page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
   page.on("pageerror", (e) => consoleErrors.push("pageerror: " + e.message));
-  await page.exposeFunction("__walletAddress", (name) => walletKeys[name].publicKey.toBase58());
-  await page.exposeFunction("__walletSign", (name, msg) => Array.from(ed25519.sign(Uint8Array.from(msg), walletKeys[name].secretKey.slice(0, 32))));
-  await page.exposeFunction("__walletSend", (name, txArr) => {
-    const tx = Transaction.from(Buffer.from(txArr));
-    tx.partialSign(walletKeys[name]);
-    const r = submit(tx.serialize(), false);
-    if (r.err) return "rejected: " + r.err;
-    return Array.from(bs58.decode(r.tx.sig));
-  });
-  await page.addInitScript(walletInit(Object.keys(walletKeys)));
+  const rpcRoute = async (route, req) => {
+    if (req.method() === "OPTIONS") return route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" } });
+    let res;
+    try { res = rpc(req.postData()); } catch (e) { res = { jsonrpc: "2.0", id: 1, error: { code: -1, message: "mock crashed: " + e.message } }; }
+    return route.fulfill({ status: 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
+  };
   await page.route("**/*", async (route) => {
     const req = route.request();
     const url = req.url();
@@ -459,12 +548,7 @@ const walletInit = (names) => `
       const res = gateway(url, req.method(), req.postData());
       return route.fulfill({ status: res.error ? 404 : 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
     }
-    if (url.startsWith("https://api.mainnet-beta.solana.com")) {
-      if (req.method() === "OPTIONS") return route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" } });
-      let res;
-      try { res = rpc(req.postData()); } catch (e) { res = { jsonrpc: "2.0", id: 1, error: { code: -1, message: "mock crashed: " + e.message } }; }
-      return route.fulfill({ status: 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
-    }
+    if (url.startsWith("https://api.mainnet-beta.solana.com") || url.startsWith("https://api.devnet.solana.com")) return rpcRoute(route, req);
     return route.fulfill({ status: 404, body: "blocked in test: " + url });
   });
   const openDetails = (label) => page.evaluate((l) => {
@@ -472,27 +556,47 @@ const walletInit = (names) => `
   }, label);
   const shot = (n) => page.screenshot({ path: path.join(OUT, n + ".png"), fullPage: true });
   const text = () => page.locator("#app").innerText();
+  const toast = () => page.locator(".toast").innerText().catch(() => "");
   const waitText = async (s, ms = 20000) => {
     try {
       await page.waitForFunction((t) => document.getElementById("app").innerText.includes(t), s, { timeout: ms });
     } catch (e) {
       await shot("fail");
       const run = await page.locator(".run").allInnerTexts().catch(() => []);
-      const toast = await page.locator(".toast").allInnerTexts().catch(() => []);
-      console.log("---- waiting for:", s, "\n---- run panel:\n" + run.join("\n") + "\n---- toast: " + toast.join(" | "));
+      console.log("---- waiting for:", s, "\n---- run panel:\n" + run.join("\n") + "\n---- toast: " + (await toast()));
       console.log("---- console errors:", consoleErrors.slice(0, 5));
       throw e;
     }
   };
+  const download = async (fn) => {
+    const [d] = await Promise.all([page.waitForEvent("download"), fn()]);
+    return { name: d.suggestedFilename(), text: fs.readFileSync(await d.path(), "utf8") };
+  };
+  const dropFile = async (name, content) => {
+    const dt = await page.evaluateHandle(([n, c]) => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([c], n, { type: "application/json" }));
+      return dt;
+    }, [name, content]);
+    await page.dispatchEvent("main", "dragenter", { dataTransfer: dt });
+    const overlay = await page.evaluate(() => document.body.classList.contains("dropping"));
+    await page.dispatchEvent("main", "drop", { dataTransfer: dt });
+    return overlay;
+  };
+  const menu = async (item) => {
+    await page.click("header .wallet button");
+    await page.click(`.menu :text('${item}')`);
+  };
+  const addrOf = (label) => page.locator(`tr:has(input[data-in='wallet-label'][value='${label}']) .addr`).first().getAttribute("title");
 
   console.log("Explorer");
   await page.goto("https://iq.test/#/");
   await waitText("iq-locker");
-  check((await text()).includes("iq-snake-game"), "database list renders from the gateway");
+  check((await text()).includes("iq-snake-game"), "database list renders from IQ's gateway");
   await shot("01-databases");
   await page.click("text=iq-locker");
   await waitText("Official wallet");
-  await page.click("text=notes");
+  await page.click("a:has-text('notes')");
   await waitText("first note");
   const t1 = await text();
   check(t1.includes("second <b>note</b>"), "row text is shown escaped (no HTML injection)");
@@ -500,45 +604,120 @@ const walletInit = (names) => `
   await page.click("button:has-text('Unofficial')");
   await waitText("a visitor wrote this");
   check(true, "Unofficial filter shows the visitor's row");
-  await shot("02-table-raw");
   await page.fill("#q", "notes");
   await page.press("#q", "Enter");
   await waitText("Search: notes");
-  check((await text()).includes("iq-locker / notes") || (await text()).includes("notes"), "search results render");
+  check((await text()).includes("notes"), "search results render");
 
-  console.log("Workspace: new database");
+  console.log("Account: create, import a key file, save");
+  await page.goto("https://iq.test/#/mine");
+  await waitText("Log in to see");
+  await page.click("header a:has-text('Log in')");
+  await waitText("New account");
+  await page.fill("#acct-name", "e2e");
+  await page.fill("#pass1", PASS);
+  await page.fill("#pass2", PASS);
+  const f1 = await download(() => page.click("button:has-text('Create account')"));
+  check(f1.name === "e2e.iqaccount.json", "account file downloaded: " + f1.name);
+  const file1 = JSON.parse(f1.text);
+  check(file1.format === "iq-tables-account" && file1.ciphertext && !f1.text.includes("master"), "account file is encrypted (no secrets in the clear)");
+  const plain = JSON.parse(Buffer.from(await iq.crypto.passwordDecrypt(PASS, file1.salt, file1.iv, file1.ciphertext)).toString());
+  check(typeof plain.master === "string" && plain.master.length === 64, "the IQ SDK's own passwordDecrypt opens the account file");
+  const master = Buffer.from(plain.master, "hex");
+  const derive = (i) => Keypair.fromSeed(sha256(Buffer.concat([Buffer.from("iq-tables/account/v1/wallet"), master, u32le(i)])));
+  await waitText("Databases you own");
+  check((await page.evaluate(() => location.hash)) === "#/mine", "logged in and taken to My tables");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Wallets");
+  check((await addrOf("Main")) === derive(0).publicKey.toBase58(), "Main wallet = SHA-256(domain ‖ master ‖ 0), matches independent derivation");
+  await page.setInputFiles("input[data-file='import-keys']", { name: "funder.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(Array.from(funderKp.secretKey))) });
+  await waitText("Imported 1 new wallet");
+  check((await addrOf("funder")) === funderKp.publicKey.toBase58(), "Solana CLI keypair file imported as wallet \"funder\"");
+  await waitText("10.0000 SOL");
+  check(true, "balances read for every wallet");
+  await menu("Log out");
+  check((await toast()).includes("aren't saved"), "logout refused while imported keys are unsaved");
+  const f2 = await download(() => page.click(".warnbox button:has-text('Save account file')"));
+  const plain2 = JSON.parse(Buffer.from(await iq.crypto.passwordDecrypt(PASS, JSON.parse(f2.text).salt, JSON.parse(f2.text).iv, JSON.parse(f2.text).ciphertext)).toString());
+  check(plain2.wallets.some((w) => w.label === "funder" && w.secret === bs58.encode(funderKp.secretKey)), "saved file carries the imported key");
+  await menu("Log out");
+  await waitText("Logged out");
+
+  console.log("Account: log in by dropping the file");
+  const overlay = await dropFile("e2e.iqaccount.json", f2.text);
+  check(overlay, "drop overlay shows while dragging a file over the page");
+  await waitText("enter its passphrase");
+  await page.fill("#unlock-pass", "wrong passphrase!");
+  await page.press("#unlock-pass", "Enter");
+  await waitText("Wrong passphrase");
+  check(true, "wrong passphrase rejected");
+  await page.fill("#unlock-pass", PASS);
+  await page.press("#unlock-pass", "Enter");
+  await waitText("Databases you own");
+  check((await page.locator("header .wallet button").innerText()).includes("e2e"), "logged in to every wallet in the file");
+
+  console.log("Account: a wallet made after the last save is recovered");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Wallets");
+  await page.fill("#wlabel", "spare");
+  await page.press("#wlabel", "Enter");
+  await waitText("New wallet \"spare\"");
+  const spare = derive(1).publicKey.toBase58();
+  check((await addrOf("spare")) === spare, "new wallet derived at index 1");
+  const fa = funderKp.publicKey.toBase58();
+  await openDetails("Send");
+  await page.selectOption(`select[data-arg='to:${fa}']`, spare);
+  await page.fill(`#amt-${fa}`, "0.25");
+  await page.click(`button[data-a='transfer'][data-arg='${fa}']`);
+  await waitText("Transfer confirmed");
+  check(lam(spare) === 0.25 * LAMPORTS, "moved 0.25 SOL between two wallets of the account");
+  await menu("Log out");
+  await waitText("Logged out");
+  await dropFile("e2e.iqaccount.json", f2.text); // the older file, without "spare"
+  await waitText("enter its passphrase");
+  await page.fill("#unlock-pass", PASS);
+  await page.press("#unlock-pass", "Enter");
+  await waitText("Recovered 1 wallet");
+  check(true, "login rescan recovered the wallet created after the file was saved");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Wallets");
+  check((await addrOf("Recovered #1")) === spare, "recovered wallet has the same address");
+  await page.check("input[data-in='remember']");
+  await page.reload();
+  await page.goto("https://iq.test/#/account");
+  await waitText("Welcome back");
+  await page.fill("#unlock-pass", PASS);
+  await page.press("#unlock-pass", "Enter");
+  await waitText("Databases you own");
+  check(true, "remembered account unlocks with just the passphrase after a reload");
+  await shot("02-account");
+
+  console.log("Workspace: new database with its own wallet");
   await page.goto("https://iq.test/#/ws");
   await waitText("New database");
   await page.fill("#newdb", "e2e-parts");
   await page.press("#newdb", "Enter");
-  await waitText("Database wallet");
   await waitText("name available");
-  check(true, "draft created; name availability checked on chain");
-  await page.click("header .wallet button:has-text('Connect wallet')");
-  await page.click(".menu button:has-text('Test Wallet')");
-  await waitText("Connected");
-  await page.click("button:has-text('Create database wallet')");
-  await waitText("Database wallet unlocked");
-  const dbw = await page.locator(".addrbox .mono").first().innerText();
-  // the derived key must match an independent computation
-  const { sha256 } = require("@noble/hashes/sha2");
-  const msg = Buffer.from(`IQ Tables — unlock database wallet\n\nDatabase: e2e-parts\nKey version: 1\n\nSigning this gives this page the key to the database wallet for "e2e-parts". Only sign it on the IQ Tables portal. It does not move any funds.`);
-  const sig = ed25519.sign(msg, walletKeys["Test Wallet"].secretKey.slice(0, 32));
-  const seed = sha256(Buffer.concat([Buffer.from("iq-tables/db-wallet/v1"), Buffer.from(sig)]));
-  const expectedDbw = Keypair.fromSeed(seed).publicKey.toBase58();
-  check(dbw.trim() === expectedDbw, "database wallet = SHA-256(domain ‖ signature), matches independent derivation");
+  await page.click("button:has-text('Create a dedicated wallet')");
+  await waitText("Created dedicated wallet");
+  const dbw = (await page.locator(".addrbox .mono").first().innerText()).trim();
+  check(dbw === derive(2).publicKey.toBase58(), "dedicated database wallet derived from the account (index 2)");
   check((await page.locator("svg.qr").count()) === 1, "donation QR code rendered");
-  await page.fill("input[data-arg^='fund:']", "0.5");
-  await page.click("button:has-text('Fund from my wallet')");
-  await waitText("Funding confirmed");
-  check(lam(expectedDbw) === 0.5 * LAMPORTS, "funding transfer (legacy tx signed by the wallet) landed: 0.5 SOL");
+  const dkey = (await page.evaluate(() => location.hash)).split("/")[2];
+  await page.selectOption(`select[data-arg='ffrom:${dkey}']`, fa);
+  await page.fill(`#famt-${dkey}`, "0.5");
+  await page.click("button:has-text('Move SOL')");
+  await waitText("Transfer confirmed");
+  check(lam(dbw) === 0.5 * LAMPORTS, "funded the database wallet from another account wallet: 0.5 SOL");
 
-  console.log("Workspace: tables and ghost rows");
+  console.log("Workspace: tables, ghost rows, links and a file");
+  const rootPda = iq.contract.getDbRootPda(Buffer.from("e2e-parts"), PID).toBase58();
+  const fastPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("fasteners"), PID).toBase58();
+  const supPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("suppliers"), PID).toBase58();
   await page.fill("input[data-arg^='tname:']", "fasteners");
   await page.selectOption("select[data-arg^='topen:']", "open");
   await page.click("button:has-text('Add table')");
   await waitText("No rows yet");
-  // 600-part CSV
   const kinds = ["Hex bolt", "Socket head cap screw", "Flat washer", "Nylon lock nut", "Carriage bolt", "Set screw"];
   const mats = ["18-8 stainless", "316 stainless", "Grade 5 steel", "Grade 8 steel", "Brass"];
   const thr = ["M6x1.0", "M8x1.25", "M10x1.5", "1/4-20 UNC", "3/8-16 UNC"];
@@ -559,18 +738,25 @@ const walletInit = (names) => `
   check(!!packMatch, "pack plan shown: " + (packMatch ? packMatch[0] : "missing"));
   const nPacks = packMatch ? Number(packMatch[1]) : 0;
   check(nPacks > 1 && nPacks <= 12, `600 records fit in ${nPacks} inscriptions`);
-  // edit a ghost cell, and add a second (locked) table
-  await page.fill("#c-" + (await page.locator("input[id^='c-']").first().getAttribute("id")).slice(2), "FST-EDITED");
+  await page.fill("#" + (await page.locator("input[id^='c-']").first().getAttribute("id")), "FST-EDITED");
   await page.keyboard.press("Tab");
   await openDetails("New table");
   await page.fill("input[data-arg^='tname:']", "suppliers");
-  await page.fill("input[data-arg^='tcols:']", "name, city, state");
+  await page.fill("input[data-arg^='tcols:']", "name, city, state, website, catalog, spec_file");
   await page.click("button:has-text('Add table')");
   await page.click("button:has-text('+ Row')");
-  const cells = page.locator("table.edit input");
-  await cells.nth(0).fill("Brazos Bolt & Nut"); await cells.nth(0).press("Tab");
-  await cells.nth(1).fill("Waco"); await cells.nth(1).press("Tab");
-  await cells.nth(2).fill("TX"); await cells.nth(2).press("Tab");
+  const cells = page.locator("table.edit input[data-in='cell']");
+  const vals = ["Brazos Bolt & Nut", "Waco", "TX", "https://brazosbolt.example/catalog", `iq://table/${fastPda}/FST-001001`];
+  for (let i = 0; i < vals.length; i++) { await cells.nth(i).fill(vals[i]); await cells.nth(i).press("Tab"); }
+  check((await page.locator("select[data-in='attach-col']").inputValue()) === "spec_file", "file column picked automatically (spec_file)");
+  const spec = "Torque spec, dry threads\nM6 grade 8.8: 10 N·m\nM8 grade 8.8: 25 N·m\nM10 grade 8.8: 49 N·m\n";
+  await page.setInputFiles("input[data-fileb64='attach']", { name: "torque-spec.txt", mimeType: "text/plain", buffer: Buffer.from(spec) });
+  await waitText("is inscribed and linked", 30000);
+  check(!(await text()).includes("one-time IQ account setup"), "cost estimate drops the wallet setup once an attachment has done it");
+  check(chain.ixSeen.user_inventory_code_in === 1 && chain.ixSeen.user_initialize === 1, "file inscribed with user_inventory_code_in (after the wallet's one-time setup), checked against the SDK builder");
+  const fileSig = [...chain.files.keys()][0];
+  check((await cells.nth(5).inputValue()) === `iq://tx/${fileSig}#torque-spec.txt`, "cell holds the file's iq://tx link");
+  check(JSON.parse(chain.files.get(fileSig).metadata).data === spec, "file stored as text, exactly like the SDK's codeIn");
   await shot("03-draft");
 
   console.log("Inscribe");
@@ -578,28 +764,41 @@ const walletInit = (names) => `
   await waitText("Done. Spent", 60000);
   const t3 = await text();
   check(!t3.includes("Simulation rejected") && !t3.includes("failed"), "inscription finished without errors");
-  const rootPda = iq.contract.getDbRootPda(Buffer.from("e2e-parts"), PID).toBase58();
   const root = accCoder.decode("DbRoot", acct(rootPda).data);
-  check(root.creator.toBase58() === expectedDbw, "DbRoot created with the database wallet as creator (official signer)");
-  check(root.table_creators.length === 1 && root.table_creators[0].toBase58() === expectedDbw, "table creation locked to the database wallet");
-  const fastPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("fasteners"), PID).toBase58();
-  const supPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("suppliers"), PID).toBase58();
+  check(root.creator.toBase58() === dbw, "DbRoot created with the database wallet as creator (official signer)");
+  check(root.table_creators.length === 1 && root.table_creators[0].toBase58() === dbw, "table creation locked to the database wallet");
   const fastMeta = accCoder.decode("Table", acct(fastPda).data);
   const supMeta = accCoder.decode("Table", acct(supPda).data);
   check(fastMeta.writers.length === 0, "open table: no writer restriction");
-  check(supMeta.writers.length === 1 && supMeta.writers[0].toBase58() === expectedDbw, "locked table: writers = [database wallet]");
+  check(supMeta.writers.length === 1 && supMeta.writers[0].toBase58() === dbw, "locked table: writers = [database wallet]");
   check((chain.rows.get(fastPda) || []).length === nPacks, `${nPacks} pack rows written to "fasteners"`);
-  check(chain.txCount.v1 > 0, `v1 transactions used (${chain.txCount.v1} v1, ${chain.txCount.legacy} legacy)`);
+  check(chain.txCount.v1 > 0, `v1 transactions used once the feature gate is on (${chain.txCount.v1} v1, ${chain.txCount.legacy} legacy)`);
   check((chain.reallocs || 0) >= 1, "DbRoot realloc path exercised (" + (chain.reallocs || 0) + ")");
-  check(chain.notifies.length === nPacks + 1, "gateway notified for every pack (" + chain.notifies.length + ")");
+  check(chain.notifies.length === nPacks + 1, "IQ gateway notified for every pack (" + chain.notifies.length + ")");
   console.log("   instruction mix:", JSON.stringify(chain.ixSeen));
-  console.log("   db wallet balance after:", lam(expectedDbw) / LAMPORTS, "SOL");
   await shot("04-inscribed");
 
-  console.log("Explorer reads it back");
+  console.log("Explorer: links and files");
   await page.click("a:has-text('view on chain')");
-  await waitText("record(s)");
-  check((await text()).includes("Brazos Bolt & Nut") && (await text()).includes("Waco"), "locked table's record reads back");
+  await page.waitForSelector("table.data td:has-text('Brazos Bolt & Nut')");
+  const web = page.locator("table.data a[href='https://brazosbolt.example/catalog']");
+  check((await web.count()) === 1 && (await web.getAttribute("target")) === "_blank", "web link in a cell opens in a new tab");
+  await waitText("e2e-parts › fasteners › FST-001001");
+  check(true, "iq://table link shows the database › table › record it points to");
+  await page.click("button[data-a='open-tx']:has-text('torque-spec.txt')");
+  await waitText("M8 grade 8.8: 25 N·m");
+  check((await text()).includes("read from IQ gateway"), "file opens in the viewer, read through IQ's gateway /data");
+  await shot("05b-viewer");
+  const dl = await download(() => page.click("button:has-text('Download')"));
+  check(dl.name === "torque-spec.txt" && dl.text === spec, "file downloads byte-for-byte");
+  await page.click("button[data-a='viewer-close']");
+  await page.click("a:has-text('e2e-parts › fasteners › FST-001001')");
+  await waitText("Copy record link");
+  check(/showing 1 record/.test(await text()), "record link opens that one record");
+  await page.click("button:has-text('Copy record link')");
+  check((await toast()).includes(`iq://table/${fastPda}/FST-001001`), "record link copied: iq://table/<table>/<id>");
+
+  console.log("Explorer reads the rest back");
   await page.goto(`https://iq.test/#/t/${rootPda}/${fastPda}`);
   try {
     await page.waitForFunction(() => /showing 600 record/.test(document.getElementById("app").innerText), null, { timeout: 20000 });
@@ -610,11 +809,10 @@ const walletInit = (names) => `
   await shot("05-records");
   await page.fill("#tvq", "FST-001123");
   await page.waitForFunction(() => /showing 1 record/.test(document.getElementById("app").innerText), null, { timeout: 5000 });
-  check(true, "row filter narrows to one record");
   await page.click("td:has-text('FST-001123')");
   await page.click("button:has-text('Edit in workspace')");
   await waitText("Record copied into a ghost row");
-  const ghostInputs = page.locator("tr.ghost input");
+  const ghostInputs = page.locator("tr.ghost input[data-in='cell']");
   await ghostInputs.nth(5).fill("9999");
   await ghostInputs.nth(5).press("Tab");
   await page.click("button:has-text('Inscribe')");
@@ -626,59 +824,116 @@ const walletInit = (names) => `
   const t5 = await text();
   check(t5.includes("9999") && t5.includes("2 versions"), "update inscribed as a new pack; latest version wins (2 versions)");
 
-  console.log("Unofficial contribution from another wallet");
-  await page.click("header .wallet button");
-  await page.click(".menu button:has-text('Disconnect')");
+  console.log("My tables");
+  await page.goto("https://iq.test/#/mine");
+  await waitText("torque-spec.txt");
+  const tm = await text();
+  check(/Databases you own[\s\S]*e2e-parts/.test(tm), "My tables lists the database the account's wallet owns");
+  check(tm.includes("fasteners") && tm.includes("suppliers"), "…with its tables");
+  check(/Files[\s\S]*torque-spec\.txt/.test(tm), "…and the files its wallets inscribed (IQ gateway /user/<wallet>/assets)");
+  check(/Drafts in this browser[\s\S]*e2e-parts/.test(tm), "…and the drafts in this browser");
+  await shot("06-mine");
+
+  console.log("Unofficial contribution from a second account");
+  await menu("Log out");
+  await waitText("Logged out");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Welcome back");
+  await page.click("button:has-text('Forget it on this device')");
+  await waitText("New account");
+  await page.fill("#acct-name", "visitor");
+  await page.fill("#pass1", PASS + "!");
+  await page.fill("#pass2", PASS + "!");
+  await download(() => page.click("button:has-text('Create account')"));
+  await waitText("Databases you own");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Wallets");
+  await openDetails("Import existing keys");
+  await page.fill("#keys-text", `other: ${bs58.encode(otherKp.secretKey)}`);
+  await page.click("button:has-text('Import pasted keys')");
+  await waitText("Imported 1 new wallet");
+  const oa = otherKp.publicKey.toBase58();
+  check((await addrOf("other")) === oa, "pasted \"label: base58-key\" imported");
   await page.goto("https://iq.test/#/ws");
   await page.fill("#newdb", "e2e-parts");
   await page.press("#newdb", "Enter");
   await waitText("Taken");
   check(true, "name check reports the database as taken by its owner");
-  await page.click("header .wallet button:has-text('Connect wallet')");
-  await page.click(".menu button:has-text('Other Wallet')");
-  await waitText("Connected");
-  await page.click("button:has-text('Create database wallet')");
-  await waitText("Database wallet unlocked");
-  await page.fill("input[data-arg^='fund:']", "0.2");
-  await page.click("button:has-text('Fund from my wallet')");
-  await waitText("Funding confirmed");
+  await page.selectOption("select[data-in='draft-wallet']", oa);
+  await waitText("signs everything for");
   await page.fill("input[data-arg^='tname:']", "fasteners");
   await page.fill("input[data-arg^='tcols:']", "part_no, name, note");
   await page.click("button:has-text('Add table')");
   await page.click("button:has-text('+ Row')");
-  const c2 = page.locator("table.edit input");
+  const c2 = page.locator("table.edit input[data-in='cell']");
   await c2.nth(0).fill("FST-900001"); await c2.nth(0).press("Tab");
   await c2.nth(1).fill("Community-submitted washer"); await c2.nth(1).press("Tab");
+  const reallocsBefore = chain.reallocs || 0;
   await page.click("button:has-text('Inscribe')");
   await waitText("Done. Spent", 60000);
   check((await text()).includes("unofficial contributions"), "contributor mode explained in the run log");
-  // try the locked table too: must be refused by the (mock) program before anything is sent
+  check((chain.reallocs || 0) >= reallocsBefore + 2 && acct(iq.contract.getUserInventoryPda(otherKp.publicKey, PID).toBase58()).data.length === 4213, "pre-upgrade IQ accounts grown before the first v1 write (like the SDK)");
   await page.fill("input[data-arg^='tname:']", "suppliers");
   await page.fill("input[data-arg^='tcols:']", "name, city, state");
   await page.click("button:has-text('Add table')");
   await page.click("button:has-text('+ Row')");
-  const c3 = page.locator("table.edit input");
+  const c3 = page.locator("table.edit input[data-in='cell']");
   await c3.nth(0).fill("Spam Co"); await c3.nth(0).press("Tab");
   const supBefore = (chain.rows.get(supPda) || []).length;
   await page.click("button:has-text('Inscribe')");
   await waitText("Simulation rejected", 30000);
   check((chain.rows.get(supPda) || []).length === supBefore, "write to a locked table is rejected at simulation; nothing sent");
-  await shot("06-contributor");
   await page.goto(`https://iq.test/#/t/${rootPda}/${fastPda}`);
   await waitText("Unofficial");
   await page.click("button:has-text('Unofficial')");
   await waitText("Community-submitted washer");
-  const t6 = await text();
-  check(/Unofficial 1/.test(t6.replace(/\s+/g, " ")), "explorer counts 1 unofficial record");
-  check(/Official 600/.test(t6.replace(/\s+/g, " ")), "official records unaffected (600)");
+  const t6 = (await text()).replace(/\s+/g, " ");
+  check(/Unofficial 1/.test(t6), "explorer counts 1 unofficial record");
+  check(/Official 600/.test(t6), "official records unaffected (600)");
   await shot("07-unofficial");
+
+  console.log("Reading straight from Solana (no gateway)");
+  await page.goto("https://iq.test/#/settings");
+  await page.selectOption("select[data-arg='source']", "rpc");
+  await page.goto("https://iq.test/#/");
+  await waitText("e2e-parts");
+  check((await text()).includes("Source: Solana RPC"), "database list read with getProgramAccounts");
+  await page.goto(`https://iq.test/#/t/${rootPda}/${fastPda}`);
+  await page.waitForFunction(() => /Official\s*600/.test(document.getElementById("app").innerText), null, { timeout: 20000 });
+  await page.click("button[data-a='tv-who'][data-arg='official']"); // the view remembers the last filter used on this table
+  await waitText("FST-EDITED");
+  const t7 = (await text()).replace(/\s+/g, " ");
+  check(/Unofficial 1/.test(t7) && t7.includes("FST-EDITED"), "rows rebuilt from the table's transactions: 600 official + 1 unofficial");
+  check(chain.batches > 0, "transactions fetched with batched JSON-RPC (" + chain.batches + " batch)");
+  await page.fill("#tvq", "FST-001123");
+  await page.waitForFunction(() => /showing 1 record/.test(document.getElementById("app").innerText), null, { timeout: 5000 });
+  await page.click("td:has-text('FST-001123')");
+  check((await text()).includes("2 versions"), "latest-wins merge works on chain-read rows too");
+  await page.goto("https://iq.test/#/settings");
+  await page.selectOption("select[data-arg='source']", "gateway");
+
+  console.log("Devnet");
+  await page.selectOption("select[data-arg='cluster']", "devnet");
+  await page.goto("https://iq.test/#/account");
+  await waitText("Wallets");
+  check((await page.locator(".devnet").count()) === 1, "devnet banner shown");
+  const before = lam(oa);
+  await openDetails("Send");
+  await page.click(`button[data-a='airdrop'][data-arg='${oa}']`);
+  await waitText("Airdrop confirmed");
+  check(lam(oa) === before + LAMPORTS, "devnet airdrop of 1 SOL confirmed");
+  await shot("08b-account");
+  await page.goto("https://iq.test/#/settings");
+  await page.selectOption("select[data-arg='cluster']", "mainnet");
 
   console.log("Mobile layout");
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("https://iq.test/#/");
-  await waitText("iq-locker");
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-  check(overflow <= 1, "no horizontal page scroll at 390px (" + overflow + ")");
+  for (const [h, t] of [["#/", "iq-locker"], ["#/account", "Wallets"], ["#/mine", "Drafts in this browser"]]) {
+    await page.goto("https://iq.test/" + h);
+    await waitText(t);
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    check(overflow <= 1, `no horizontal page scroll at 390px on ${h} (${overflow})`);
+  }
   await shot("08-mobile");
 
   check(consoleErrors.length === 0, "no console errors" + (consoleErrors.length ? ": " + consoleErrors.slice(0, 3).join(" | ") : ""));

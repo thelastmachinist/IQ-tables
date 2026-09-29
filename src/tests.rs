@@ -128,6 +128,7 @@ fn instructions_match_sdk() {
     let ata = pk(x.get("iqAta").str().unwrap());
     same_ix(&iq::db_code_in_inline(&signer, &db_id, &seed, &md, Some(ata)), x.get("dbCodeInAta"), "db_code_in ata");
     same_ix(&iq::realloc_account(&signer, &iq::db_root_pda(&db_id), 4321), x.get("realloc"), "realloc");
+    same_ix(&iq::user_inventory_code_in_inline(&signer, &md, None), x.get("userInventoryCodeIn"), "user_inventory_code_in");
 }
 
 #[test]
@@ -313,4 +314,121 @@ fn qr_matrix_for_scanner_check() {
     let _ = std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
     std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/target/qr.txt"), format!("{}\n{}", text, rows.join("\n"))).unwrap();
     assert!(m.len() >= 21 && (m.len() - 17) % 4 == 0);
+}
+
+// ------------------------------------------------------ password encryption
+
+use crate::crypto::aead;
+
+#[test]
+fn pbkdf2_matches_node() {
+    for c in fixtures().get("pbkdf2").arr() {
+        let key = aead::pbkdf2_sha256(c.get("pw").str().unwrap().as_bytes(), &h(c.get("salt")), c.get("it").u64().unwrap() as u32, 32);
+        assert_eq!(hex(&key), c.get("key").str().unwrap(), "pbkdf2 it={}", c.get("it"));
+    }
+}
+
+#[test]
+fn aes_gcm_matches_node() {
+    for c in fixtures().get("gcm").arr() {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h(c.get("key")));
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&h(c.get("iv")));
+        let pt = h(c.get("pt"));
+        let ct = aead::gcm_encrypt(&key, &iv, &pt);
+        assert_eq!(hex(&ct), c.get("ct").str().unwrap(), "gcm len {}", pt.len());
+        assert_eq!(aead::gcm_decrypt(&key, &iv, &ct).unwrap(), pt);
+        let mut bad = ct.clone();
+        bad[0] ^= 1;
+        assert!(aead::gcm_decrypt(&key, &iv, &bad).is_none(), "tampering detected");
+    }
+}
+
+#[test]
+fn opens_sdk_password_encrypt_output() {
+    let f = fixtures();
+    let s = f.get("sdkPassword");
+    let mut iv = [0u8; 12];
+    iv.copy_from_slice(&h(s.get("iv")));
+    let pw = s.get("password").str().unwrap();
+    let pt = aead::password_decrypt(pw, &h(s.get("salt")), &iv, &h(s.get("ciphertext"))).expect("decrypts SDK output");
+    assert_eq!(hex(&pt), s.get("plaintext").str().unwrap());
+    assert!(aead::password_decrypt("wrong", &h(s.get("salt")), &iv, &h(s.get("ciphertext"))).is_none());
+    // and the SDK format round-trips the other way: same salt/iv -> same bytes
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&h(s.get("salt")));
+    let again = aead::password_encrypt(pw, &pt, salt, iv);
+    assert_eq!(hex(&again.ciphertext), s.get("ciphertext").str().unwrap());
+}
+
+#[test]
+fn parses_our_transactions_back() {
+    let kp = solana::Keypair::from_seed([5; 32]);
+    let seed = iq::seed_bytes("t");
+    let md = iq::inline_metadata(3, &pack::row_json("IQT1zABC"));
+    let ix = iq::db_code_in_inline(&kp.pubkey, b"db", &seed, &md, None);
+    let msg = solana::compile(&kp.pubkey, &[ix.clone()], [9; 32]);
+    for (raw, sig) in [solana::v1_signed(&msg, &kp.seed), solana::legacy_signed(&msg, &kp.seed)] {
+        let t = solana::parse_tx(&raw).expect("parses");
+        assert_eq!(t.signature, base58::encode(&sig));
+        let (p, accs, data) = &t.ixs[0];
+        assert_eq!(t.keys[*p], iq::program_id());
+        assert_eq!(t.keys[accs[0]], kp.pubkey);
+        let d = iq::decode_db_code_in(data).unwrap();
+        assert_eq!(d.db_id, b"db");
+        assert_eq!(d.table_seed, seed);
+        let row = iq::row_from_metadata(&d.metadata).unwrap();
+        assert_eq!(row.get("p").str(), Some("IQT1zABC"));
+    }
+    // the SDK's own v1 transaction parses too
+    let f = fixtures();
+    let raw = h(f.get("v1CodeIn").get("raw"));
+    let t = solana::parse_tx(&raw).unwrap();
+    assert_eq!(t.signature, f.get("v1CodeIn").get("signature").str().unwrap());
+    assert!(iq::decode_db_code_in(&t.ixs[0].2).is_some());
+}
+
+#[test]
+fn account_file_roundtrip_and_imports() {
+    use crate::account::{self, Parsed};
+    let mut a = account::Account::new("Test", [3; 32]);
+    let w2 = a.new_wallet("db: parts", "database parts");
+    let cli = solana::Keypair::from_seed([8; 32]);
+    assert!(a.import(cli.clone(), "cli"));
+    assert!(!a.import(cli.clone(), "again"), "duplicate import ignored");
+    a.set_passphrase("pass phrase", [1; 16]);
+    let file = a.to_file([2; 12]);
+    assert!(!file.contains(&b58(&w2.kp.pubkey)), "addresses are inside the ciphertext");
+    let Parsed::Locked(name, v) = account::parse_file("acct.json", &file).unwrap() else { panic!() };
+    assert_eq!(name, "Test");
+    assert!(account::unlock(&v, "nope").is_err());
+    let b = account::unlock(&v, "pass phrase").unwrap();
+    assert_eq!(b.addresses(), a.addresses());
+    assert_eq!(b.next_index, 2);
+    // the encrypted payload is plain SDK passwordEncrypt output
+    let salt = unhex(v.get("salt").str().unwrap()).unwrap();
+    let iv: [u8; 12] = unhex(v.get("iv").str().unwrap()).unwrap().try_into().unwrap();
+    assert!(crate::crypto::aead::password_decrypt("pass phrase", &salt, &iv, &unhex(v.get("ciphertext").str().unwrap()).unwrap()).is_some());
+    // rescan finds a wallet created after the save
+    let lost = account::derive(&[3; 32], 5);
+    assert!(b.rescan_candidates().iter().any(|(i, k)| *i == 5 && k.pubkey == lost.pubkey));
+    // Solana CLI keypair file
+    let mut arr: Vec<u8> = cli.seed.to_vec();
+    arr.extend_from_slice(&cli.pubkey);
+    let cli_json = format!("[{}]", arr.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+    let Parsed::Keys(k) = account::parse_file("id.json", &cli_json).unwrap() else { panic!() };
+    assert_eq!(k[0].1.pubkey, cli.pubkey);
+    assert_eq!(k[0].0, "id");
+    // text list with labels
+    let txt = format!("# my keys\ntreasury: {}\n{}\n", cli.export_b58(), solana::Keypair::from_seed([9; 32]).export_b58());
+    let Parsed::Keys(k) = account::parse_file("keys.txt", &txt).unwrap() else { panic!() };
+    assert_eq!(k.len(), 2);
+    assert_eq!(k[0].0, "treasury");
+    assert!(account::parse_file("x.txt", "not a key").is_err());
+    // unencrypted export round-trips
+    let mut c = account::Account::new("Plain", [4; 32]);
+    c.seal = None;
+    let Parsed::Account(c2) = account::parse_file("p.json", &c.to_file([0; 12])).unwrap() else { panic!() };
+    assert_eq!(c2.addresses(), c.addresses());
 }

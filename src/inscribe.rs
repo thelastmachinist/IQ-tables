@@ -21,6 +21,8 @@ pub enum StepKind {
     Root,
     Table(usize),
     UserInit,
+    /// Grow accounts made by the pre-upgrade program so v1 writes fit.
+    Grow(Vec<(Pubkey, u64)>),
     Pack { t: usize, rows: Vec<usize>, payload: String, pack_id: String, count: usize },
 }
 
@@ -92,6 +94,7 @@ impl Run {
             StepKind::Root => "Create database (DbRoot) and lock table creation".into(),
             StepKind::Table(t) => format!("Create table \"{}\"", tables.get(*t).map(|x| x.name.as_str()).unwrap_or("?")),
             StepKind::UserInit => "One-time IQ account setup for the database wallet".into(),
+            StepKind::Grow(_) => "Enlarge the wallet's IQ accounts for 4 KB (v1) writes".into(),
             StepKind::Pack { t, count, pack_id, .. } => format!(
                 "Inscribe pack {} → \"{}\" ({} records)",
                 pack_id,
@@ -108,6 +111,7 @@ fn guard(k: &StepKind) -> u64 {
         StepKind::Root => 5_000_000,
         StepKind::Table(_) => 10_000_000,
         StepKind::UserInit => iq::USER_INIT_RENT_ESTIMATE,
+        StepKind::Grow(_) => 50_000_000,
         StepKind::Pack { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
     }
 }
@@ -119,8 +123,12 @@ impl App {
             return;
         }
         let Some(i) = self.draft_idx(key) else { return };
-        let Some(kp) = self.keys.get(key).cloned() else {
-            self.err("Unlock the database wallet first");
+        let Some(kp) = self.draft_keypair(key) else {
+            self.err(if self.account.is_none() {
+                "Log in first (drop your account file anywhere on the page)"
+            } else {
+                "Pick a wallet from your account for this database first"
+            });
             return;
         };
         if self.drafts[i].tables.is_empty() {
@@ -168,6 +176,8 @@ impl App {
             iq::ata(&user, &mint, &solana::pk(iq::TOKEN_PROGRAM_STR)),
             iq::ata(&user, &mint, &solana::pk(iq::TOKEN_2022_STR)),
             user,
+            iq::code_account_pda(&user),
+            solana::pk(iq::TX_V1_FEATURE_GATE_STR),
         ];
         for t in &d.tables {
             addrs.push(iq::table_pda(&root, &iq::seed_bytes(&t.name)));
@@ -377,8 +387,17 @@ impl App {
             None
         };
         let bal = vals.get(5).and_then(|x| x.get("lamports").u64()).unwrap_or(0);
+        let len = |k: usize| vals.get(k).and_then(net::account_data).map(|d| d.len() as u64).unwrap_or(0);
         let mut steps = vec![];
         let mut notes: Vec<(bool, String)> = vec![];
+        // Like the SDK: only use v1 transactions once the cluster's feature gate is on.
+        {
+            let r = self.run.as_mut().unwrap();
+            if r.auto && !r.legacy && !vals.get(7).map(iq::v1_active).unwrap_or(false) {
+                r.legacy = true;
+                notes.push((true, "v1 transactions aren't active on this cluster yet, so packs use legacy transactions (up to 700 bytes each).".into()));
+            }
+        }
         let contributor;
         match &root {
             None => {
@@ -404,7 +423,7 @@ impl App {
         }
         let tables = self.drafts[di].tables.clone();
         for (t, tb) in tables.iter().enumerate() {
-            let on_chain = exists(6 + t);
+            let on_chain = exists(8 + t);
             if on_chain {
                 if tb.created.is_none() {
                     self.drafts[di].tables[t].created = Some("existing".into());
@@ -419,10 +438,21 @@ impl App {
             }
             steps.push(Step { kind: StepKind::Table(t), sig: None, cost: None });
         }
+        let legacy = self.run.as_ref().unwrap().legacy;
         if !has_inventory {
             steps.push(Step { kind: StepKind::UserInit, sig: None, cost: None });
+        } else if !legacy {
+            let mut grow = vec![];
+            if len(1) < iq::USER_INVENTORY_SPACE {
+                grow.push((iq::user_inventory_pda(&kp.pubkey), iq::USER_INVENTORY_SPACE));
+            }
+            if exists(6) && len(6) < iq::CODE_ACCOUNT_SPACE {
+                grow.push((iq::code_account_pda(&kp.pubkey), iq::CODE_ACCOUNT_SPACE));
+            }
+            if !grow.is_empty() {
+                steps.push(Step { kind: StepKind::Grow(grow), sig: None, cost: None });
+            }
         }
-        let legacy = self.run.as_ref().unwrap().legacy;
         let cap = if legacy { iq::INLINE_CAP_LEGACY } else { iq::INLINE_CAP_V1 };
         for (t, tb) in tables.iter().enumerate() {
             let ghost_idx: Vec<usize> = tb.rows.iter().enumerate().filter(|(_, r)| r.sig.is_none()).map(|(i, _)| i).collect();
@@ -456,7 +486,9 @@ impl App {
         r.iq_ata = iq_ata;
         r.contributor = contributor;
         r.root_creator = root.map(|x| x.creator);
-        r.start_balance = Some(bal);
+        if r.start_balance.is_none() {
+            r.start_balance = Some(bal);
+        }
         r.balance = Some(bal);
         r.steps = steps;
         r.i = 0;
@@ -480,6 +512,8 @@ impl App {
             let w = b58(&r.kp.pubkey);
             self.fetch_balance(&w);
             self.ok("Inscription complete");
+            // pick up new databases/tables next time the list is shown
+            self.dbroots = crate::app::Load::None;
             return;
         }
         if r.stop {
@@ -542,6 +576,11 @@ impl App {
                 ));
             }
             StepKind::UserInit => ixs.push(iq::user_initialize(&kp.pubkey)),
+            StepKind::Grow(list) => {
+                for (target, size) in list {
+                    ixs.push(iq::realloc_account(&kp.pubkey, target, *size));
+                }
+            }
             StepKind::Pack { t, payload, .. } => {
                 let tb = &d.tables[*t];
                 let md = iq::inline_metadata(r.seq, &pack::row_json(payload));
@@ -627,6 +666,7 @@ impl App {
             }
             StepKind::Table(t) => self.drafts[di].tables[*t].created = Some(sig.clone()),
             StepKind::UserInit => self.drafts[di].user_init_sig = Some(sig.clone()),
+            StepKind::Grow(_) => {}
             StepKind::Pack { t, rows, payload, .. } => {
                 let tb = &mut self.drafts[di].tables[*t];
                 for &ri in rows {
@@ -649,13 +689,23 @@ impl App {
             r.balance = r.balance.map(|b| b.saturating_sub(c));
         }
         r.i += 1;
-        if let (Some((tpda, row)), true) = (notify, self.settings.notify_gateway) {
+        let replan = matches!(kind, StepKind::UserInit) && !r.legacy;
+        if let (Some((tpda, row)), true) = (notify, self.settings.notify_gateway && self.settings.cluster != "devnet") {
             // Warm the gateway cache so the explorer shows the rows right away.
             let body = format!("{{\"txSignature\":\"{}\",\"signer\":\"{}\",\"row\":{}}}", sig, signer, row);
             let id = self.nid();
             self.pending.insert(id, P::Ignore);
             let url = format!("{}/table/{}/notify", self.settings.gateway.trim_end_matches('/'), tpda);
             host::fetch(id, "POST", &url, &body, "application/json");
+        }
+        if replan {
+            // A pre-upgrade program makes small accounts; re-read them so a
+            // resize step is added before any 4 KB write.
+            let r = self.run.as_mut().unwrap();
+            r.steps.clear();
+            r.i = 0;
+            self.prep();
+            return;
         }
         self.next_step();
     }

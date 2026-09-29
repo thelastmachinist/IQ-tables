@@ -18,6 +18,8 @@ pub struct Settings {
     pub tx_format: TxFormat,
     pub simulate: bool,
     pub notify_gateway: bool,
+    /// "gateway" (IQ's cached HTTP API) or "rpc" (straight from Solana).
+    pub source: String,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             tx_format: TxFormat::Auto,
             simulate: true,
             notify_gateway: true,
+            source: "gateway".into(),
         }
     }
 }
@@ -49,6 +52,7 @@ impl Settings {
             ),
             ("simulate", Json::Bool(self.simulate)),
             ("notify", Json::Bool(self.notify_gateway)),
+            ("source", json::s(&self.source)),
         ])
     }
     pub fn from_json(v: &Json) -> Self {
@@ -64,6 +68,7 @@ impl Settings {
             },
             simulate: v.get("simulate").bool().unwrap_or(true),
             notify_gateway: v.get("notify").bool().unwrap_or(true),
+            source: if v.get("source").str() == Some("rpc") { "rpc".into() } else { "gateway".into() },
         }
     }
     pub fn chain(&self) -> &'static str {

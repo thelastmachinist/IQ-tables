@@ -34,6 +34,7 @@ const IX_CREATE_TABLE: [u8; 8] = [214, 142, 131, 250, 242, 83, 135, 185];
 const IX_USER_INITIALIZE: [u8; 8] = [223, 157, 253, 44, 62, 158, 83, 137];
 const IX_DB_CODE_IN: [u8; 8] = [38, 100, 165, 242, 99, 137, 206, 108];
 const IX_REALLOC_ACCOUNT: [u8; 8] = [51, 237, 126, 233, 52, 244, 186, 244];
+const IX_USER_INVENTORY_CODE_IN: [u8; 8] = [81, 177, 5, 122, 213, 125, 21, 238];
 const ACC_DB_ROOT: [u8; 8] = [245, 92, 214, 180, 144, 59, 3, 240];
 const ACC_TABLE: [u8; 8] = [34, 100, 138, 97, 236, 129, 230, 112];
 const ACC_USER_STATE: [u8; 8] = [72, 177, 85, 249, 76, 167, 186, 126];
@@ -230,6 +231,88 @@ pub fn db_code_in_inline(user: &Pubkey, db_id: &[u8], table_seed: &[u8], metadat
     )
 }
 
+/// `user_inventory_code_in` on the direct path: a small file stored inline in
+/// the metadata (what the SDK's `codeIn` does for data under the inline cap).
+pub fn user_inventory_code_in_inline(user: &Pubkey, metadata: &str, iq_ata: Option<Pubkey>) -> Instruction {
+    let p = program_id();
+    ix(
+        vec![
+            AccountMeta::ws(*user),
+            AccountMeta::w(user_inventory_pda(user)),
+            AccountMeta::r(SYSTEM_PROGRAM),
+            AccountMeta::w(fee_receiver()),
+            AccountMeta::r(p),                   // session: None
+            AccountMeta::r(iq_ata.unwrap_or(p)), // iq_ata
+        ],
+        Borsh::new(&IX_USER_INVENTORY_CODE_IN).string("").string(metadata).u8(0).0,
+    )
+}
+
+/// Metadata for an inline file inscription, as the SDK's `codeIn` builds it.
+pub fn file_metadata(filetype: &str, filename: &str, data: &str) -> String {
+    json::obj(vec![
+        ("filetype", json::s(filetype)),
+        ("method", json::n(0)),
+        ("filename", json::s(filename)),
+        ("total_chunks", json::n(1)),
+        ("data", json::s(data)),
+    ])
+    .to_string()
+}
+
+/// Decoded `db_code_in` arguments (from a transaction read back from chain).
+pub struct DbCodeIn {
+    pub db_id: Vec<u8>,
+    pub table_seed: Vec<u8>,
+    pub on_chain_path: String,
+    pub metadata: String,
+}
+
+pub fn decode_db_code_in(data: &[u8]) -> Option<DbCodeIn> {
+    if data.len() < 8 || data[..8] != IX_DB_CODE_IN {
+        return None;
+    }
+    let mut r = Rd { b: data, i: 8 };
+    let db_id = r.bytes()?;
+    let table_seed = r.bytes()?;
+    let on_chain_path = String::from_utf8(r.bytes()?).ok()?;
+    let metadata = String::from_utf8(r.bytes()?).ok()?;
+    Some(DbCodeIn { db_id, table_seed, on_chain_path, metadata })
+}
+
+/// (on_chain_path, metadata) of a `user_inventory_code_in` (a file inscription).
+pub fn decode_inventory_code_in(data: &[u8]) -> Option<(String, String)> {
+    if data.len() < 8 || data[..8] != IX_USER_INVENTORY_CODE_IN {
+        return None;
+    }
+    let mut r = Rd { b: data, i: 8 };
+    let path = String::from_utf8(r.bytes()?).ok()?;
+    let metadata = String::from_utf8(r.bytes()?).ok()?;
+    Some((path, metadata))
+}
+
+/// Row object from an inline `db_code_in` (None for chunked uploads).
+pub fn row_from_metadata(metadata: &str) -> Option<json::Json> {
+    let md = json::parse(metadata).ok()?;
+    let data = md.get("data").str()?;
+    let row = json::parse(data).ok()?;
+    matches!(row, json::Json::Obj(_)).then_some(row)
+}
+
+/// Gateway-shaped table metadata from a decoded Table account.
+pub fn meta_json(t: &TableMeta) -> json::Json {
+    json::obj(vec![
+        ("name", json::s(&t.name)),
+        ("columns", json::Json::Arr(t.columns.iter().map(|c| json::s(c)).collect())),
+        ("idCol", json::s(&t.id_col)),
+        ("lastTimestamp", json::n(t.last_timestamp)),
+        ("gate", json::Json::Null),
+        ("writers", json::Json::Arr(t.writers.iter().map(|w| json::s(&crate::solana::b58(w))).collect())),
+    ])
+}
+
+pub const ACC_DB_ROOT_DISC: [u8; 8] = ACC_DB_ROOT;
+
 /// The metadata string the SDK writes for an inline row: exactly
 /// `JSON.stringify({filetype, method, filename, total_chunks, data})`.
 pub fn inline_metadata(seq: u64, row_json: &str) -> String {
@@ -391,6 +474,21 @@ pub const TX_FEE: u64 = 5_000; // per signature
 pub const USER_INIT_RENT_ESTIMATE: u64 = 62_000_000;
 /// Rent-exempt minimum for an empty system account; the payer must keep this.
 pub const RENT_FLOOR: u64 = 890_880;
+
+/// Post-upgrade sizes of the per-wallet accounts; smaller ones were made by
+/// the pre-upgrade program and must be grown before a v1-sized write.
+pub const CODE_ACCOUNT_SPACE: u64 = 4215;
+pub const USER_INVENTORY_SPACE: u64 = 4213;
+/// Feature gate for v1 transactions (the SDK checks the same account).
+pub const TX_V1_FEATURE_GATE_STR: &str = "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL";
+pub const FEATURE_PROGRAM_STR: &str = "Feature111111111111111111111111111111111111";
+
+/// Whether a `getMultipleAccounts` entry for the feature gate says v1 is live
+/// (owned by the Feature program, `Option<u64>` activation slot is `Some`).
+pub fn v1_active(acc: &json::Json) -> bool {
+    acc.get("owner").str() == Some(FEATURE_PROGRAM_STR)
+        && crate::net::account_data(acc).map(|d| d.first() == Some(&1)).unwrap_or(false)
+}
 
 pub fn rent_exempt(bytes: usize) -> u64 {
     ((bytes as u64) + 128) * 6960

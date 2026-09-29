@@ -149,6 +149,24 @@ summary { cursor: pointer; color: var(--accent); font-weight: 500; }
 .x { background: none; border: 0; font-size: 1.2rem; color: inherit; cursor: pointer; line-height: 1; }
 .loading { color: var(--muted); padding: 20px 0; }
 .prose p { max-width: 780px; }
+.modal { position: fixed; inset: 0; z-index: 20; background: rgba(10,12,16,.45); display: flex; align-items: flex-start; justify-content: center; padding: 6vh 16px; overflow: auto; }
+.sheet { width: min(760px, 100%); margin: 0; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+.sheet.center { text-align: center; width: min(420px, 100%); margin-top: 18vh; }
+img.preview { max-width: 100%; max-height: 60vh; display: block; margin: 10px auto; border-radius: 8px; background: repeating-conic-gradient(var(--soft) 0 25%, var(--panel) 0 50%) 0 0/16px 16px; }
+pre.wrap { white-space: pre-wrap; word-break: break-word; }
+.drop { display: grid; gap: 6px; place-items: center; text-align: center; border: 2px dashed var(--line); border-radius: var(--radius); padding: 28px 16px; cursor: pointer; background: var(--soft); margin: 6px 0 12px; }
+.drop:hover { border-color: var(--accent); }
+body.dropping::after { content: "Drop account or key files to log in"; position: fixed; inset: 12px; z-index: 30; border: 3px dashed var(--accent); border-radius: 16px; background: var(--accent-soft); opacity: .94; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; font-weight: 600; color: var(--accent); pointer-events: none; }
+.warnbox { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+.warnbox .btn { margin-left: 8px; }
+.devnet { background: var(--warn-soft); color: var(--warn); text-align: center; font-size: .85rem; padding: 4px 16px; }
+.link.file { text-align: left; }
+.cell-link { margin-top: 2px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nowrap { white-space: nowrap; }
+input.inline { padding: 3px 6px; min-width: 110px; max-width: 200px; }
+.ghosttext { color: var(--ghost); }
+.menu a.btn:hover { text-decoration: none; }
+label.link { cursor: pointer; }
 @media (max-width: 640px) {
   header.top { padding: 10px 16px; gap: 10px; }
   nav { order: 3; flex-basis: 100%; overflow-x: auto; }

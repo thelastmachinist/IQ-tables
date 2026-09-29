@@ -1,11 +1,13 @@
-//! Application state, event dispatch and the asynchronous flows (explorer
-//! loads, wallet, funding). The inscription pipeline lives in `inscribe.rs`
-//! and rendering in `views.rs`.
+//! Application state, event dispatch and the asynchronous flows. Accounts and
+//! wallets live in `accounts_flow.rs`, direct chain reads in `chain.rs`, file
+//! attachments in `attach.rs`, the inscription pipeline in `inscribe.rs` and
+//! rendering in `views.rs`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::crypto::{base58, base64_encode};
+use crate::account::Account;
+use crate::crypto::base58;
 use crate::host;
 use crate::inscribe::{Run, RunOp};
 use crate::iq;
@@ -13,6 +15,9 @@ use crate::json::{self, Json};
 use crate::net::{self, DbRootInfo};
 use crate::pack;
 use crate::solana::{self, b58, parse_pk, Keypair};
+
+pub const K_ACCOUNT: &str = "iqtables:v1:account";
+pub const K_REMEMBER: &str = "iqtables:v1:remember";
 use crate::state::{self, Draft, DraftTable, GhostRow, Settings};
 use crate::ui;
 
@@ -39,8 +44,10 @@ impl<T> Load<T> {
 pub enum Route {
     Databases,
     Db(String),
-    Table { root: Option<String>, pda: String },
+    Table { root: Option<String>, pda: String, record: Option<String> },
     Search(String),
+    Mine,
+    Account,
     Workspace,
     Draft(String),
     Settings,
@@ -97,18 +104,40 @@ pub enum P {
     Meta(String, u32),
     Rows(String, u32),
     RootInfo(String, u32),
-    Connect,
-    Sign { draft: String, first: Option<Vec<u8>> },
     NameCheck { draft: String, name: String },
     Balance(String),
-    FundHash { draft: String, lamports: u64 },
-    FundSent { draft: String },
-    WithdrawHash { draft: String },
-    WithdrawSent { draft: String },
-    Confirm { what: String, sig: String, addr: String, since: f64 },
-    ConfirmTick { what: String, sig: String, addr: String, since: f64 },
+    Confirm { what: String, sig: String, since: f64, after: After },
+    ConfirmTick { what: String, sig: String, since: f64, after: After },
     Run(RunOp),
+    // accounts (accounts_flow.rs)
+    Unlock,
+    CreateAccount,
+    SetPass,
+    Rescan(Vec<(u32, String)>),
+    Balances(Vec<String>),
+    TransferHash { from: String, to: String, lamports: u64 },
+    TransferSent,
+    Airdrop(String),
+    // direct chain reads (chain.rs)
+    RpcRoots,
+    RpcMeta(String, u32),
+    RpcSigs(String, u32),
+    RpcTxs(crate::chain::Page),
+    // files and links (attach.rs)
+    AttachCheck(crate::attach::Job),
+    AttachHash(crate::attach::Job),
+    AttachSent(crate::attach::Job),
+    /// (signature, read from Solana rather than IQ's gateway)
+    TxView(String, bool),
+    Files(String),
     Ignore,
+}
+
+/// What to do once a confirmed transaction lands.
+#[derive(Clone)]
+pub enum After {
+    Balances,
+    Attach(crate::attach::Job),
 }
 
 pub struct PlanCache {
@@ -126,9 +155,23 @@ pub struct App {
     pub search_q: String,
     pub search: Load<Vec<Hit>>,
     pub table: Option<TableView>,
-    pub wallets: Vec<(String, String)>,
-    pub owner: Option<(String, String)>,
-    pub keys: HashMap<String, Keypair>,
+    /// The logged-in account (all its keys are in memory only while logged in).
+    pub account: Option<Account>,
+    /// An encrypted account file waiting for its passphrase: (name, file).
+    pub locked: Option<(String, Json)>,
+    /// Blocking work in progress (e.g. "Unlocking…" while PBKDF2 runs).
+    pub busy: Option<String>,
+    pub account_menu: bool,
+    /// Imported keys not yet saved to the account file.
+    pub unsaved_keys: bool,
+    /// Keep the encrypted account file in this browser.
+    pub remember: bool,
+    /// Files each account wallet inscribed (IQ gateway `/user/<wallet>/assets`).
+    pub files: HashMap<String, Load<Vec<crate::attach::Asset>>>,
+    /// A file being inscribed into a cell: ("key:table:row", status).
+    pub attach_status: Option<(String, String)>,
+    /// An opened `iq://tx/…` link.
+    pub viewer: Option<crate::attach::Viewer>,
     pub balances: HashMap<String, Load<u64>>,
     pub name_checks: HashMap<String, Load<Option<String>>>,
     pub pending: HashMap<u32, P>,
@@ -139,7 +182,6 @@ pub struct App {
     pub revs: HashMap<(String, usize), u64>,
     pub form: HashMap<String, String>,
     pub reveal_key: Option<String>,
-    pub connect_menu: bool,
     /// Set when an action navigates and its message should survive the route change.
     pub keep_toast: bool,
 }
@@ -177,8 +219,7 @@ unsafe fn owned_str(p: *mut u8, len: usize) -> String {
 #[no_mangle]
 pub extern "C" fn start() {
     APP.with(|a| {
-        let mut app = App::new();
-        app.refresh_wallets();
+        let app = App::new();
         *a.borrow_mut() = Some(app);
     });
 }
@@ -231,9 +272,15 @@ impl App {
             search_q: String::new(),
             search: Load::None,
             table: None,
-            wallets: vec![],
-            owner: None,
-            keys: HashMap::new(),
+            account: None,
+            locked: None,
+            busy: None,
+            account_menu: false,
+            unsaved_keys: false,
+            remember: host::storage_get(K_REMEMBER).as_deref() == Some("1"),
+            files: HashMap::new(),
+            attach_status: None,
+            viewer: None,
             balances: HashMap::new(),
             name_checks: HashMap::new(),
             pending: HashMap::new(),
@@ -244,7 +291,6 @@ impl App {
             revs: HashMap::new(),
             form: HashMap::new(),
             reveal_key: None,
-            connect_menu: false,
             keep_toast: false,
         }
     }
@@ -296,9 +342,20 @@ impl App {
         *self.revs.entry((key.to_string(), t)).or_insert(0) += 1;
     }
 
-    pub fn refresh_wallets(&mut self) {
-        let v = json::parse(&host::wallets()).unwrap_or(Json::Arr(vec![]));
-        self.wallets = v.arr().iter().map(|w| (w.get("name").str_or("?"), w.get("icon").str_or(""))).collect();
+    /// Key for an address, if it belongs to the logged-in account.
+    pub fn keypair(&self, address: &str) -> Option<Keypair> {
+        self.account.as_ref()?.find(address).map(|w| w.kp.clone())
+    }
+
+    /// The database wallet's key for a draft, if it's in the account.
+    pub fn draft_keypair(&self, key: &str) -> Option<Keypair> {
+        let w = self.drafts.get(self.draft_idx(key)?)?.wallet.clone()?;
+        self.keypair(&w)
+    }
+
+    /// Read tables straight from Solana instead of the IQ gateway.
+    pub fn use_rpc(&self) -> bool {
+        self.settings.source == "rpc" || self.settings.cluster == "devnet"
     }
 
     pub fn render(&mut self) {
@@ -316,11 +373,16 @@ impl App {
         } else {
             self.toast = None;
         }
+        self.account_menu = false;
         self.route = match parts.as_slice() {
             ["db", pda] => Route::Db(pda.to_string()),
-            ["t", root, pda] => Route::Table { root: Some(root.to_string()), pda: pda.to_string() },
-            ["t", pda] => Route::Table { root: None, pda: pda.to_string() },
+            ["t", root, pda, "r", rec] => Route::Table { root: Some(root.to_string()), pda: pda.to_string(), record: Some(pct_decode(rec)) },
+            ["t", pda, "r", rec] => Route::Table { root: None, pda: pda.to_string(), record: Some(pct_decode(rec)) },
+            ["t", root, pda] => Route::Table { root: Some(root.to_string()), pda: pda.to_string(), record: None },
+            ["t", pda] => Route::Table { root: None, pda: pda.to_string(), record: None },
             ["search", q] => Route::Search(pct_decode(q)),
+            ["mine"] => Route::Mine,
+            ["account"] => Route::Account,
             ["ws"] => Route::Workspace,
             ["ws", key] => Route::Draft(key.to_string()),
             ["settings"] => Route::Settings,
@@ -329,16 +391,30 @@ impl App {
         };
         match self.route.clone() {
             Route::Databases | Route::Db(_) => self.ensure_dbroots(),
-            Route::Table { root, pda } => {
+            Route::Table { root, pda, record } => {
                 self.ensure_dbroots();
                 self.open_table(root, pda);
+                if let (Some(rec), Some(t)) = (record, self.table.as_mut()) {
+                    t.text = rec.clone();
+                    t.selected = Some(rec);
+                }
             }
             Route::Search(q) => {
                 self.search_q = q.clone();
-                self.search = Load::Loading;
-                let path = format!("/search?q={}&limit=40", pct_encode(&q));
-                self.get(&path, P::Search(q));
+                if self.use_rpc() {
+                    self.ensure_dbroots();
+                    self.search = Load::None; // searched locally over the database list
+                } else {
+                    self.search = Load::Loading;
+                    let path = format!("/search?q={}&limit=40", pct_encode(&q));
+                    self.get(&path, P::Search(q));
+                }
             }
+            Route::Mine => {
+                self.load_mine();
+                self.fetch_all_balances();
+            }
+            Route::Account => self.fetch_all_balances(),
             Route::Draft(key) => {
                 if let Some(i) = self.draft_idx(&key) {
                     if let Some(w) = self.drafts[i].wallet.clone() {
@@ -355,10 +431,14 @@ impl App {
         }
     }
 
-    fn ensure_dbroots(&mut self) {
+    pub fn ensure_dbroots(&mut self) {
         if matches!(self.dbroots, Load::None | Load::Err(_)) {
             self.dbroots = Load::Loading;
-            self.get("/dbroots", P::DbRoots);
+            if self.use_rpc() {
+                self.rpc_roots();
+            } else {
+                self.get("/dbroots", P::DbRoots);
+            }
         }
     }
 
@@ -418,9 +498,14 @@ impl App {
             }
         }
         self.attach_root_info();
-        self.get(&format!("/table/{}/meta", pda), P::Meta(pda.clone(), gen));
-        let q = if fresh { "&fresh=1" } else { "" };
-        self.get(&format!("/table/{}/rows?limit=100{}", pda, q), P::Rows(pda.clone(), gen));
+        if self.use_rpc() {
+            self.rpc_meta(&pda, gen);
+            self.rpc_rows(&pda, gen, None);
+        } else {
+            self.get(&format!("/table/{}/meta", pda), P::Meta(pda.clone(), gen));
+            let q = if fresh { "&fresh=1" } else { "" };
+            self.get(&format!("/table/{}/rows?limit=100{}", pda, q), P::Rows(pda.clone(), gen));
+        }
         let needs_root = self.table.as_ref().map(|t| t.creator.is_none()).unwrap_or(false);
         if needs_root {
             if let Some(r) = root {
@@ -431,7 +516,7 @@ impl App {
     }
 
     /// Fill creator / database name for the open table from the gateway list.
-    fn attach_root_info(&mut self) {
+    pub fn attach_root_info(&mut self) {
         let Some(t) = self.table.as_ref() else { return };
         let pda = t.pda.clone();
         let root = t.root.clone();
@@ -451,12 +536,18 @@ impl App {
         }
     }
 
-    fn more_rows(&mut self) {
+    pub fn more_rows(&mut self) {
         let Some(t) = self.table.as_mut() else { return };
         if t.loading || t.done {
             return;
         }
         t.loading = true;
+        if self.settings.source == "rpc" || self.settings.cluster == "devnet" {
+            let (pda, gen, cur) = (t.pda.clone(), t.gen, t.cursor.clone());
+            t.err = None;
+            self.rpc_rows(&pda, gen, cur);
+            return;
+        }
         let path = match &t.cursor {
             Some(c) => format!("/table/{}/rows?limit=100&before={}", t.pda, c),
             None => format!("/table/{}/rows?limit=100", t.pda),
@@ -470,7 +561,6 @@ impl App {
     pub fn event(&mut self, kind: &str, action: &str, arg: &str, val: &str) -> bool {
         match (kind, action) {
             ("route", _) => self.route(val),
-            ("wallets", _) => self.refresh_wallets(),
             (_, "go") => host::set_hash(arg),
             (_, "toast-close") => self.toast = None,
             (_, "db-filter") => self.db_filter = val.to_string(),
@@ -542,22 +632,12 @@ impl App {
             }
             (_, "tv-export") => self.export_view(arg),
             (_, "tv-draft") => self.draft_from_table(arg),
-            // wallet
-            (_, "connect-menu") => {
-                self.refresh_wallets();
-                self.connect_menu = !self.connect_menu;
-            }
-            (_, "connect") => {
-                self.connect_menu = false;
-                let id = self.nid();
-                self.pending.insert(id, P::Connect);
-                host::wallet_connect(id, arg);
-            }
-            (_, "disconnect") => {
-                host::wallet_disconnect();
-                self.owner = None;
-                self.keys.clear();
-                self.connect_menu = false;
+            (_, "copy-record") => {
+                if let Some(t) = self.table.as_ref() {
+                    let link = format!("iq://table/{}/{}", t.pda, pct_encode(arg));
+                    host::copy(&link);
+                    self.ok(format!("Copied {}", link));
+                }
             }
             // workspace
             (_, "form") => {
@@ -573,8 +653,6 @@ impl App {
                     host::set_hash("#/ws");
                 }
             }
-            (_, "unlock") => self.unlock(arg),
-            (_, "import-key") => self.import_key(arg),
             (_, "reveal-key") => {
                 self.reveal_key = if self.reveal_key.as_deref() == Some(arg) { None } else { Some(arg.to_string()) };
             }
@@ -585,8 +663,6 @@ impl App {
                 }
             }
             (_, "balance") => self.fetch_balance(arg),
-            (_, "fund") => self.fund(arg),
-            (_, "withdraw") => self.withdraw(arg),
             (_, "add-table") => self.add_table(arg),
             (_, "sel-table") => {
                 let mut it = arg.splitn(2, ':');
@@ -595,6 +671,9 @@ impl App {
                     self.drafts[i].sel = t;
                     self.drafts[i].page = 0;
                 }
+            }
+            (_, "del-table") | (_, "del-row") | (_, "clear-ghosts") | (_, "inscribe") if self.attach_busy(arg.split(':').next().unwrap_or("")) => {
+                self.err("Wait for the file being attached to finish.");
             }
             (_, "del-table") => self.edit_table(arg, |d, t| {
                 if d.tables[t].created.is_none() {
@@ -633,6 +712,15 @@ impl App {
                 self.import_text(arg, &text);
             }
             ("file", "import-file") => self.import_text(arg, val),
+            ("file", "attach") => self.attach_file(arg, val),
+            (_, "open-tx") => self.open_tx(arg, val),
+            (_, "viewer-close") => self.viewer = None,
+            (_, "viewer-download") => self.viewer_download(),
+            (_, "attach-col") => {
+                let mut it = arg.splitn(2, ':');
+                let (k, t) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("0").parse().unwrap_or(0));
+                self.form.insert(format!("attachcol:{}:{}", k, t), val.to_string());
+            }
             (_, "inscribe") => self.start_run(arg),
             (_, "run-stop") => {
                 if let Some(r) = self.run.as_mut() {
@@ -666,7 +754,7 @@ impl App {
                 }
                 Err(e) => self.err(format!("Not a workspace file: {}", e)),
             },
-            _ => return false,
+            _ => return self.account_event(kind, action, arg, val),
         }
         true
     }
@@ -687,6 +775,8 @@ impl App {
                 }
                 self.balances.clear();
                 self.name_checks.clear();
+                self.dbroots = Load::None;
+                self.files.clear();
             }
             "tx" => {
                 self.settings.tx_format = match val {
@@ -695,6 +785,11 @@ impl App {
                     _ => state::TxFormat::Auto,
                 };
                 self.plans.clear();
+            }
+            "source" => {
+                self.settings.source = if val == "rpc" { "rpc".into() } else { "gateway".into() };
+                self.dbroots = Load::None;
+                self.files.clear();
             }
             "simulate" => self.settings.simulate = val == "true",
             "notify" => self.settings.notify_gateway = val == "true",
@@ -817,22 +912,6 @@ impl App {
                     self.more_rows();
                 }
             }
-            P::Connect => {
-                if ok {
-                    let v = json::parse(&text()).unwrap_or(Json::Null);
-                    let addr = v.get("address").str_or("");
-                    if parse_pk(&addr).is_some() {
-                        self.owner = Some((v.get("name").str_or("Wallet"), addr.clone()));
-                        self.fetch_balance(&addr);
-                        self.ok(format!("Connected {}", solana::short(&addr)));
-                    } else {
-                        self.err("Wallet returned no Solana account");
-                    }
-                } else {
-                    self.err(format!("Wallet connection failed: {}", text()));
-                }
-            }
-            P::Sign { draft, first } => self.on_signature(&draft, first, ok, data),
             P::NameCheck { draft, name } => {
                 let cur = self.draft_idx(&draft).map(|i| self.drafts[i].name.clone());
                 if cur.as_deref() == Some(&name) {
@@ -860,74 +939,53 @@ impl App {
                 };
                 self.balances.insert(addr, v);
             }
-            P::FundHash { draft, lamports } => {
-                let hash = if http_ok { net::rpc_result(&text()).ok() } else { None };
-                let bh = hash.as_ref().and_then(|r| r.get("value").get("blockhash").str().and_then(base58::decode32));
-                match (bh, self.owner.clone(), self.draft_idx(&draft).and_then(|i| self.drafts[i].wallet.clone())) {
-                    (Some(bh), Some((_, owner)), Some(dest)) => {
-                        let (Some(from), Some(to)) = (parse_pk(&owner), parse_pk(&dest)) else { return true };
-                        let msg = solana::compile(&from, &[solana::system_transfer(&from, &to, lamports)], bh);
-                        let tx = solana::legacy_unsigned(&msg);
-                        let id = self.nid();
-                        self.pending.insert(id, P::FundSent { draft });
-                        let chain = self.settings.chain();
-                        host::wallet_sign_and_send(id, &tx, chain);
-                        self.ok("Approve the transfer in your wallet…");
-                    }
-                    _ => self.err(format!("Could not prepare the transfer: {}", fetch_err(ok, status, &text()))),
-                }
-            }
-            P::FundSent { draft } => {
-                if ok {
-                    let sig = base58::encode(&data);
-                    let addr = self.draft_idx(&draft).and_then(|i| self.drafts[i].wallet.clone()).unwrap_or_default();
-                    self.ok(format!("Transfer sent: {}", solana::short(&sig)));
-                    let now = host::now_ms();
-                    self.timer(1500, P::ConfirmTick { what: "Funding".into(), sig, addr, since: now });
-                } else {
-                    self.err(format!("Transfer not sent: {}", text()));
-                }
-            }
-            P::WithdrawHash { draft } => self.withdraw_send(&draft, ok, status, &text()),
-            P::WithdrawSent { draft } => {
-                let addr = self.draft_idx(&draft).and_then(|i| self.drafts[i].wallet.clone()).unwrap_or_default();
-                match if http_ok { net::rpc_result(&text()) } else { Err(fetch_err(ok, status, &text())) } {
-                    Ok(r) => {
-                        let sig = r.str_or("");
-                        self.ok(format!("Withdrawal sent: {}", solana::short(&sig)));
-                        let now = host::now_ms();
-                        self.timer(1500, P::ConfirmTick { what: "Withdrawal".into(), sig, addr, since: now });
-                    }
-                    Err(e) => self.err(format!("Withdrawal failed: {}", e)),
-                }
-            }
-            P::ConfirmTick { what, sig, addr, since } => {
+            P::ConfirmTick { what, sig, since, after } => {
                 let params = json::parse(&format!("[[\"{}\"]]", sig)).unwrap();
-                self.rpc("getSignatureStatuses", params, P::Confirm { what, sig, addr, since });
+                self.rpc("getSignatureStatuses", params, P::Confirm { what, sig, since, after });
                 return false;
             }
-            P::Confirm { what, sig, addr, since } => {
+            P::Confirm { what, sig, since, after } => {
                 let st = if http_ok { net::rpc_result(&text()).ok() } else { None };
                 let v = st.as_ref().map(|r| r.get("value").idx(0).clone()).unwrap_or(Json::Null);
                 let conf = v.get("confirmationStatus").str_or("");
                 if !v.get("err").is_null() {
+                    if let After::Attach(_) = after {
+                        self.attach_status = None;
+                    }
                     self.err(format!("{} failed on chain: {}", what, v.get("err")));
                 } else if conf == "confirmed" || conf == "finalized" {
                     self.ok(format!("{} confirmed", what));
-                    self.fetch_balance(&addr);
-                    if let Some((_, o)) = self.owner.clone() {
-                        self.fetch_balance(&o);
-                    }
+                    self.fetch_all_balances();
+                    self.after_confirm(after, &sig);
                 } else if host::now_ms() - since < 90_000.0 {
-                    self.timer(2000, P::ConfirmTick { what, sig, addr, since });
+                    self.timer(2000, P::ConfirmTick { what, sig, since, after });
                     return false;
                 } else {
+                    if let After::Attach(_) = after {
+                        self.attach_status = None;
+                    }
                     self.err(format!("{} not confirmed after 90s — check {}", what, solana::short(&sig)));
                 }
             }
             P::Run(op) => return self.run_async(op, ok, status, data),
+            other => return self.more_async(other, ok, status, data),
         }
         true
+    }
+
+    fn more_async(&mut self, p: P, ok: bool, status: u32, data: Vec<u8>) -> bool {
+        match p {
+            P::RpcRoots | P::RpcMeta(..) | P::RpcSigs(..) | P::RpcTxs(..) => self.chain_async(p, ok, status, data),
+            P::AttachCheck(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => self.attach_async(p, ok, status, data),
+            other => self.account_async(other, ok, status, data),
+        }
+    }
+
+    fn after_confirm(&mut self, after: After, sig: &str) {
+        match after {
+            After::Balances => {}
+            After::Attach(job) => self.attach_confirmed(job, sig),
+        }
     }
 
     // ------------------------------------------------------------- wallet
@@ -939,142 +997,6 @@ impl App {
         self.balances.insert(addr.to_string(), Load::Loading);
         let params = json::parse(&format!("[\"{}\",{{\"commitment\":\"confirmed\"}}]", addr)).unwrap();
         self.rpc("getBalance", params, P::Balance(addr.to_string()));
-    }
-
-    fn unlock(&mut self, key: &str) {
-        let Some(i) = self.draft_idx(key) else { return };
-        if self.owner.is_none() {
-            self.err("Connect your wallet first — it is your account and the key to your database wallets.");
-            return;
-        }
-        let msg = state::derivation_message(&self.drafts[i].name);
-        let id = self.nid();
-        self.pending.insert(id, P::Sign { draft: key.to_string(), first: None });
-        host::wallet_sign_message(id, msg.as_bytes());
-        self.ok("Sign the unlock message in your wallet (it does not move funds)…");
-    }
-
-    fn on_signature(&mut self, key: &str, first: Option<Vec<u8>>, ok: bool, sig: Vec<u8>) {
-        let Some(i) = self.draft_idx(key) else { return };
-        if !ok || sig.len() != 64 {
-            self.err(format!("Signature not received: {}", String::from_utf8_lossy(&sig)));
-            return;
-        }
-        let owner = self.owner.clone().map(|o| o.1).unwrap_or_default();
-        let known = self.drafts[i].wallet.clone();
-        // First unlock of a new database: sign twice to prove the wallet's
-        // signatures are deterministic, otherwise the key could never be
-        // recovered.
-        if known.is_none() && first.is_none() {
-            let msg = state::derivation_message(&self.drafts[i].name);
-            let id = self.nid();
-            self.pending.insert(id, P::Sign { draft: key.to_string(), first: Some(sig) });
-            host::wallet_sign_message(id, msg.as_bytes());
-            self.ok("Sign once more — this checks your wallet always produces the same key.");
-            return;
-        }
-        if let Some(f) = first {
-            if f != sig {
-                self.err("Your wallet produced two different signatures for the same message, so a database wallet can't be reliably derived from it. Import a key instead.");
-                return;
-            }
-        }
-        let kp = Keypair::from_seed(state::derive_seed(&sig));
-        let addr = b58(&kp.pubkey);
-        if let Some(k) = known {
-            if k != addr && self.drafts[i].wallet_kind == "derived" {
-                self.err(format!(
-                    "This wallet derives {} but the draft belongs to {}. Connect the wallet that created it ({}).",
-                    solana::short(&addr),
-                    solana::short(&k),
-                    self.drafts[i].owner.as_deref().map(solana::short).unwrap_or_default()
-                ));
-                return;
-            }
-        }
-        let d = &mut self.drafts[i];
-        d.wallet = Some(addr.clone());
-        d.owner = Some(owner);
-        d.wallet_kind = "derived".into();
-        self.keys.insert(key.to_string(), kp);
-        self.save_drafts();
-        self.fetch_balance(&addr);
-        self.ok(format!("Database wallet unlocked: {}", solana::short(&addr)));
-    }
-
-    fn import_key(&mut self, key: &str) {
-        let Some(i) = self.draft_idx(key) else { return };
-        let secret = self.form.remove(&format!("key:{}", key)).unwrap_or_default();
-        match Keypair::from_secret_b58(&secret) {
-            Some(kp) => {
-                let addr = b58(&kp.pubkey);
-                if let Some(w) = &self.drafts[i].wallet {
-                    if w != &addr {
-                        self.err(format!("That key is for {}, not this database's wallet {}", solana::short(&addr), solana::short(w)));
-                        return;
-                    }
-                }
-                self.drafts[i].wallet = Some(addr.clone());
-                if self.drafts[i].owner.is_none() {
-                    self.drafts[i].wallet_kind = "imported".into();
-                }
-                self.keys.insert(key.to_string(), kp);
-                self.save_drafts();
-                self.fetch_balance(&addr);
-                self.ok("Key imported for this session (it is never stored).");
-            }
-            None => self.err("Not a valid base58 secret key (64-byte Phantom export or 32-byte seed)."),
-        }
-    }
-
-    fn fund(&mut self, key: &str) {
-        let amount = self.form.get(&format!("fund:{}", key)).cloned().unwrap_or_default();
-        let Some(lamports) = ui::parse_sol(&amount).filter(|&l| l > 0) else {
-            self.err("Enter an amount in SOL, e.g. 0.1");
-            return;
-        };
-        if self.owner.is_none() {
-            self.err("Connect your wallet first");
-            return;
-        }
-        let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
-        self.rpc("getLatestBlockhash", params, P::FundHash { draft: key.to_string(), lamports });
-    }
-
-    fn withdraw(&mut self, key: &str) {
-        if !self.keys.contains_key(key) {
-            self.err("Unlock the database wallet first");
-            return;
-        }
-        let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
-        self.rpc("getLatestBlockhash", params, P::WithdrawHash { draft: key.to_string() });
-    }
-
-    fn withdraw_send(&mut self, key: &str, ok: bool, status: u32, text: &str) {
-        let Some(kp) = self.keys.get(key).cloned() else { return };
-        let dest = self.form.get(&format!("wd:{}", key)).cloned().filter(|s| !s.trim().is_empty()).or(self.owner.clone().map(|o| o.1));
-        let Some(dest) = dest.and_then(|d| parse_pk(&d)) else {
-            self.err("Enter a destination address (or connect your wallet)");
-            return;
-        };
-        let bal = self.balances.get(&b58(&kp.pubkey)).and_then(|b| b.ready().copied()).unwrap_or(0);
-        if bal <= iq::TX_FEE {
-            self.err("Nothing to withdraw");
-            return;
-        }
-        let bh = if ok && (200..300).contains(&status) {
-            net::rpc_result(text).ok().and_then(|r| r.get("value").get("blockhash").str().and_then(base58::decode32))
-        } else {
-            None
-        };
-        let Some(bh) = bh else {
-            self.err(format!("Could not get a blockhash: {}", fetch_err(ok, status, text)));
-            return;
-        };
-        let msg = solana::compile(&kp.pubkey, &[solana::system_transfer(&kp.pubkey, &dest, bal - iq::TX_FEE)], bh);
-        let (raw, _) = solana::legacy_signed(&msg, &kp.seed);
-        let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\"}}]", base64_encode(&raw))).unwrap();
-        self.rpc("sendTransaction", params, P::WithdrawSent { draft: key.to_string() });
     }
 
     // ---------------------------------------------------------- workspace

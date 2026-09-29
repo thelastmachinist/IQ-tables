@@ -278,3 +278,95 @@ impl Keypair {
         Some(kp)
     }
 }
+
+/// A transaction read back from the chain (legacy, v0 or v1 wire format).
+pub struct ParsedTx {
+    pub signature: String,
+    pub keys: Vec<Pubkey>,
+    /// (program key index, account key indices, data)
+    pub ixs: Vec<(usize, Vec<usize>, Vec<u8>)>,
+}
+
+fn read_compact(b: &[u8], i: &mut usize) -> Option<usize> {
+    let mut v = 0usize;
+    for shift in [0, 7, 14] {
+        let c = *b.get(*i)? as usize;
+        *i += 1;
+        v |= (c & 0x7f) << shift;
+        if c & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+pub fn parse_tx(raw: &[u8]) -> Option<ParsedTx> {
+    if raw.first() == Some(&129) {
+        // v1: message first, signatures at the end
+        let nsig = *raw.get(1)? as usize;
+        let mut i = 4;
+        let mask = u32::from_le_bytes(raw.get(i..i + 4)?.try_into().ok()?);
+        i += 4 + 32;
+        let nix = *raw.get(i)? as usize;
+        let nkeys = *raw.get(i + 1)? as usize;
+        i += 2;
+        let mut keys = Vec::with_capacity(nkeys);
+        for _ in 0..nkeys {
+            keys.push(raw.get(i..i + 32)?.try_into().ok()?);
+            i += 32;
+        }
+        if mask & 3 != 0 {
+            i += 8;
+        }
+        for bit in [4u32, 8, 16] {
+            if mask & bit != 0 {
+                i += 4;
+            }
+        }
+        let mut heads = vec![];
+        for _ in 0..nix {
+            let h = raw.get(i..i + 4)?;
+            heads.push((h[0] as usize, h[1] as usize, u16::from_le_bytes([h[2], h[3]]) as usize));
+            i += 4;
+        }
+        let mut ixs = vec![];
+        for (p, na, dl) in heads {
+            let accs = raw.get(i..i + na)?.iter().map(|&x| x as usize).collect();
+            i += na;
+            let data = raw.get(i..i + dl)?.to_vec();
+            i += dl;
+            ixs.push((p, accs, data));
+        }
+        let sig = raw.get(raw.len().checked_sub(64 * nsig)?..raw.len().checked_sub(64 * nsig)? + 64)?;
+        return Some(ParsedTx { signature: base58::encode(sig), keys, ixs });
+    }
+    let mut i = 0;
+    let nsig = read_compact(raw, &mut i)?;
+    let sig = raw.get(i..i + 64)?.to_vec();
+    i += 64 * nsig;
+    if raw.get(i)? & 0x80 != 0 {
+        i += 1; // versioned (v0) message prefix
+    }
+    i += 3;
+    let nkeys = read_compact(raw, &mut i)?;
+    let mut keys = Vec::with_capacity(nkeys);
+    for _ in 0..nkeys {
+        keys.push(raw.get(i..i + 32)?.try_into().ok()?);
+        i += 32;
+    }
+    i += 32;
+    let nix = read_compact(raw, &mut i)?;
+    let mut ixs = vec![];
+    for _ in 0..nix {
+        let p = *raw.get(i)? as usize;
+        i += 1;
+        let na = read_compact(raw, &mut i)?;
+        let accs = raw.get(i..i + na)?.iter().map(|&x| x as usize).collect();
+        i += na;
+        let dl = read_compact(raw, &mut i)?;
+        let data = raw.get(i..i + dl)?.to_vec();
+        i += dl;
+        ixs.push((p, accs, data));
+    }
+    Some(ParsedTx { signature: base58::encode(&sig), keys, ixs })
+}

@@ -1,7 +1,8 @@
 // IQ Tables — browser bridge.
 // Browsers can only run WebAssembly through JavaScript, so this file gives the
 // Rust app the few things it can't do itself: the DOM, fetch, localStorage,
-// the clock/RNG, and the Solana wallet (via the Wallet Standard). No app logic.
+// the clock, secure randomness and files. No app logic and no wallet extension:
+// keys live in the user's account file and all signing happens in Rust.
 (async () => {
   "use strict";
   const root = document.getElementById("app");
@@ -27,20 +28,12 @@
     w.on_async(id, ok ? 1 : 0, status, p, u8.length);
   };
 
-  // ---- Wallet Standard discovery (Phantom, Solflare, Backpack, …)
-  const wallets = [];
-  let current = null; // { wallet, account }
-  const api = {
-    register(...ws) {
-      for (const x of ws) if (!wallets.includes(x)) wallets.push(x);
-      if (w) ev("wallets", "", "", "");
-      return () => {};
-    },
-  };
-  window.addEventListener("wallet-standard:register-wallet", (e) => { try { e.detail(api); } catch (_) {} });
-  try { window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api })); } catch (_) {}
-  const solana = () => wallets.filter((x) => (x.chains || []).some((c) => String(c).startsWith("solana:")) && x.features && x.features["standard:connect"]);
   const errText = (e) => String((e && (e.message || e.name)) || e || "error");
+  const b64 = (u8) => {
+    let s = "";
+    for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
 
   // ---- rendering with focus/selection preserved across innerHTML swaps
   function render(html) {
@@ -85,40 +78,6 @@
       storage_set: (kp, kl, vp, vl) => { try { localStorage.setItem(str(kp, kl), str(vp, vl)); } catch (_) {} },
       now: () => Date.now(),
       random: (p, l) => crypto.getRandomValues(mem().subarray(p, p + l)),
-      wallets: () => stage(enc.encode(JSON.stringify(solana().map((x) => ({ name: x.name, icon: x.icon || "" }))))),
-      wallet_connect: (id, np, nl) => {
-        const name = str(np, nl);
-        const x = solana().find((y) => y.name === name);
-        if (!x) return done(id, false, 0, "wallet not found");
-        x.features["standard:connect"].connect()
-          .then((r) => {
-            const acct = (r && r.accounts && r.accounts[0]) || x.accounts[0];
-            if (!acct) throw new Error("no account");
-            current = { wallet: x, account: acct };
-            done(id, true, 0, JSON.stringify({ name: x.name, address: acct.address }));
-          })
-          .catch((e) => done(id, false, 0, errText(e)));
-      },
-      wallet_disconnect: () => {
-        try { current && current.wallet.features["standard:disconnect"] && current.wallet.features["standard:disconnect"].disconnect(); } catch (_) {}
-        current = null;
-      },
-      wallet_sign_message: (id, mp, ml) => {
-        const message = bytes(mp, ml);
-        const f = current && current.wallet.features["solana:signMessage"];
-        if (!f) return done(id, false, 0, "this wallet can't sign messages");
-        f.signMessage({ account: current.account, message })
-          .then((out) => done(id, true, 0, new Uint8Array(out[0].signature)))
-          .catch((e) => done(id, false, 0, errText(e)));
-      },
-      wallet_sign_and_send: (id, tp, tl, cp, cl) => {
-        const transaction = bytes(tp, tl), chain = str(cp, cl);
-        const f = current && current.wallet.features["solana:signAndSendTransaction"];
-        if (!f) return done(id, false, 0, "this wallet can't send transactions");
-        f.signAndSendTransaction({ account: current.account, chain, transaction })
-          .then((out) => done(id, true, 0, new Uint8Array(out[0].signature)))
-          .catch((e) => done(id, false, 0, errText(e)));
-      },
       download: (np, nl, mp, ml, dp, dl) => {
         const a = document.createElement("a");
         a.href = URL.createObjectURL(new Blob([bytes(dp, dl)], { type: str(mp, ml) }));
@@ -127,7 +86,17 @@
         a.click();
         setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
       },
-      copy: (p, l) => { try { navigator.clipboard.writeText(str(p, l)); } catch (_) {} },
+      copy: (p, l) => {
+        const s = str(p, l);
+        const fallback = () => {
+          const t = document.createElement("textarea");
+          t.value = s; t.setAttribute("readonly", ""); t.style.cssText = "position:fixed;opacity:0";
+          document.body.appendChild(t); t.select();
+          try { document.execCommand("copy"); } catch (_) {}
+          t.remove();
+        };
+        try { navigator.clipboard.writeText(s).catch(fallback); } catch (_) { fallback(); }
+      },
       timer: (id, ms) => setTimeout(() => done(id, true, 0, ""), ms),
       set_hash: (p, l) => {
         const h = str(p, l);
@@ -178,9 +147,14 @@
       const args = ["change", t.dataset.in, t.dataset.arg, t.type === "checkbox" ? String(t.checked) : t.value];
       if (pointerDown && t.type !== "checkbox" && t.tagName !== "SELECT") held.push(args); else ev(...args);
     }
-    if (t.dataset.file && t.files && t.files[0]) {
+    if (t.dataset.file && t.files && t.files.length) {
+      for (const f of t.files) f.text().then((txt) => ev("file", t.dataset.file, t.dataset.arg || f.name, txt));
+      t.value = "";
+    }
+    if (t.dataset.fileb64 && t.files && t.files[0]) {
       const f = t.files[0];
-      f.text().then((txt) => ev("file", t.dataset.file, t.dataset.arg, txt));
+      f.arrayBuffer().then((ab) => ev("file", t.dataset.fileb64, t.dataset.arg,
+        JSON.stringify({ name: f.name, type: f.type || "application/octet-stream", size: f.size, b64: b64(new Uint8Array(ab)) })));
       t.value = "";
     }
   });
@@ -204,16 +178,31 @@
     }
   });
   document.addEventListener("click", (e) => {
-    // close the wallet menu when clicking elsewhere
+    // close the account menu when clicking elsewhere
     const m = document.querySelector(".menu");
-    if (m && !e.target.closest(".wallet")) ev("click", "connect-menu", "", "");
+    if (m && !e.target.closest(".wallet")) ev("click", "account-menu", "", "");
   }, true);
+  // Drop account files / key files anywhere on the page to log in.
+  let dragDepth = 0;
+  const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  window.addEventListener("dragenter", (e) => { if (!hasFiles(e)) return; dragDepth++; document.body.classList.add("dropping"); });
+  window.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dropping"); } });
+  window.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove("dropping");
+    if (e.target.closest && e.target.closest("[data-fileb64]")) return;
+    for (const f of e.dataTransfer.files) {
+      if (f.size > 2 * 1024 * 1024) { ev("file", "drop-too-big", f.name, ""); continue; }
+      f.text().then((txt) => ev("file", "drop-file", f.name, txt));
+    }
+  });
   window.addEventListener("hashchange", () => ev("route", "", "", location.hash));
 
   w.start();
   ev("route", "", "", location.hash);
-  // wallets that register a moment after load
-  setTimeout(() => ev("wallets", "", "", ""), 600);
 })().catch((e) => {
   document.getElementById("app").innerHTML =
     '<div class="card bad" style="margin:2rem">IQ Tables failed to start: ' +

@@ -1,3 +1,4 @@
+pub mod aead;
 pub mod base58;
 pub mod ed25519;
 pub mod keccak;

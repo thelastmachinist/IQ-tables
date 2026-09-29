@@ -1,6 +1,7 @@
 //! The boundary with the browser. Browsers only run WebAssembly through a
 //! JavaScript loader, so `web/host.js` provides these few primitives (DOM,
-//! network, storage, wallet) and nothing else; all logic lives in Rust.
+//! network, storage, files) and nothing else; all logic — including key
+//! handling and signing — lives in Rust.
 
 #[cfg(target_arch = "wasm32")]
 mod ffi {
@@ -14,11 +15,6 @@ mod ffi {
         pub fn storage_set(kp: *const u8, kl: usize, vp: *const u8, vl: usize);
         pub fn now() -> f64;
         pub fn random(p: *mut u8, l: usize);
-        pub fn wallets() -> i32;
-        pub fn wallet_connect(id: u32, np: *const u8, nl: usize);
-        pub fn wallet_disconnect();
-        pub fn wallet_sign_message(id: u32, mp: *const u8, ml: usize);
-        pub fn wallet_sign_and_send(id: u32, tp: *const u8, tl: usize, cp: *const u8, cl: usize);
         pub fn download(np: *const u8, nl: usize, mp: *const u8, ml: usize, dp: *const u8, dl: usize);
         pub fn copy(p: *const u8, l: usize);
         pub fn timer(id: u32, ms: u32);
@@ -62,22 +58,6 @@ mod imp {
     }
     pub fn random(buf: &mut [u8]) {
         unsafe { ffi::random(buf.as_mut_ptr(), buf.len()) }
-    }
-    pub fn wallets() -> String {
-        let n = unsafe { ffi::wallets() };
-        staged(n).and_then(|v| String::from_utf8(v).ok()).unwrap_or_else(|| "[]".into())
-    }
-    pub fn wallet_connect(id: u32, name: &str) {
-        unsafe { ffi::wallet_connect(id, name.as_ptr(), name.len()) }
-    }
-    pub fn wallet_disconnect() {
-        unsafe { ffi::wallet_disconnect() }
-    }
-    pub fn wallet_sign_message(id: u32, msg: &[u8]) {
-        unsafe { ffi::wallet_sign_message(id, msg.as_ptr(), msg.len()) }
-    }
-    pub fn wallet_sign_and_send(id: u32, tx: &[u8], chain: &str) {
-        unsafe { ffi::wallet_sign_and_send(id, tx.as_ptr(), tx.len(), chain.as_ptr(), chain.len()) }
     }
     pub fn download(name: &str, mime: &str, data: &[u8]) {
         unsafe { ffi::download(name.as_ptr(), name.len(), mime.as_ptr(), mime.len(), data.as_ptr(), data.len()) }
@@ -128,13 +108,6 @@ mod imp {
             *b = x as u8;
         }
     }
-    pub fn wallets() -> String {
-        "[]".into()
-    }
-    pub fn wallet_connect(_id: u32, _name: &str) {}
-    pub fn wallet_disconnect() {}
-    pub fn wallet_sign_message(_id: u32, _msg: &[u8]) {}
-    pub fn wallet_sign_and_send(_id: u32, _tx: &[u8], _chain: &str) {}
     pub fn download(_n: &str, _m: &str, _d: &[u8]) {}
     pub fn copy(_s: &str) {}
     pub fn timer(_id: u32, _ms: u32) {}
