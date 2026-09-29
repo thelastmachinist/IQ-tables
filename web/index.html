@@ -100,7 +100,7 @@ body > #app table.grid:not(.data):not(.edit) { border: 1px solid var(--line); bo
 table.grid th, table.grid td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.grid th { font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); background: var(--soft); font-weight: 600; white-space: nowrap; }
 table.grid td.num, table.grid th.num { text-align: right; font-variant-numeric: tabular-nums; }
-table.data td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.data td { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 table.data tbody tr { cursor: pointer; }
 table.data tbody tr:hover { background: var(--soft); }
 table.data tr.sel { background: var(--accent-soft); }
@@ -162,6 +162,7 @@ body.dropping::after { content: "Drop account or key files to log in"; position:
 .devnet { background: var(--warn-soft); color: var(--warn); text-align: center; font-size: .85rem; padding: 4px 16px; }
 .link.file { text-align: left; }
 .link.git { text-align: left; }
+table.data td .link.git { display: inline-block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 .crowd .hash { overflow-wrap: anywhere; }
 .pieces { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0 12px; }
 .pieces i { width: 12px; height: 12px; border-radius: 3px; background: var(--soft); border: 1px solid var(--line); }

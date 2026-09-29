@@ -177,17 +177,19 @@ pub fn cell(app: &App, pda: &str, raw: &str) -> Option<String> {
     }
     app.git.wanted.borrow_mut().push(pda.to_string());
     let Some(Load::Ready(Some(r))) = app.git.repos.get(pda) else { return None };
-    let latest = match &r.commits {
+    // the newest commit's message goes in the tooltip so the cell stays narrow
+    let (latest, msg) = match &r.commits {
         Load::Ready(v) => match v.first() {
-            Some(c) => format!(" <span class=\"muted\">· {} · {}</span>", esc(&clip(&c.message, 40)), ago(host::now_ms(), c.time_ms)),
-            None => " <span class=\"muted\">· no commits yet</span>".into(),
+            Some(c) => (format!(" <span class=\"muted\">· {}</span>", ago(host::now_ms(), c.time_ms)), format!("Latest: {}\n", clip(&c.message, 80))),
+            None => (" <span class=\"muted\">· no commits yet</span>".into(), String::new()),
         },
-        Load::Err(_) => String::new(),
-        _ => " <span class=\"muted\">· reading…</span>".into(),
+        Load::Err(_) => (String::new(), String::new()),
+        _ => (" <span class=\"muted\">· reading…</span>".into(), String::new()),
     };
     Some(format!(
-        "<button class=\"link git\" data-a=\"git-open\" data-arg=\"{}\" title=\"{} — IQ git repository; always shows its newest commit\">📦 {}{}</button>",
+        "<button class=\"link git\" data-a=\"git-open\" data-arg=\"{}\" title=\"{}{} — IQ git repository; always shows its newest commit\">📦 {}{}</button>",
         esc(pda),
+        esc(&msg),
         esc(raw),
         esc(&r.name),
         latest
@@ -278,7 +280,8 @@ pub fn panel(app: &App, h: &mut String) {
 /// A link to one commit's files: its tree inscription, named repo@commit.
 pub fn pinned_link(repo: &str, c: &Commit) -> String {
     let short: String = c.id.chars().filter(|ch| *ch != '-').take(8).collect();
-    format!("iq://tx/{}#{}", c.tree, crate::app::pct_encode(&format!("{}@{}", repo, short)))
+    // `@` is allowed in a URL fragment, so it stays readable
+    format!("iq://tx/{}#{}@{}", c.tree, crate::app::pct_encode(repo), short)
 }
 
 /// The file list of a tree inscription shown in the viewer.

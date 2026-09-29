@@ -616,7 +616,7 @@ fn iq_git_links() {
     let c = git::parse_commits(rows.arr(), owner);
     assert_eq!(c.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["a8ccd41d", "7f5f5851"], "newest first, owner's commits only");
     assert_eq!(c[0].parent, "7f5f5851");
-    assert!(git::pinned_link("blockchain-internet", &c[0]).starts_with(&format!("iq://tx/{}#blockchain-internet%40a8ccd41d", tree_b)));
+    assert!(git::pinned_link("blockchain-internet", &c[0]).starts_with(&format!("iq://tx/{}#blockchain-internet@a8ccd41d", tree_b)));
     let (sig, label) = crate::attach::parse_tx_link(&git::pinned_link("blockchain-internet", &c[0])).unwrap();
     assert_eq!((sig.as_str(), label.as_str()), (tree_b, "blockchain-internet@a8ccd41d"));
     // a tree inscription and a file of it
