@@ -38,6 +38,8 @@ pub struct Job {
     pub legacy: bool,
     pub iq_ata: Option<Pubkey>,
     pub stage: Stage,
+    /// Already topped up from the main balance once.
+    pub funded: bool,
 }
 
 impl Job {
@@ -188,7 +190,7 @@ impl App {
         }
         let ghost = self.drafts[i].tables.get(t).and_then(|tb| tb.rows.get(r)).map(|x| x.sig.is_none() && !x.deleted).unwrap_or(false);
         if !ghost {
-            self.err("Files can only be attached to ghost rows.");
+            self.err("Files can only go into rows that aren't saved yet.");
             return;
         }
         let Some(c) = self.attach_column(&key, t) else {
@@ -245,7 +247,11 @@ impl App {
             legacy: legacy_only || size <= iq::INLINE_CAP_LEGACY,
             iq_ata: None,
             stage: Stage::Write,
+            funded: false,
         };
+        if let Some(m) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) {
+            self.fetch_balance(&m);
+        }
         self.attach_check(job);
     }
 
@@ -288,6 +294,10 @@ impl App {
         self.rpc("getLatestBlockhash", params, P::AttachHash(job));
     }
 
+    pub fn attach_retry(&mut self, job: Job) {
+        self.attach_check(job);
+    }
+
     /// A transaction of the attachment flow confirmed.
     pub fn attach_confirmed(&mut self, mut job: Job, sig: &str) {
         match job.stage {
@@ -297,6 +307,8 @@ impl App {
                     d.user_init_sig.get_or_insert_with(|| sig.to_string());
                 }
                 self.save_drafts();
+                // the next step may need its own top-up
+                job.funded = false;
                 self.attach_check(job) // re-read sizes (pre-upgrade accounts need growing)
             }
             Stage::Grow(_) => {
@@ -325,7 +337,7 @@ impl App {
         if placed {
             self.bump(&job.key, job.t);
             self.save_drafts();
-            self.ok(format!("{} is inscribed and linked in the row. Inscribe the row to publish the link.", job.filename));
+            self.ok(format!("{} is saved on the blockchain and linked in the cell. Save the table to keep the link.", job.filename));
         } else {
             host::copy(&link);
             self.ok(format!("{} is inscribed ({}); its row changed meanwhile, so the link was copied to your clipboard.", job.filename, link));
@@ -432,6 +444,20 @@ impl App {
                     }
                 };
                 if bal < need + iq::RENT_FLOOR {
+                    // pay from the main balance automatically, like saving does
+                    let main = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()).filter(|m| m != &job.wallet);
+                    let main_bal = main.as_ref().and_then(|m| self.balances.get(m)).and_then(|b| b.ready().copied()).unwrap_or(0);
+                    let short = need + iq::RENT_FLOOR + need / 10 - bal;
+                    if let (Some(m), false) = (main, job.funded) {
+                        if main_bal >= short + iq::TX_FEE + iq::RENT_FLOOR {
+                            job.stage = stage;
+                            job.funded = true;
+                            self.attach_status_set(&job, "Moving SOL from your balance…");
+                            let w = job.wallet.clone();
+                            self.transfer(&m, &w, short, After::AttachFunded(job));
+                            return true;
+                        }
+                    }
                     self.attach_fail(format!(
                         "The database wallet has {} but this needs about {}{}. Fund it first.",
                         ui::sol(bal),

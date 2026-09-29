@@ -432,3 +432,127 @@ fn account_file_roundtrip_and_imports() {
     let Parsed::Account(c2) = account::parse_file("p.json", &c.to_file([0; 12])).unwrap() else { panic!() };
     assert_eq!(c2.addresses(), c.addresses());
 }
+
+// ------------------------------------------------------ spreadsheet + SQL
+
+fn cells(v: &[&str]) -> Vec<Json> {
+    v.iter().map(|s| crate::ui::typed(s)).collect()
+}
+
+#[test]
+fn sheet_overlays_pending_edits_on_saved_rows() {
+    use crate::sheet::{self, RowState};
+    use crate::state::{DraftTable, GhostRow};
+    let mut tb = DraftTable { name: "t".into(), title: "t".into(), columns: vec!["id".into(), "name".into(), "qty".into()], id_col: 0, open: false, compress: true, created: Some("x".into()), rows: vec![] };
+    // two rows saved earlier from this browser
+    tb.rows.push(GhostRow { vals: cells(&["a", "bolt", "5"]), deleted: false, sig: Some("s1".into()) });
+    tb.rows.push(GhostRow { vals: cells(&["b", "nut", "7"]), deleted: false, sig: Some("s1".into()) });
+    let base = sheet::local_base(&tb);
+    let rows = sheet::rows(&tb, &base);
+    assert_eq!(rows.iter().map(|r| r.state).collect::<Vec<_>>(), vec![RowState::Saved, RowState::Saved]);
+    // edit a saved row → pending copy; edit it back → nothing pending
+    assert!(sheet::set_cell(&mut tb, &rows[0], 2, crate::ui::typed("6")).unwrap());
+    let rows = sheet::rows(&tb, &base);
+    assert_eq!(rows[0].state, RowState::Changed);
+    assert!(rows[0].changed(2) && !rows[0].changed(1));
+    sheet::set_cell(&mut tb, &rows[0], 2, crate::ui::typed("5")).unwrap();
+    assert_eq!(sheet::pending(&sheet::rows(&tb, &base)), (0, 0, 0));
+    // saved IDs can't change
+    let rows = sheet::rows(&tb, &base);
+    assert!(sheet::set_cell(&mut tb, &rows[1], 0, crate::ui::typed("zz")).is_err());
+    // delete a saved row, then undo it by deleting again
+    sheet::delete_rows(&mut tb, &[&rows[1]]);
+    let rows = sheet::rows(&tb, &base);
+    assert_eq!(rows[1].state, RowState::Deleted);
+    sheet::delete_rows(&mut tb, &[&rows[1]]);
+    assert_eq!(sheet::pending(&sheet::rows(&tb, &base)), (0, 0, 0));
+    // new rows, and a batch update that reverts one edit and makes another
+    sheet::insert_row(&mut tb);
+    let rows = sheet::rows(&tb, &base);
+    assert_eq!(rows[2].state, RowState::New);
+    let errs = sheet::apply_rows(&mut tb, vec![(rows[2].clone(), cells(&["c", "washer", "1"])), (rows[0].clone(), cells(&["a", "bolt", "9"]))]);
+    assert!(errs.is_empty());
+    assert_eq!(sheet::pending(&sheet::rows(&tb, &base)), (1, 1, 0));
+    // columns: add, move, delete keep values aligned
+    sheet::add_column(&mut tb, "color", Some(1)).unwrap();
+    let rows = sheet::rows(&tb, &sheet::local_base(&tb));
+    assert_eq!(rows[0].vals[2].cell_text(), "bolt");
+    sheet::delete_column(&mut tb, 1).unwrap();
+    assert!(sheet::delete_column(&mut tb, 0).is_err());
+    assert!(sheet::rename_column(&mut tb, &base, 1, "title").is_err(), "saved tables keep their column names");
+    // clipboard text from Excel
+    assert_eq!(sheet::parse_tsv("a\tb\r\nc\t\"d\te\"\n"), vec![vec!["a".to_string(), "b".into()], vec!["c".into(), "d\te".into()]]);
+    assert_eq!(sheet::col_letter(0), "A");
+    assert_eq!(sheet::col_letter(27), "AB");
+}
+
+#[test]
+fn sql_parses_and_evaluates() {
+    use crate::sql::{self, Stmt};
+    let s = sql::parse("SELECT name, COUNT(*) AS n FROM `parts list` WHERE qty >= 10 AND name LIKE '%bolt%' GROUP BY name ORDER BY n DESC LIMIT 5 OFFSET 1; -- c\nSHOW TABLES").unwrap();
+    assert_eq!(s.len(), 2);
+    match &s[0] {
+        Stmt::Select { table, limit, offset, group, order, .. } => {
+            assert_eq!(table, "parts list");
+            assert_eq!((*limit, *offset, group.len(), order.len()), (Some(5), 1, 1, 1));
+        }
+        other => panic!("{:?}", other),
+    }
+    assert!(matches!(sql::parse("CREATE TABLE t (code VARCHAR(20) PRIMARY KEY, n INT) OPEN").unwrap()[0], Stmt::Create { ref id, open: true, .. } if id.as_deref() == Some("code")));
+    assert!(sql::parse("SELEC * FROM t").is_err());
+    assert!(sql::parse("SELECT * FROM t WHERE").is_err());
+    assert!(sql::parse("SELECT 'unterminated FROM t").is_err());
+    let e = |src: &str| {
+        let Stmt::Select { items, .. } = &sql::parse(&format!("SELECT {} FROM t", src)).unwrap()[0] else { panic!() };
+        let crate::sql::Item::Expr(x, _) = &items[0] else { panic!() };
+        sql::eval(x, &|c: &str| Ok(if c == "qty" { Json::Num("12".into()) } else { Json::Str("Hex Bolt".into()) }), None).unwrap()
+    };
+    assert_eq!(e("qty * 2 + 1"), Json::Num("25".into()));
+    assert_eq!(e("name LIKE '%bolt'"), Json::Bool(true), "LIKE is case-insensitive");
+    assert_eq!(e("qty BETWEEN 10 AND 12"), Json::Bool(true));
+    assert_eq!(e("qty IN (1, 2, '12')"), Json::Bool(true));
+    assert_eq!(e("name = 'hex bolt'"), Json::Bool(true));
+    assert_eq!(e("NULL = NULL"), Json::Null);
+    assert_eq!(e("UPPER(name) || '!'"), Json::Str("HEX BOLT!".into()));
+    assert_eq!(e("7 / 2"), Json::Num("3.5".into()));
+    assert_eq!(e("1 / 0"), Json::Null);
+}
+
+#[test]
+fn sql_runs_against_a_draft() {
+    use crate::sql_exec::Out;
+    let mut app = crate::app::App::new();
+    app.drafts.push(crate::state::Draft::new("k".into(), "shop".into()));
+    let run = |app: &mut crate::app::App, q: &str| app.run_sql("k", q);
+    let out = run(&mut app, "CREATE TABLE parts (sku PRIMARY KEY, name, qty); INSERT INTO parts VALUES ('A1','Hex bolt',10), ('A2','Nut',3), ('A3','Washer',30)");
+    assert!(out.iter().all(|o| matches!(o, Out::Msg(true, _))), "{:?}", out);
+    assert!(matches!(&run(&mut app, "INSERT INTO parts (sku) VALUES ('A1')")[0], Out::Msg(false, m) if m.contains("already exists")));
+    let out = run(&mut app, "UPDATE parts SET qty = qty + 1 WHERE qty < 20; DELETE FROM parts WHERE sku = 'A2'");
+    assert!(matches!(&out[0], Out::Msg(true, m) if m.starts_with("2 row(s) changed")), "{:?}", out);
+    let out = run(&mut app, "SELECT sku, qty FROM parts ORDER BY qty DESC");
+    let Out::Rows { rows, .. } = &out[0] else { panic!("{:?}", out) };
+    assert_eq!(rows.iter().map(|r| format!("{}={}", r[0].cell_text(), r[1].cell_text())).collect::<Vec<_>>(), vec!["A3=30", "A1=11"]);
+    let out = run(&mut app, "SELECT COUNT(*) AS n, SUM(qty) AS total, AVG(qty) FROM parts");
+    let Out::Rows { rows, cols, .. } = &out[0] else { panic!() };
+    assert_eq!(cols, &vec!["n".to_string(), "total".into(), "AVG(qty)".into()]);
+    assert_eq!(rows[0].iter().map(|v| v.cell_text()).collect::<Vec<_>>(), vec!["2", "41", "20.5"]);
+    let out = run(&mut app, "ALTER TABLE parts ADD COLUMN color; UPDATE parts SET color = 'red' WHERE sku = 'A3'; SELECT sku FROM parts WHERE color IS NOT NULL");
+    let Out::Rows { rows, .. } = &out[2] else { panic!("{:?}", out) };
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(&run(&mut app, "SELECT nope FROM parts")[0], Out::Msg(false, m) if m.contains("Unknown column")));
+    assert!(matches!(&run(&mut app, "DROP TABLE parts")[0], Out::Msg(true, _)), "unsaved tables can be dropped");
+    assert!(matches!(&run(&mut app, "SELECT * FROM parts")[0], Out::Msg(false, m) if m.contains("No table")));
+}
+
+#[test]
+fn dropping_a_table_forgets_what_was_computed_for_its_position() {
+    let mut app = crate::app::App::new();
+    app.drafts.push(crate::state::Draft::new("k".into(), "shop".into()));
+    let out = app.run_sql("k", "CREATE TABLE a (id PRIMARY KEY); INSERT INTO a VALUES ('x'); CREATE TABLE b (id PRIMARY KEY); INSERT INTO b VALUES ('1'), ('2'), ('3')");
+    assert!(out.iter().all(|o| matches!(o, crate::sql_exec::Out::Msg(true, _))), "{:?}", out);
+    let cap = app.inline_cap();
+    let count = |app: &mut crate::app::App, t| app.plan_for("k", t, cap).as_ref().unwrap().iter().map(|p| p.count).sum::<usize>();
+    assert_eq!((count(&mut app, 0), count(&mut app, 1)), (1, 3));
+    app.run_sql("k", "DROP TABLE a");
+    assert_eq!(count(&mut app, 0), 3, "table b moved to position 0; its own plan is used");
+}

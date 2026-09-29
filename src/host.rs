@@ -19,6 +19,7 @@ mod ffi {
         pub fn copy(p: *const u8, l: usize);
         pub fn timer(id: u32, ms: u32);
         pub fn set_hash(p: *const u8, l: usize);
+        pub fn passkey(id: u32, p: *const u8, l: usize);
     }
 }
 
@@ -71,6 +72,11 @@ mod imp {
     pub fn set_hash(s: &str) {
         unsafe { ffi::set_hash(s.as_ptr(), s.len()) }
     }
+    /// Create or use a passkey (WebAuthn with the PRF extension); the result
+    /// JSON arrives through on_async.
+    pub fn passkey(id: u32, req: &str) {
+        unsafe { ffi::passkey(id, req.as_ptr(), req.len()) }
+    }
 }
 
 /// Native stand-ins so the crate builds and unit-tests off the browser.
@@ -112,6 +118,9 @@ mod imp {
     pub fn copy(_s: &str) {}
     pub fn timer(_id: u32, _ms: u32) {}
     pub fn set_hash(_s: &str) {}
+    pub fn passkey(id: u32, req: &str) {
+        OUT.with(|o| o.borrow_mut().push(format!("passkey:{}:{}", id, req)));
+    }
 }
 
 pub use imp::*;

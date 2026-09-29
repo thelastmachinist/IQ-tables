@@ -115,9 +115,12 @@ pub enum P {
     SetPass,
     Rescan(Vec<(u32, String)>),
     Balances(Vec<String>),
-    TransferHash { from: String, to: String, lamports: u64 },
-    TransferSent,
+    TransferHash { from: String, to: String, lamports: u64, after: After },
+    TransferSent(After),
     Airdrop(String),
+    Passkey(bool),
+    Sns { name: String, lamports: u64 },
+    SaveCheck { key: String, need: u64, main: Option<String> },
     // direct chain reads (chain.rs)
     RpcRoots,
     RpcMeta(String, u32),
@@ -138,6 +141,17 @@ pub enum P {
 pub enum After {
     Balances,
     Attach(crate::attach::Job),
+    /// Funds arrived in a database wallet: continue saving.
+    StartRun(String),
+    /// Funds arrived for a file attachment: try it again.
+    AttachFunded(crate::attach::Job),
+}
+
+/// A payment waiting for the user's confirmation.
+pub struct SendReview {
+    pub to: String,
+    pub label: String,
+    pub lamports: u64,
 }
 
 pub struct PlanCache {
@@ -184,6 +198,18 @@ pub struct App {
     pub reveal_key: Option<String>,
     /// Set when an action navigates and its message should survive the route change.
     pub keep_toast: bool,
+    /// Saved records of draft tables read from the chain (the editor's base).
+    pub bases: HashMap<String, TableView>,
+    pub base_cache: HashMap<String, (String, std::rc::Rc<Vec<crate::sheet::BaseRec>>)>,
+    pub ed: crate::editor::Ed,
+    pub undo: HashMap<(String, usize), crate::editor::Undo>,
+    /// Small non-blocking status ("Checking your balance…").
+    pub busy_note: Option<String>,
+    pub send_review: Option<SendReview>,
+    /// Filter to apply once the editor opens (editing one record).
+    pub pending_filter: Option<String>,
+    /// Which account panel is open on the account page ("add", "send", "").
+    pub panel: String,
 }
 
 thread_local! {
@@ -219,9 +245,33 @@ unsafe fn owned_str(p: *mut u8, len: usize) -> String {
 #[no_mangle]
 pub extern "C" fn start() {
     APP.with(|a| {
-        let app = App::new();
+        let mut app = App::new();
+        app.auto_login();
         *a.borrow_mut() = Some(app);
     });
+}
+
+/// Key presses from elements marked data-keys. Returns 1 when handled (the
+/// page then prevents the browser's default action).
+#[no_mangle]
+pub unsafe extern "C" fn on_key(ap: *mut u8, al: usize, gp: *mut u8, gl: usize, kp: *mut u8, kl: usize, vp: *mut u8, vl: usize) -> u32 {
+    let action = owned_str(ap, al);
+    let arg = owned_str(gp, gl);
+    let key = owned_str(kp, kl);
+    let val = owned_str(vp, vl);
+    let mut handled = 0;
+    APP.with(|a| {
+        if let Ok(mut g) = a.try_borrow_mut() {
+            if let Some(app) = g.as_mut() {
+                let (h, r) = app.key(&action, &arg, &key, &val);
+                handled = h as u32;
+                if r {
+                    app.render();
+                }
+            }
+        }
+    });
+    handled
 }
 
 #[no_mangle]
@@ -292,6 +342,14 @@ impl App {
             form: HashMap::new(),
             reveal_key: None,
             keep_toast: false,
+            bases: HashMap::new(),
+            base_cache: HashMap::new(),
+            ed: crate::editor::Ed { tab: "browse".into(), ..Default::default() },
+            undo: HashMap::new(),
+            busy_note: None,
+            send_review: None,
+            pending_filter: None,
+            panel: String::new(),
         }
     }
 
@@ -342,6 +400,26 @@ impl App {
         *self.revs.entry((key.to_string(), t)).or_insert(0) += 1;
     }
 
+    /// Table `t` of `key` was removed: state kept per table index moves with
+    /// the tables that shift down, and nothing computed for the old index
+    /// survives.
+    pub fn table_removed(&mut self, key: &str, t: usize) {
+        self.plans.retain(|(k, _), _| k != key);
+        let n = self.draft_idx(key).map(|i| self.drafts[i].tables.len()).unwrap_or(0);
+        for j in 0..=n {
+            self.bump(key, j);
+        }
+        let keys: Vec<(String, usize)> = self.undo.keys().filter(|(k, j)| k == key && *j >= t).cloned().collect();
+        let mut moved: Vec<(usize, crate::editor::Undo)> = keys.into_iter().filter_map(|ck| self.undo.remove(&ck).map(|u| (ck.1, u))).collect();
+        moved.sort_by_key(|m| m.0);
+        for (j, u) in moved {
+            if j > t {
+                self.undo.insert((key.to_string(), j - 1), u);
+            }
+        }
+        self.ed.table = (String::new(), usize::MAX);
+    }
+
     /// Key for an address, if it belongs to the logged-in account.
     pub fn keypair(&self, address: &str) -> Option<Keypair> {
         self.account.as_ref()?.find(address).map(|w| w.kp.clone())
@@ -359,6 +437,7 @@ impl App {
     }
 
     pub fn render(&mut self) {
+        self.sync_sheet();
         let html = crate::views::render(self);
         host::render(&html);
     }
@@ -385,6 +464,18 @@ impl App {
             ["account"] => Route::Account,
             ["ws"] => Route::Workspace,
             ["ws", key] => Route::Draft(key.to_string()),
+            ["ws", key, t] => {
+                if let (Some(i), Ok(t)) = (self.draft_idx(key), t.parse::<usize>()) {
+                    if t < self.drafts[i].tables.len() {
+                        self.drafts[i].sel = t;
+                    }
+                }
+                // picking a table shows it, as in phpMyAdmin's tree
+                if self.ed.tab == "sql" || self.ed.tab == "save" {
+                    self.ed.tab = "browse".into();
+                }
+                Route::Draft(key.to_string())
+            }
             ["settings"] => Route::Settings,
             ["about"] => Route::About,
             _ => Route::Databases,
@@ -424,6 +515,12 @@ impl App {
                     }
                     if !self.name_checks.contains_key(&key) {
                         self.check_name(&key);
+                    }
+                }
+                let main = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address());
+                if let Some(m) = main {
+                    if !self.balances.contains_key(&m) {
+                        self.fetch_all_balances();
                     }
                 }
             }
@@ -537,23 +634,39 @@ impl App {
     }
 
     pub fn more_rows(&mut self) {
-        let Some(t) = self.table.as_mut() else { return };
+        if let Some(pda) = self.table.as_ref().map(|t| t.pda.clone()) {
+            self.more_rows_for(&pda);
+        }
+    }
+
+    /// The table view (explorer) or editor base loading `pda` at generation `gen`.
+    pub fn tv_mut(&mut self, pda: &str, gen: u32) -> Option<&mut TableView> {
+        if self.table.as_ref().map(|t| t.pda == pda && t.gen == gen).unwrap_or(false) {
+            return self.table.as_mut();
+        }
+        self.bases.get_mut(pda).filter(|t| t.gen == gen)
+    }
+
+    /// Fetch the next page of rows for the explorer table or an editor base.
+    pub fn more_rows_for(&mut self, pda: &str) {
+        let rpc = self.use_rpc();
+        let t = if self.table.as_ref().map(|t| t.pda == pda).unwrap_or(false) { self.table.as_mut() } else { self.bases.get_mut(pda) };
+        let Some(t) = t else { return };
         if t.loading || t.done {
             return;
         }
         t.loading = true;
-        if self.settings.source == "rpc" || self.settings.cluster == "devnet" {
-            let (pda, gen, cur) = (t.pda.clone(), t.gen, t.cursor.clone());
-            t.err = None;
+        t.err = None;
+        let (pda, gen, cur) = (t.pda.clone(), t.gen, t.cursor.clone());
+        if rpc {
             self.rpc_rows(&pda, gen, cur);
             return;
         }
-        let path = match &t.cursor {
-            Some(c) => format!("/table/{}/rows?limit=100&before={}", t.pda, c),
-            None => format!("/table/{}/rows?limit=100", t.pda),
+        let path = match &cur {
+            Some(c) => format!("/table/{}/rows?limit=100&before={}", pda, c),
+            None => format!("/table/{}/rows?limit=100", pda),
         };
-        let p = P::Rows(t.pda.clone(), t.gen);
-        self.get(&path, p);
+        self.get(&path, P::Rows(pda, gen));
     }
 
     // ------------------------------------------------------------- events
@@ -632,6 +745,10 @@ impl App {
             }
             (_, "tv-export") => self.export_view(arg),
             (_, "tv-draft") => self.draft_from_table(arg),
+            (_, "db-edit") => {
+                let db = self.dbroots.ready().and_then(|rs| rs.iter().find(|d| d.pda == arg)).and_then(|d| d.id.clone());
+                self.open_in_editor(db, Some(arg.to_string()), None, None);
+            }
             (_, "copy-record") => {
                 if let Some(t) = self.table.as_ref() {
                     let link = format!("iq://table/{}/{}", t.pda, pct_encode(arg));
@@ -663,7 +780,7 @@ impl App {
                 }
             }
             (_, "balance") => self.fetch_balance(arg),
-            (_, "add-table") => self.add_table(arg),
+            (_, "add-table") => self.add_table(arg.strip_prefix("tname:").unwrap_or(arg)),
             (_, "sel-table") => {
                 let mut it = arg.splitn(2, ':');
                 let (k, t) = (it.next().unwrap_or(""), it.next().unwrap_or("0").parse().unwrap_or(0));
@@ -675,12 +792,19 @@ impl App {
             (_, "del-table") | (_, "del-row") | (_, "clear-ghosts") | (_, "inscribe") if self.attach_busy(arg.split(':').next().unwrap_or("")) => {
                 self.err("Wait for the file being attached to finish.");
             }
-            (_, "del-table") => self.edit_table(arg, |d, t| {
-                if d.tables[t].created.is_none() {
-                    d.tables.remove(t);
-                    d.sel = 0;
+            (_, "del-table") => {
+                let mut removed = None;
+                self.edit_table(arg, |d, t| {
+                    if d.tables[t].created.is_none() {
+                        d.tables.remove(t);
+                        d.sel = 0;
+                        removed = Some(t);
+                    }
+                });
+                if let Some(t) = removed {
+                    self.table_removed(arg.split(':').next().unwrap_or(""), t);
                 }
-            }),
+            }
             (_, "table-open") => {
                 let v = val == "true";
                 self.edit_table(arg, move |d, t| d.tables[t].open = v)
@@ -721,13 +845,19 @@ impl App {
                 let (k, t) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("0").parse().unwrap_or(0));
                 self.form.insert(format!("attachcol:{}:{}", k, t), val.to_string());
             }
-            (_, "inscribe") => self.start_run(arg),
+            (_, "inscribe") => self.save(arg),
             (_, "run-stop") => {
                 if let Some(r) = self.run.as_mut() {
                     r.stop = true;
                 }
             }
-            (_, "run-resume") => self.resume_run(),
+            (_, "run-resume") => {
+                let paused = self.run.as_ref().map(|r| matches!(r.state, crate::inscribe::RunState::Paused(_))).unwrap_or(false);
+                match (paused, self.run.as_ref().map(|r| r.draft.clone())) {
+                    (true, Some(k)) => self.save(&k),
+                    _ => self.resume_run(),
+                }
+            }
             (_, "run-close") => {
                 if self.run.as_ref().map(|r| !r.busy()).unwrap_or(true) {
                     self.run = None;
@@ -737,7 +867,7 @@ impl App {
             (_, "set") => self.set_setting(arg, val),
             (_, "export-ws") => {
                 let data = state::drafts_to_json(&self.drafts).to_string();
-                host::download("iq-tables-workspace.json", "application/json", data.as_bytes());
+                host::download("iq-tables-drafts.json", "application/json", data.as_bytes());
             }
             ("file", "import-ws") => match json::parse(val) {
                 Ok(v) => {
@@ -752,9 +882,14 @@ impl App {
                     self.save_drafts();
                     self.ok(format!("Imported {} draft database(s)", n));
                 }
-                Err(e) => self.err(format!("Not a workspace file: {}", e)),
+                Err(e) => self.err(format!("Not a drafts file: {}", e)),
             },
-            _ => return self.account_event(kind, action, arg, val),
+            _ => {
+                if let Some(r) = self.editor_event(kind, action, arg, val) {
+                    return r;
+                }
+                return self.account_event(kind, action, arg, val);
+            }
         }
         true
     }
@@ -843,7 +978,7 @@ impl App {
                 };
             }
             P::Meta(pda, gen) => {
-                if let Some(t) = self.table.as_mut().filter(|t| t.pda == pda && t.gen == gen) {
+                if let Some(t) = self.tv_mut(&pda, gen) {
                     t.meta = if http_ok {
                         json::parse(&text()).map(Load::Ready).unwrap_or_else(Load::Err)
                     } else {
@@ -883,7 +1018,8 @@ impl App {
             }
             P::Rows(pda, gen) => {
                 let mut again = false;
-                if let Some(t) = self.table.as_mut().filter(|t| t.pda == pda && t.gen == gen) {
+                let mut finished = false;
+                if let Some(t) = self.tv_mut(&pda, gen) {
                     t.loading = false;
                     if http_ok {
                         match json::parse(&text()) {
@@ -898,6 +1034,7 @@ impl App {
                                 if n == 0 || t.cursor.is_none() {
                                     t.done = true;
                                     t.load_all = false;
+                                    finished = true;
                                 }
                                 again = t.load_all && !t.done && t.rows.len() < 20_000;
                             }
@@ -909,7 +1046,9 @@ impl App {
                     }
                 }
                 if again {
-                    self.more_rows();
+                    self.more_rows_for(&pda);
+                } else if finished {
+                    self.base_loaded(&pda);
                 }
             }
             P::NameCheck { draft, name } => {
@@ -949,7 +1088,7 @@ impl App {
                 let v = st.as_ref().map(|r| r.get("value").idx(0).clone()).unwrap_or(Json::Null);
                 let conf = v.get("confirmationStatus").str_or("");
                 if !v.get("err").is_null() {
-                    if let After::Attach(_) = after {
+                    if let After::Attach(_) | After::AttachFunded(_) = after {
                         self.attach_status = None;
                     }
                     self.err(format!("{} failed on chain: {}", what, v.get("err")));
@@ -961,7 +1100,7 @@ impl App {
                     self.timer(2000, P::ConfirmTick { what, sig, since, after });
                     return false;
                 } else {
-                    if let After::Attach(_) = after {
+                    if let After::Attach(_) | After::AttachFunded(_) = after {
                         self.attach_status = None;
                     }
                     self.err(format!("{} not confirmed after 90s — check {}", what, solana::short(&sig)));
@@ -977,6 +1116,7 @@ impl App {
         match p {
             P::RpcRoots | P::RpcMeta(..) | P::RpcSigs(..) | P::RpcTxs(..) => self.chain_async(p, ok, status, data),
             P::AttachCheck(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => self.attach_async(p, ok, status, data),
+            P::SaveCheck { .. } => self.save_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
         }
     }
@@ -985,6 +1125,8 @@ impl App {
         match after {
             After::Balances => {}
             After::Attach(job) => self.attach_confirmed(job, sig),
+            After::StartRun(key) => self.start_run(&key),
+            After::AttachFunded(job) => self.attach_retry(job),
         }
     }
 
@@ -1017,11 +1159,35 @@ impl App {
             self.err(format!("Database names are at most {} bytes (this one is {})", iq::MAX_DB_ID_BYTES, name.len()));
             return;
         }
+        if self.drafts.iter().any(|d| d.name == name) {
+            self.err(format!("You already have a database called \"{}\" here", name));
+            return;
+        }
         let key = self.new_key();
-        self.drafts.push(Draft::new(key.clone(), name));
+        let mut d = Draft::new(key.clone(), name.clone());
+        // start with a sheet to type into, like a new spreadsheet
+        d.tables.push(DraftTable {
+            name: "sheet1".into(),
+            title: "sheet1".into(),
+            columns: vec!["id".into(), "name".into(), "notes".into()],
+            id_col: 0,
+            open: false,
+            compress: true,
+            created: None,
+            rows: vec![],
+        });
+        // its own wallet, made automatically when signed in
+        if let Some(a) = self.account.as_mut() {
+            let w = a.new_wallet(&format!("db: {}", name), &format!("Wallet of database \"{}\"", name));
+            a.dirty = true;
+            d.wallet = Some(w.address());
+        }
+        self.drafts.push(d);
         self.form.remove("new-db");
         self.save_drafts();
-        host::set_hash(&format!("#/ws/{}", key));
+        self.persist_account();
+        self.ed.tab = "browse".into();
+        host::set_hash(&format!("#/ws/{}/0", key));
     }
 
     pub fn check_name(&mut self, key: &str) {
@@ -1049,7 +1215,7 @@ impl App {
         let mut columns: Vec<String> = cols_raw.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         columns.dedup();
         if columns.is_empty() {
-            columns = vec!["id".into()];
+            columns = vec!["id".into(), "name".into()];
         }
         let d = &mut self.drafts[i];
         d.tables.push(DraftTable {
@@ -1068,6 +1234,9 @@ impl App {
             self.form.remove(&format!("{}:{}", k, key));
         }
         self.save_drafts();
+        self.ed.tab = "browse".into();
+        let t = self.drafts[i].sel;
+        host::set_hash(&format!("#/ws/{}/{}", key, t));
     }
 
     fn edit_table(&mut self, arg: &str, f: impl FnOnce(&mut Draft, usize)) {
@@ -1196,9 +1365,9 @@ impl App {
             tb.rows.push(GhostRow { vals, deleted: false, sig: None });
         }
         let msg = if unknown.is_empty() {
-            format!("Imported {} ghost rows", n)
+            format!("Imported {} rows (not saved yet)", n)
         } else {
-            format!("Imported {} ghost rows (ignored columns not in the table: {})", n, unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+            format!("Imported {} rows, not saved yet (ignored columns not in the table: {})", n, unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
         };
         self.form.remove(&format!("csv:{}", arg));
         self.bump(&k, t);
@@ -1206,29 +1375,21 @@ impl App {
         self.ok(msg);
     }
 
-    /// Open an on-chain IQT table in the workspace to draft changes to it.
+    /// Open an on-chain IQT table in the editor (its records load from the chain).
     fn draft_from_table(&mut self, edit_key: &str) {
         let Some(tv) = self.table.as_ref() else { return };
-        let Some(db) = tv.db_id.clone() else {
-            self.err("This database's name isn't readable (it was created from a hash), so it can't be opened in the workspace.");
+        let (root, pda) = (tv.root.clone(), tv.pda.clone());
+        let label = tv.label.clone();
+        let db = tv.db_id.clone();
+        self.open_in_editor(db, root, Some((pda, label)), if edit_key.is_empty() { None } else { Some(edit_key.to_string()) });
+    }
+
+    /// Open a database (and optionally one of its tables) in the editor.
+    pub fn open_in_editor(&mut self, db: Option<String>, root: Option<String>, table: Option<(String, Option<String>)>, record: Option<String>) {
+        let info = root.as_ref().and_then(|r| self.dbroots.ready().and_then(|rs| rs.iter().find(|d| &d.pda == r)).cloned());
+        let Some(db) = db.or_else(|| info.as_ref().and_then(|i| i.id.clone())) else {
+            self.err("This database's name isn't readable (it was created from a hash), so it can't be opened in the editor.");
             return;
-        };
-        let label = tv.label.clone().unwrap_or_default();
-        if label.is_empty() || label.starts_with('#') {
-            self.err("This table's name isn't readable, so it can't be opened in the workspace.");
-            return;
-        }
-        let merged = crate::views::merged_records(tv, Who::Official);
-        let Some(schema) = tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).map(|p| p.schema.clone()).last() else {
-            self.err("No IQ Tables packs found in this table yet.");
-            return;
-        };
-        let edit_row: Option<Vec<Json>> = if edit_key.is_empty() {
-            None
-        } else {
-            merged.iter().find(|m| m.key == edit_key).map(|m| {
-                schema.cols.iter().map(|c| m.vals.iter().find(|(k, _)| k == c).map(|(_, v)| v.clone()).unwrap_or(Json::Null)).collect()
-            })
         };
         let key = match self.drafts.iter().position(|d| d.name == db) {
             Some(i) => self.drafts[i].key.clone(),
@@ -1237,44 +1398,45 @@ impl App {
                 let mut d = Draft::new(key.clone(), db.clone());
                 d.root_sig = Some("existing".into());
                 d.lock_creators = false;
+                // edit with the owner's wallet if it's in this account
+                if let (Some(i), Some(a)) = (&info, &self.account) {
+                    if a.find(&i.creator).is_some() {
+                        d.wallet = Some(i.creator.clone());
+                    }
+                }
                 self.drafts.push(d);
                 key
             }
         };
         let i = self.draft_idx(&key).unwrap();
-        let t = match self.drafts[i].tables.iter().position(|t| t.name == label) {
-            Some(t) => t,
-            None => {
-                self.drafts[i].tables.push(DraftTable {
-                    name: label.clone(),
-                    title: label.clone(),
-                    columns: schema.cols.clone(),
-                    id_col: schema.id,
-                    open: true,
-                    compress: true,
-                    created: Some("existing".into()),
-                    rows: vec![],
-                });
-                self.drafts[i].tables.len() - 1
-            }
-        };
-        if let Some(vals) = edit_row {
-            let tb = &mut self.drafts[i].tables[t];
-            let mut v2 = vec![Json::Null; tb.columns.len()];
-            for (ci, c) in schema.cols.iter().enumerate() {
-                if let Some(pos) = tb.columns.iter().position(|x| x == c) {
-                    v2[pos] = vals[ci].clone();
-                }
-            }
-            tb.rows.push(GhostRow { vals: v2, deleted: false, sig: None });
+        let mut names: Vec<String> = info.as_ref().map(|r| r.tables.iter().filter_map(|t| t.label.clone()).collect()).unwrap_or_default();
+        let wanted = table.as_ref().and_then(|(pda, label)| {
+            label.clone().filter(|l| !l.starts_with('#')).or_else(|| info.as_ref().and_then(|r| r.tables.iter().find(|t| &t.pda == pda).and_then(|t| t.label.clone())))
+        });
+        if table.is_some() && wanted.is_none() {
+            self.err("This table's name isn't readable, so it can't be opened in the editor.");
+            return;
         }
+        if let Some(w) = &wanted {
+            if !names.contains(w) {
+                names.push(w.clone());
+            }
+        }
+        for n in names {
+            if !self.drafts[i].tables.iter().any(|t| t.name == n) {
+                self.drafts[i].tables.push(DraftTable { name: n.clone(), title: n, columns: vec![], id_col: 0, open: true, compress: true, created: Some("existing".into()), rows: vec![] });
+            }
+        }
+        let t = wanted.and_then(|w| self.drafts[i].tables.iter().position(|t| t.name == w)).unwrap_or(0);
         self.drafts[i].sel = t;
-        self.drafts[i].page = 0;
-        self.bump(&key, t);
         self.save_drafts();
-        self.ok(if edit_key.is_empty() { "Opened in your workspace" } else { "Record copied into a ghost row — edit it, then inscribe" });
+        self.ed.tab = "browse".into();
+        self.ed.table = (String::new(), 0);
+        if let Some(r) = record {
+            self.pending_filter = Some(r);
+        }
         self.keep_toast = true;
-        host::set_hash(&format!("#/ws/{}", key));
+        host::set_hash(&format!("#/ws/{}/{}", key, t));
     }
 
     fn export_view(&mut self, fmt: &str) {

@@ -154,8 +154,8 @@ impl App {
         self.post_rpc(body, P::RpcTxs(page));
     }
 
-    fn push_rows(&mut self, rows: Vec<Json>) {
-        if let Some(t) = self.table.as_mut() {
+    fn push_rows(&mut self, pda: &str, gen: u32, rows: Vec<Json>) {
+        if let Some(t) = self.tv_mut(pda, gen) {
             for r in rows {
                 // a retried page must not add the same row twice
                 let sig = r.get("__txSignature").str_or("");
@@ -170,22 +170,26 @@ impl App {
 
     fn finish_page(&mut self, page: Page) {
         let mut again = false;
-        if let Some(t) = self.table.as_mut().filter(|t| t.pda == page.pda && t.gen == page.gen) {
+        let mut finished = false;
+        if let Some(t) = self.tv_mut(&page.pda, page.gen) {
             t.loading = false;
             t.cursor = page.next;
             if page.last || t.cursor.is_none() {
                 t.done = true;
                 t.load_all = false;
+                finished = true;
             }
             again = t.load_all && !t.done && t.rows.len() < 20_000;
         }
         if again {
-            self.more_rows();
+            self.more_rows_for(&page.pda);
+        } else if finished {
+            self.base_loaded(&page.pda);
         }
     }
 
     fn table_err(&mut self, pda: &str, gen: u32, e: String) {
-        if let Some(t) = self.table.as_mut().filter(|t| t.pda == pda && t.gen == gen) {
+        if let Some(t) = self.tv_mut(pda, gen) {
             t.loading = false;
             t.load_all = false;
             t.err = Some(e);
@@ -220,21 +224,22 @@ impl App {
             }
             P::RpcMeta(pda, gen) => {
                 let r = res();
-                if let Some(t) = self.table.as_mut().filter(|t| t.pda == pda && t.gen == gen) {
+                let cluster = self.settings.cluster.clone();
+                if let Some(t) = self.tv_mut(&pda, gen) {
                     t.meta = match r {
                         Ok(v) => match net::account_data(v.get("value")) {
                             Some(d) => match iq::decode_table(&d) {
                                 Some(m) => Load::Ready(iq::meta_json(&m)),
                                 None => Load::Err("that account isn't an IQ table".into()),
                             },
-                            None => Load::Err(format!("no table at this address on {}", self.settings.cluster)),
+                            None => Load::Err(format!("no table at this address on {}", cluster)),
                         },
                         Err(e) => Load::Err(e),
                     };
                 }
             }
             P::RpcSigs(pda, gen) => {
-                if !self.table.as_ref().map(|t| t.pda == pda && t.gen == gen).unwrap_or(false) {
+                if self.tv_mut(&pda, gen).is_none() {
                     return false;
                 }
                 match res() {
@@ -250,7 +255,7 @@ impl App {
                 }
             }
             P::RpcTxs(mut page) => {
-                if !self.table.as_ref().map(|t| t.pda == page.pda && t.gen == page.gen).unwrap_or(false) {
+                if self.tv_mut(&page.pda, page.gen).is_none() {
                     return false;
                 }
                 if page.batch {
@@ -268,7 +273,7 @@ impl App {
                             let failed: Vec<String> = page.sigs.iter().zip(&results).filter(|(_, r)| r.is_none()).map(|(s, _)| s.clone()).collect();
                             let pda = page.pda.clone();
                             let rows: Vec<Json> = results.iter().flatten().flat_map(|r| rows_from_tx(r, &pda)).collect();
-                            self.push_rows(rows);
+                            self.push_rows(&pda, page.gen, rows);
                             page.sigs = failed;
                             // anything the batch couldn't read is retried one by one
                             page.batch = false;
@@ -289,7 +294,8 @@ impl App {
                     match res() {
                         Ok(r) => {
                             let rows = rows_from_tx(&r, &page.pda);
-                            self.push_rows(rows);
+                            let (pda, gen) = (page.pda.clone(), page.gen);
+                            self.push_rows(&pda, gen, rows);
                             page.sigs.remove(0);
                             self.fetch_txs(page);
                         }

@@ -36,6 +36,19 @@ impl Wallet {
     }
 }
 
+/// Where an account's secret comes from, which decides how it is kept.
+#[derive(Clone, PartialEq)]
+pub enum Origin {
+    /// An account file the user saves and drops back in (passphrase-encrypted).
+    File,
+    /// Derived from a passkey (WebAuthn PRF). Nothing secret is stored; the
+    /// wallet list is kept in this browser, encrypted with a key that also
+    /// comes from the passkey.
+    Passkey { cred: String, store_key: [u8; 32] },
+    /// Kept in this browser only (fallback when passkeys aren't available).
+    Browser,
+}
+
 #[derive(Clone)]
 pub struct Account {
     pub name: String,
@@ -46,6 +59,7 @@ pub struct Account {
     pub dirty: bool,
     /// (salt, AES key) from the passphrase, kept so saving doesn't re-run PBKDF2.
     pub seal: Option<([u8; 16], [u8; 32])>,
+    pub origin: Origin,
 }
 
 pub fn derive(master: &[u8; 32], index: u32) -> Keypair {
@@ -54,7 +68,7 @@ pub fn derive(master: &[u8; 32], index: u32) -> Keypair {
 
 impl Account {
     pub fn new(name: &str, master: [u8; 32]) -> Self {
-        let mut a = Account { name: name.to_string(), master, next_index: 0, wallets: vec![], dirty: true, seal: None };
+        let mut a = Account { name: name.to_string(), master, next_index: 0, wallets: vec![], dirty: true, seal: None, origin: Origin::File };
         a.new_wallet("Main", "");
         a
     }
@@ -104,6 +118,25 @@ impl Account {
         self.dirty = true;
     }
 
+    /// The main wallet: derived index 0, or the first wallet if there is none.
+    pub fn main(&self) -> Option<&Wallet> {
+        self.wallets.iter().find(|w| w.kind == Kind::Derived(0)).or_else(|| self.wallets.first())
+    }
+
+    /// Candidate derived wallets from `start` (gap-limit rescans).
+    pub fn scan_from(&self, start: u32) -> Vec<(u32, Keypair)> {
+        (start..start + RESCAN_WINDOW).map(|i| (i, derive(&self.master, i))).collect()
+    }
+
+    /// The wallet list as stored for passkey and browser accounts.
+    pub fn store_json(&self) -> String {
+        json::obj(vec![("name", json::s(&self.name)), ("payload", self.payload())]).to_string()
+    }
+
+    pub fn from_store_json(v: &Json) -> Result<Self, String> {
+        Account::from_payload(&v.get("name").str_or("My account"), v.get("payload"))
+    }
+
     fn payload(&self) -> Json {
         json::obj(vec![
             ("master", json::s(&hex(&self.master))),
@@ -130,14 +163,14 @@ impl Account {
         ])
     }
 
-    fn from_payload(name: &str, p: &Json) -> Result<Self, String> {
+    pub fn from_payload(name: &str, p: &Json) -> Result<Self, String> {
         let m = unhex(p.get("master").str().ok_or("missing master secret")?).ok_or("bad master secret")?;
         if m.len() != 32 {
             return Err("bad master secret".into());
         }
         let mut master = [0u8; 32];
         master.copy_from_slice(&m);
-        let mut a = Account { name: name.to_string(), master, next_index: p.get("next").u64().unwrap_or(0) as u32, wallets: vec![], dirty: false, seal: None };
+        let mut a = Account { name: name.to_string(), master, next_index: p.get("next").u64().unwrap_or(0) as u32, wallets: vec![], dirty: false, seal: None, origin: Origin::File };
         for w in p.get("wallets").arr() {
             let label = w.get("label").str_or("Wallet");
             let note = w.get("note").str_or("");

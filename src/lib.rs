@@ -8,6 +8,7 @@ pub mod attach;
 pub mod chain;
 pub mod codec;
 pub mod crypto;
+pub mod editor;
 pub mod host;
 pub mod inscribe;
 pub mod iq;
@@ -15,11 +16,15 @@ pub mod json;
 pub mod net;
 pub mod pack;
 pub mod qr;
+pub mod sheet;
 pub mod solana;
+pub mod sql;
+pub mod sql_exec;
 pub mod state;
 pub mod ui;
 pub mod views;
 pub mod views_account;
+pub mod views_ws;
 
 #[cfg(test)]
 mod tests;

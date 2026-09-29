@@ -96,10 +96,10 @@ impl Run {
             StepKind::UserInit => "One-time IQ account setup for the database wallet".into(),
             StepKind::Grow(_) => "Enlarge the wallet's IQ accounts for 4 KB (v1) writes".into(),
             StepKind::Pack { t, count, pack_id, .. } => format!(
-                "Inscribe pack {} → \"{}\" ({} records)",
-                pack_id,
+                "Save {} rows to \"{}\" (pack {})",
+                count,
                 tables.get(*t).map(|x| x.name.as_str()).unwrap_or("?"),
-                count
+                pack_id
             ),
         }
     }
@@ -495,7 +495,7 @@ impl App {
         let n = r.steps.len();
         if n == 0 {
             r.state = RunState::Done;
-            r.note(true, "Nothing to inscribe — everything is already on chain.");
+            r.note(true, "Nothing to save — everything is already on the blockchain.");
             return;
         }
         r.note(true, format!("{} step(s) planned; database wallet balance {}", n, ui::sol(bal)));

@@ -1,15 +1,26 @@
 //! Account events and async handling: logging in by dropping a file,
 //! unlocking, creating and saving accounts, managing wallets, moving SOL.
 
-use crate::account::{self, Account, Parsed};
-use crate::app::{fetch_err, After, App, Load, P, K_ACCOUNT, K_REMEMBER};
-use crate::crypto::{base58, base64_encode};
+use crate::account::{self, Account, Origin, Parsed};
+use crate::app::{fetch_err, After, App, Load, SendReview, P, K_ACCOUNT, K_REMEMBER};
+use crate::crypto::{aead, base58, base64_decode, base64_encode, hex, sha2, unhex};
 use crate::host;
 use crate::iq;
 use crate::json::{self, Json};
 use crate::net;
 use crate::solana::{self, b58, parse_pk};
 use crate::ui;
+
+pub const K_DEVICE: &str = "iqtables:v1:device";
+pub const K_PK_HINT: &str = "iqtables:v1:pk-hint";
+pub const K_SIGNED_OUT: &str = "iqtables:v1:signed-out";
+const K_PK_STORE: &str = "iqtables:v1:pk:";
+
+/// The PRF input every passkey evaluates (frozen: changing it changes every
+/// passkey account's wallets).
+fn prf_salt() -> [u8; 32] {
+    sha2::sha256_parts(&[b"iq-tables/prf-salt/v1"])
+}
 
 fn random<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
@@ -21,6 +32,47 @@ impl App {
     pub fn account_event(&mut self, kind: &str, action: &str, arg: &str, val: &str) -> bool {
         match (kind, action) {
             ("file", "drop-file") | ("file", "account-file") => self.on_file(arg, val),
+            (_, "passkey-create") | (_, "passkey-signin") => {
+                let create = action == "passkey-create";
+                let id = self.nid();
+                self.pending.insert(id, P::Passkey(create));
+                let req = json::obj(vec![
+                    ("mode", json::s(if create { "create" } else { "get" })),
+                    ("salt", json::s(&base64_encode(&prf_salt()))),
+                    ("name", json::s("IQ Tables")),
+                ]);
+                self.busy = Some(if create { "Follow your device's prompt to create your account…".into() } else { "Follow your device's prompt to sign in…".into() });
+                host::passkey(id, &req.to_string());
+            }
+            (_, "browser-account") => self.create_browser_account(),
+            (_, "device-signin") => {
+                host::storage_set(K_SIGNED_OUT, "");
+                if !self.auto_login() {
+                    self.err("There's no account saved in this browser.");
+                }
+            }
+            (_, "panel") => {
+                self.panel = if self.panel == arg { String::new() } else { arg.to_string() };
+                self.send_review = None;
+                if !self.panel.is_empty() {
+                    self.fetch_all_balances();
+                }
+            }
+            (_, "add-funds") => {
+                self.panel = "add".into();
+                self.fetch_all_balances();
+                host::set_hash("#/account");
+            }
+            (_, "send-review") => self.send_review_start(),
+            (_, "send-cancel") => self.send_review = None,
+            (_, "send-confirm") => {
+                let Some(r) = self.send_review.take() else { return true };
+                let Some(from) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) else { return true };
+                self.form.remove("send-to");
+                self.form.remove("send-amt");
+                self.panel.clear();
+                self.transfer(&from, &r.to, r.lamports, After::Balances);
+            }
             ("file", "drop-too-big") => self.err(format!("{} is too big to be an account or key file", arg)),
             ("file", "import-keys") => self.on_file(arg, val),
             (_, "import-keys-text") => {
@@ -81,15 +133,21 @@ impl App {
                 if self.run.as_ref().map(|r| r.busy()).unwrap_or(false) {
                     self.err("Wait for the inscription to finish (or stop it) before logging out.");
                 } else {
-                    if self.account.as_ref().map(|a| a.dirty).unwrap_or(false) && self.unsaved_keys {
+                    let origin = self.account.as_ref().map(|a| a.origin.clone());
+                    if origin == Some(Origin::File) && self.account.as_ref().map(|a| a.dirty).unwrap_or(false) && self.unsaved_keys {
                         self.err("You have imported keys that aren't saved in your account file. Save it first (or they'll be lost).");
                         return true;
                     }
+                    if origin == Some(Origin::Browser) {
+                        host::storage_set(K_SIGNED_OUT, "1");
+                    }
+                    self.panel.clear();
+                    self.send_review = None;
                     self.account = None;
                     self.locked = None;
                     self.account_menu = false;
                     self.reveal_key = None;
-                    self.ok("Logged out. Your keys were cleared from this page.");
+                    self.ok("Signed out.");
                 }
             }
             (_, "new-wallet") => {
@@ -179,6 +237,153 @@ impl App {
         self.timer(30, p);
     }
 
+    // ------------------------------------------------------------ accounts
+
+    /// Sign back in to an account kept in this browser (no prompt).
+    pub fn auto_login(&mut self) -> bool {
+        if host::storage_get(K_SIGNED_OUT).as_deref() == Some("1") {
+            return false;
+        }
+        let Some(v) = host::storage_get(K_DEVICE).filter(|s| !s.is_empty()).and_then(|s| json::parse(&s).ok()) else { return false };
+        match Account::from_store_json(&v) {
+            Ok(mut a) => {
+                a.origin = Origin::Browser;
+                a.dirty = false;
+                self.account = Some(a);
+                self.rescan_from(None);
+                self.fetch_all_balances();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn create_browser_account(&mut self) {
+        if let Some(v) = host::storage_get(K_DEVICE).filter(|s| !s.is_empty()) {
+            // never overwrite a wallet that may hold money
+            if json::parse(&v).is_ok() {
+                host::storage_set(K_SIGNED_OUT, "");
+                self.auto_login();
+                self.ok("Signed back in to the account saved in this browser.");
+                self.after_login_route();
+                return;
+            }
+        }
+        let mut a = Account::new("My account", random::<32>());
+        a.origin = Origin::Browser;
+        host::storage_set(K_SIGNED_OUT, "");
+        self.login(a);
+        self.ok("Your account is ready. It's saved in this browser — once it holds money, download a backup from the Account page.");
+    }
+
+    fn after_login_route(&mut self) {
+        if self.route == crate::app::Route::Account {
+            self.keep_toast = true;
+            host::set_hash("#/mine");
+        }
+    }
+
+    fn passkey_result(&mut self, create: bool, text: &str) {
+        self.busy = None;
+        let v = json::parse(text).unwrap_or(Json::Null);
+        let prf = v.get("prf").str().and_then(base64_decode).filter(|p| p.len() >= 32);
+        let cred = v.get("cred").str_or("");
+        if let (Some(prf), false) = (prf, cred.is_empty()) {
+            let master = sha2::sha256_parts(&[b"iq-tables/passkey-master/v1", &prf]);
+            let store_key = sha2::sha256_parts(&[b"iq-tables/passkey-store/v1", &prf]);
+            host::storage_set(K_PK_HINT, "1");
+            // the wallet list this browser remembers for this passkey
+            let stored = host::storage_get(&format!("{}{}", K_PK_STORE, cred)).and_then(|s| json::parse(&s).ok()).and_then(|e| {
+                let iv = unhex(e.get("iv").str()?)?;
+                let ct = unhex(e.get("ct").str()?)?;
+                let iv: [u8; 12] = iv.try_into().ok()?;
+                let plain = aead::gcm_decrypt(&store_key, &iv, &ct)?;
+                json::parse(&String::from_utf8(plain).ok()?).ok()
+            });
+            let mut a = match stored.and_then(|v| Account::from_store_json(&v).ok()).filter(|a| a.master == master) {
+                Some(a) => a,
+                None => Account::new("My account", master),
+            };
+            a.origin = Origin::Passkey { cred, store_key };
+            let fresh = create;
+            self.login(a);
+            self.ok(if fresh { "Your account is ready — your passkey is your login on every device where it's synced." } else { "Signed in." });
+            return;
+        }
+        let err = v.get("error").str_or("");
+        if v.get("unsupported").bool() == Some(true) {
+            if create {
+                self.create_browser_account();
+                self.ok("This browser can't use passkeys here, so your account is saved in this browser instead. Once it holds money, download a backup from the Account page.");
+            } else {
+                self.err("This browser can't use passkeys here. If you made your account in this browser, use \"Continue with this browser\"; otherwise sign in with your backup file.");
+            }
+        } else if err == "NotAllowedError" || err == "AbortError" {
+            self.err("Cancelled.");
+        } else {
+            self.err(format!("Your device couldn't {} the passkey: {}", if create { "create" } else { "use" }, v.get("message").str_or(&err)));
+        }
+    }
+
+    /// Save the account wherever its origin keeps it.
+    pub fn persist_account(&mut self) {
+        let Some(a) = self.account.as_ref() else { return };
+        match &a.origin {
+            Origin::File => {
+                if self.remember && a.seal.is_some() {
+                    host::storage_set(K_ACCOUNT, &a.to_file(random::<12>()));
+                }
+            }
+            Origin::Browser => host::storage_set(K_DEVICE, &a.store_json()),
+            Origin::Passkey { cred, store_key } => {
+                let iv = random::<12>();
+                let ct = aead::gcm_encrypt(store_key, &iv, a.store_json().as_bytes());
+                let e = json::obj(vec![("iv", json::s(&hex(&iv))), ("ct", json::s(&hex(&ct)))]);
+                host::storage_set(&format!("{}{}", K_PK_STORE, cred), &e.to_string());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ money
+
+    fn send_review_start(&mut self) {
+        let to = self.form.get("send-to").cloned().unwrap_or_default().trim().to_string();
+        let amt = self.form.get("send-amt").cloned().unwrap_or_default();
+        let Some(main) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) else { return };
+        let bal = self.balances.get(&main).and_then(|b| b.ready().copied()).unwrap_or(0);
+        let lamports = if amt.trim().eq_ignore_ascii_case("max") || amt.trim().eq_ignore_ascii_case("all") {
+            bal.saturating_sub(iq::TX_FEE)
+        } else {
+            match ui::parse_sol(&amt) {
+                Some(l) if l > 0 => l,
+                _ => return self.err("Enter how much SOL to send, e.g. 0.25"),
+            }
+        };
+        if lamports + iq::TX_FEE > bal {
+            return self.err(format!("That's more than your balance ({})", ui::sol(bal)));
+        }
+        let lower = to.to_ascii_lowercase();
+        if lower.ends_with(".sol") && lower.len() > 4 {
+            // look the name up through IQ's gateway
+            self.busy_note = Some(format!("Looking up {}…", lower));
+            self.get(&format!("/sns/{}", crate::app::pct_encode(&lower)), P::Sns { name: lower, lamports });
+            return;
+        }
+        if parse_pk(&to).is_none() {
+            return self.err("Enter a Solana address or a name like alice.sol");
+        }
+        if to == main {
+            return self.err("That's your own address");
+        }
+        self.send_review = Some(SendReview { label: solana::short(&to), to, lamports });
+    }
+
+    /// Move SOL between wallets (or to anyone), then run `after`.
+    pub fn transfer(&mut self, from: &str, to: &str, lamports: u64, after: After) {
+        let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
+        self.rpc("getLatestBlockhash", params, P::TransferHash { from: from.into(), to: to.into(), lamports, after });
+    }
+
     fn on_file(&mut self, name: &str, text: &str) {
         let parsed = account::parse_file(name, text);
         if let (Some(a), Ok(Parsed::Locked(..) | Parsed::Account(_))) = (self.account.as_ref(), &parsed) {
@@ -233,10 +438,20 @@ impl App {
         for k in ["unlock-pass", "pass1", "pass2"] {
             self.form.remove(k);
         }
-        self.store_on_device();
-        self.rescan();
+        self.persist_account();
+        self.rescan_from(None);
         self.fetch_all_balances();
         self.files.clear();
+        // drafts made before signing in get their own wallet now
+        let names: Vec<(usize, String)> = self.drafts.iter().enumerate().filter(|(_, d)| d.wallet.is_none()).map(|(i, d)| (i, d.name.clone())).collect();
+        for (i, n) in names {
+            if let Some(a) = self.account.as_mut() {
+                let w = a.new_wallet(&format!("db: {}", n), &format!("Wallet of database \"{}\"", n));
+                self.drafts[i].wallet = Some(w.address());
+            }
+        }
+        self.save_drafts();
+        self.persist_account();
         if self.route == crate::app::Route::Account {
             self.keep_toast = true;
             host::set_hash("#/mine");
@@ -248,16 +463,10 @@ impl App {
         }
     }
 
-    /// Keep the (encrypted) account file in this browser, if allowed.
+    /// Keep the account where it lives (browser, passkey store, or the
+    /// remembered encrypted file).
     pub fn store_on_device(&mut self) {
-        if !self.remember {
-            return;
-        }
-        if let Some(a) = self.account.as_ref() {
-            if a.seal.is_some() {
-                host::storage_set(K_ACCOUNT, &a.to_file(random::<12>()));
-            }
-        }
+        self.persist_account();
     }
 
     fn save_account(&mut self, plain: bool) {
@@ -289,10 +498,13 @@ impl App {
         }
     }
 
-    /// Look for wallets created after the file was last saved.
-    fn rescan(&mut self) {
+    /// Look for derived wallets that have been used but aren't listed (made
+    /// after the file was saved, or on another device): scan ahead until a
+    /// whole window is unused.
+    fn rescan_from(&mut self, start: Option<u32>) {
         let Some(a) = self.account.as_ref() else { return };
-        let cands: Vec<(u32, String)> = a.rescan_candidates().into_iter().map(|(i, kp)| (i, b58(&kp.pubkey))).collect();
+        let start = start.unwrap_or(a.next_index);
+        let cands: Vec<(u32, String)> = a.scan_from(start).into_iter().map(|(i, kp)| (i, b58(&kp.pubkey))).collect();
         let mut addrs = vec![];
         for (_, w) in &cands {
             addrs.push(json::s(w));
@@ -355,8 +567,7 @@ impl App {
             self.err(format!("Not enough SOL: the wallet has {}", ui::sol(bal)));
             return;
         }
-        let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
-        self.rpc("getLatestBlockhash", params, P::TransferHash { from: from.into(), to: to.into(), lamports });
+        self.transfer(from, to, lamports, After::Balances);
     }
 
     pub fn account_async(&mut self, p: P, ok: bool, status: u32, data: Vec<u8>) -> bool {
@@ -396,6 +607,16 @@ impl App {
                 }
                 self.save_account(false);
             }
+            P::Passkey(create) => self.passkey_result(create, &text),
+            P::Sns { name, lamports } => {
+                self.busy_note = None;
+                let v = if http_ok { json::parse(&text).ok() } else { None };
+                let pick = |k: &str| v.as_ref().and_then(|v| v.get(k).str().map(String::from)).filter(|a| parse_pk(a).is_some());
+                match pick("record").or_else(|| pick("owner")) {
+                    Some(to) => self.send_review = Some(SendReview { label: format!("{} ({})", name, solana::short(&to)), to, lamports }),
+                    None => self.err(format!("Couldn't find who owns {}", name)),
+                }
+            }
             P::Rescan(cands) => {
                 if let Ok(v) = res() {
                     let vals = v.get("value").arr().to_vec();
@@ -413,7 +634,14 @@ impl App {
                     }
                     if !found.is_empty() {
                         self.fetch_all_balances();
-                        self.ok(format!("Recovered {} wallet(s) created after this file was saved. Save the account file to keep their labels.", found.len()));
+                        self.persist_account();
+                        let file = self.account.as_ref().map(|a| a.origin == Origin::File).unwrap_or(false);
+                        if file {
+                            self.ok(format!("Recovered {} wallet(s) created after this file was saved. Save the account file to keep their labels.", found.len()));
+                        }
+                        // keep looking past the last one found
+                        let next = cands.last().map(|(i, _)| i + 1);
+                        self.rescan_from(next);
                     }
                 }
             }
@@ -430,7 +658,7 @@ impl App {
                     }
                 }
             },
-            P::TransferHash { from, to, lamports } => {
+            P::TransferHash { from, to, lamports, after } => {
                 let bh = res().ok().and_then(|r| r.get("value").get("blockhash").str().and_then(base58::decode32));
                 let (Some(bh), Some(kp), Some(dest)) = (bh, self.keypair(&from), parse_pk(&to)) else {
                     self.err("Couldn't prepare the transfer (no blockhash from the RPC)");
@@ -439,14 +667,14 @@ impl App {
                 let msg = solana::compile(&kp.pubkey, &[solana::system_transfer(&kp.pubkey, &dest, lamports)], bh);
                 let (raw, _) = solana::legacy_signed(&msg, &kp.seed);
                 let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"preflightCommitment\":\"confirmed\"}}]", base64_encode(&raw))).unwrap();
-                self.rpc("sendTransaction", params, P::TransferSent);
+                self.rpc("sendTransaction", params, P::TransferSent(after));
                 self.ok(format!("Sending {} to {}…", ui::sol(lamports), solana::short(&to)));
             }
-            P::TransferSent => match res() {
+            P::TransferSent(after) => match res() {
                 Ok(r) => {
                     let sig = r.str_or("");
                     let now = host::now_ms();
-                    self.timer(1200, P::ConfirmTick { what: "Transfer".into(), sig, since: now, after: After::Balances });
+                    self.timer(1200, P::ConfirmTick { what: "Transfer".into(), sig, since: now, after });
                     return false;
                 }
                 Err(e) => self.err(format!("Transfer failed: {}", e)),
