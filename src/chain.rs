@@ -15,6 +15,24 @@ use crate::solana::{self, b58};
 /// Signatures per page of table history.
 pub const SIG_PAGE: usize = 25;
 
+/// Reassembling a row sent in chunks (IQ's linked list or session).
+#[derive(Clone)]
+pub struct ChunkRead {
+    pub pda: String,
+    pub gen: u32,
+    /// The finalizing transaction (the placeholder row's signature).
+    pub sig: String,
+    pub kind: ChunkKind,
+}
+
+#[derive(Clone)]
+pub enum ChunkKind {
+    /// Walking back from the tail: the next signature to read, parts so far (in order).
+    Linked { next: String, parts: Vec<String> },
+    /// A session: its address, signatures still to read, parts by index.
+    Session { session: String, sigs: Vec<String>, parts: std::collections::BTreeMap<u32, String>, total: usize, listed: bool },
+}
+
 /// One page of a table's history being turned into rows.
 #[derive(Clone)]
 pub struct Page {
@@ -101,10 +119,16 @@ pub fn rows_from_tx(result: &Json, pda: &str) -> Vec<Json> {
         if accs.get(7).and_then(|&i| tx.keys.get(i)).map(b58).as_deref() != Some(pda) {
             continue;
         }
-        if !d.on_chain_path.is_empty() {
-            continue; // chunked upload: only the gateway reassembles those
-        }
-        let Some(mut row) = iq::row_from_metadata(&d.metadata) else { continue };
+        let mut row = if !d.on_chain_path.is_empty() {
+            // a chunked upload: a placeholder, filled in once its parts are read
+            let total = json::parse(&d.metadata).ok().and_then(|m| m.get("total_chunks").u64()).unwrap_or(0);
+            json::obj(vec![("__onChainPath", json::s(&d.on_chain_path)), ("__chunks", json::n(total)), ("__pending", Json::Bool(true))])
+        } else {
+            match iq::row_from_metadata(&d.metadata) {
+                Some(r) => r,
+                None => continue,
+            }
+        };
         row.set("__txSignature", json::s(&tx.signature));
         if let Some(signer) = accs.first().and_then(|&i| tx.keys.get(i)) {
             row.set("__signer", json::s(&b58(signer)));
@@ -155,6 +179,7 @@ impl App {
     }
 
     fn push_rows(&mut self, pda: &str, gen: u32, rows: Vec<Json>) {
+        let mut reads = vec![];
         if let Some(t) = self.tv_mut(pda, gen) {
             for r in rows {
                 // a retried page must not add the same row twice
@@ -162,9 +187,77 @@ impl App {
                 if t.rows.iter().any(|x| x.get("__txSignature").str() == Some(sig.as_str()) && *x == r) {
                     continue;
                 }
+                if r.get("__pending").bool() == Some(true) {
+                    t.chunk_waits += 1;
+                    let path = r.get("__onChainPath").str_or("");
+                    let total = r.get("__chunks").u64().unwrap_or(0) as usize;
+                    reads.push((sig.clone(), path, total));
+                }
                 t.decoded.push(decode_row(&r));
                 t.rows.push(r);
             }
+        }
+        for (sig, path, total) in reads {
+            let kind = if path.len() >= 80 {
+                ChunkKind::Linked { next: path, parts: vec![] }
+            } else {
+                ChunkKind::Session { session: path, sigs: vec![], parts: Default::default(), total, listed: false }
+            };
+            self.chunk_step(ChunkRead { pda: pda.to_string(), gen, sig, kind });
+        }
+    }
+
+    /// Next request for a chunked row.
+    fn chunk_step(&mut self, c: ChunkRead) {
+        match &c.kind {
+            ChunkKind::Linked { next, .. } => {
+                let body = tx_request(next, 0).get("params").clone();
+                self.rpc("getTransaction", body, P::RpcChunk(c));
+            }
+            ChunkKind::Session { session, listed: false, .. } => {
+                let params = Json::Arr(vec![json::s(session), json::obj(vec![("limit", json::n(1000)), ("commitment", json::s("confirmed"))])]);
+                self.rpc("getSignaturesForAddress", params, P::RpcChunk(c));
+            }
+            ChunkKind::Session { sigs, .. } => {
+                let Some(s) = sigs.first().cloned() else {
+                    self.chunk_done(c);
+                    return;
+                };
+                let body = tx_request(&s, 0).get("params").clone();
+                self.rpc("getTransaction", body, P::RpcChunk(c));
+            }
+        }
+    }
+
+    /// All parts are in (or reading failed): replace the placeholder row.
+    fn chunk_done(&mut self, c: ChunkRead) {
+        let text = match &c.kind {
+            ChunkKind::Linked { parts, .. } => Some(parts.concat()),
+            ChunkKind::Session { parts, total, .. } => {
+                let n = if *total > 0 { *total } else { parts.len() };
+                let ok = (0..n as u32).all(|i| parts.contains_key(&i));
+                ok.then(|| (0..n as u32).map(|i| parts[&i].as_str()).collect::<String>())
+            }
+        };
+        let row = text.and_then(|t| json::parse(&t).ok()).filter(|r| matches!(r, Json::Obj(_)));
+        let mut finished = false;
+        if let Some(t) = self.tv_mut(&c.pda, c.gen) {
+            if let Some(i) = t.rows.iter().position(|r| r.get("__txSignature").str() == Some(c.sig.as_str()) && r.get("__pending").bool() == Some(true)) {
+                let old = t.rows[i].clone();
+                let mut row = row.unwrap_or_else(|| json::obj(vec![("__unreadable", Json::Bool(true))]));
+                for k in ["__txSignature", "__signer", "__blockTime", "__onChainPath"] {
+                    if !old.get(k).is_null() {
+                        row.set(k, old.get(k).clone());
+                    }
+                }
+                t.decoded[i] = decode_row(&row);
+                t.rows[i] = row;
+            }
+            t.chunk_waits = t.chunk_waits.saturating_sub(1);
+            finished = t.chunk_waits == 0 && t.done;
+        }
+        if finished {
+            self.base_loaded(&c.pda);
         }
     }
 
@@ -181,9 +274,14 @@ impl App {
             }
             again = t.load_all && !t.done && t.rows.len() < 20_000;
         }
+        if (again || finished) && self.stop_at_checkpoint(&page.pda, page.gen) {
+            again = false;
+            finished = true;
+        }
+        let waiting = self.tv_mut(&page.pda, page.gen).map(|t| t.chunk_waits > 0).unwrap_or(false);
         if again {
             self.more_rows_for(&page.pda);
-        } else if finished {
+        } else if finished && !waiting {
             self.base_loaded(&page.pda);
         }
     }
@@ -304,6 +402,61 @@ impl App {
                             self.table_err(&pda, gen, e);
                         }
                     }
+                }
+            }
+            P::RpcChunk(mut c) => {
+                if self.tv_mut(&c.pda, c.gen).is_none() {
+                    return false;
+                }
+                let r = res();
+                let pid = iq::program_id();
+                let decode = |v: &Json| -> Option<solana::ParsedTx> {
+                    let raw = v.get("transaction").idx(0).str().and_then(base64_decode)?;
+                    solana::parse_tx(&raw)
+                };
+                match (&mut c.kind, r) {
+                    (ChunkKind::Linked { next, parts }, Ok(v)) => {
+                        let found = decode(&v).and_then(|tx| tx.ixs.iter().find_map(|(p, _, data)| (tx.keys.get(*p) == Some(&pid)).then(|| iq::decode_send_code(data)).flatten()));
+                        match found {
+                            Some((code, before)) if parts.len() < 1000 => {
+                                parts.insert(0, code);
+                                if before == "Genesis" || before.is_empty() {
+                                    self.chunk_done(c);
+                                } else {
+                                    *next = before;
+                                    self.chunk_step(c);
+                                }
+                            }
+                            _ => {
+                                parts.clear();
+                                parts.push(String::new());
+                                self.chunk_done(c);
+                            }
+                        }
+                    }
+                    (ChunkKind::Session { sigs, listed, .. }, Ok(v)) if !*listed => {
+                        *listed = true;
+                        *sigs = v.arr().iter().filter(|x| x.get("err").is_null()).filter_map(|x| x.get("signature").str().map(String::from)).collect();
+                        // oldest first, so a re-sent part (newer) wins
+                        sigs.reverse();
+                        self.chunk_step(c);
+                    }
+                    (ChunkKind::Session { sigs, parts, .. }, Ok(v)) => {
+                        if let Some(tx) = decode(&v) {
+                            for (p, _, data) in &tx.ixs {
+                                if tx.keys.get(*p) == Some(&pid) {
+                                    if let Some((i, chunk)) = iq::decode_post_chunk(data) {
+                                        parts.insert(i, chunk);
+                                    }
+                                }
+                            }
+                        }
+                        if !sigs.is_empty() {
+                            sigs.remove(0);
+                        }
+                        self.chunk_step(c);
+                    }
+                    (_, Err(_)) => self.chunk_done(c),
                 }
             }
             _ => return false,

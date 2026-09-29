@@ -439,6 +439,8 @@ fn db_structure(app: &mut App, key: &str, h: &mut String) {
                 "<span class=\"pill ghost\">not saved yet</span>".to_string()
             } else if tb.clear {
                 "<span class=\"pill un\">will be emptied</span>".to_string()
+            } else if tb.checkpoint {
+                "<span class=\"pill un\">checkpoint on save</span>".to_string()
             } else if tb.schema_changed() || tb.meta_changed(d.wallet.as_deref()) || tb.ghosts() > 0 {
                 "<span class=\"pill un\">unsaved changes</span>".to_string()
             } else {
@@ -1225,6 +1227,37 @@ fn tbl_operations(app: &mut App, key: &str, t: usize, h: &mut String) {
         if tb.created.is_some() { format!(" · <a href=\"#/t/{}/{}\">view in Explore</a>", esc(&b58(&iq::db_root_pda(d.name.as_bytes()))), esc(&tpda)) } else { String::new() }
     ));
     h.push_str("</div>");
+    // checkpoint
+    if tb.created.is_some() {
+        let (_, pda) = app.table_pda_of(key, t).unwrap_or_default();
+        // writes read from the chain, plus ones this browser made since
+        let (mut writes, cut, seen) = app
+            .bases
+            .get(&pda)
+            .map(|b| (b.rows.len(), b.cut, b.rows.iter().filter_map(|r| r.get("__txSignature").str().map(String::from)).collect::<Vec<_>>()))
+            .unwrap_or((0, false, vec![]));
+        let mut mine: Vec<&String> = tb.rows.iter().filter_map(|r| r.sig.as_ref()).filter(|s| !seen.contains(s)).collect();
+        mine.sort();
+        mine.dedup();
+        writes += mine.len();
+        let live = app.sheet_rows(key, t).iter().filter(|r| r.state != RowState::Deleted).count();
+        h.push_str("<section class=\"card\"><h3>Checkpoint</h3>");
+        h.push_str(&format!(
+            "<p class=\"small\">{}</p>",
+            if cut {
+                format!("This table opens from its last checkpoint: {} write(s) read for {} row(s).", writes, live)
+            } else {
+                format!("Opening this table replays its whole history: {} write(s) on the blockchain for {} row(s) today.", writes, live)
+            }
+        ));
+        h.push_str("<p class=\"small muted\">A checkpoint rewrites the current rows together (as one chunked write when that's cheaper) and records that readers can start there, so a table with a long history of edits opens quickly again. Nothing old is erased. Same as <code>OPTIMIZE TABLE</code>.</p>");
+        h.push_str(&if tb.checkpoint {
+            "<div class=\"row\"><span class=\"pill un\">checkpoint on next save</span><button class=\"btn\" data-a=\"op-checkpoint\" data-arg=\"off\">Cancel</button></div>".to_string()
+        } else {
+            "<div class=\"row\"><button class=\"btn\" data-a=\"op-checkpoint\" data-arg=\"on\">Checkpoint on next save</button></div>".to_string()
+        });
+        h.push_str("</section>");
+    }
     // danger zone
     h.push_str("<section class=\"card dz\"><h3>Delete data</h3><div class=\"row\">");
     h.push_str(&danger(app, "op-truncate", &t.to_string(), "Empty the table (TRUNCATE)", false));
@@ -1366,7 +1399,9 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
             continue;
         }
         if tb.created.is_some() {
-            if tb.clear {
+            if tb.checkpoint {
+                lines.push(format!("<b>{}</b>: checkpoint — the table's rows are rewritten together, then readers skip its older history · {} for the record", esc(&label), ui::sol(write)));
+            } else if tb.clear {
                 lines.push(format!("<b>{}</b>: empty it (earlier rows stop showing) · {}", esc(&label), ui::sol(write)));
             } else if tb.schema_changed() {
                 lines.push(format!("<b>{}</b>: new structure (columns, types, keys or rules) · {}", esc(&label), ui::sol(write)));
@@ -1387,14 +1422,20 @@ fn save_tab(app: &mut App, key: &str, h: &mut String) {
         match &plans[t] {
             Ok(p) if !p.is_empty() => {
                 let recs: usize = p.iter().map(|x| x.count).sum();
+                let parts: usize = p.iter().map(|x| x.chunks).sum();
+                let how = if parts > 0 {
+                    format!("in one write sent in {} parts (IQ's chunked upload{})", parts, if parts >= iq::LINKED_LIST_THRESHOLD { ", session" } else { "" })
+                } else {
+                    format!("in {} write{}", p.len(), if p.len() == 1 { "" } else { "s" })
+                };
                 lines.push(format!(
-                    "<b>{}</b>: {} changed {} in {} write{} · {}",
+                    "<b>{}</b>: {} {} {} {} · {}",
                     esc(&label),
                     recs,
-                    if tb.is_system() { "view(s)" } else { "row(s)" },
-                    p.len(),
-                    if p.len() == 1 { "" } else { "s" },
-                    ui::sol(p.len() as u64 * write)
+                    if tb.checkpoint { "row(s) rewritten" } else { "changed" },
+                    if tb.checkpoint { "" } else if tb.is_system() { "view(s)" } else { "row(s)" },
+                    how,
+                    ui::sol(p.iter().map(|x| x.cost()).sum::<u64>())
                 ));
             }
             Err(e) => lines.push(format!("<span class=\"warn\"><b>{}</b>: {}</span>", esc(&label), esc(e))),

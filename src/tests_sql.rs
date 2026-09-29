@@ -373,6 +373,7 @@ fn structure_records_on_chain() {
     // rows saved with keys (id, qty); then the owner renames qty → count, adds
     // a column with a default, and later re-keys by sku and truncates
     let data = |tx: &str, cols: &[&str], id: usize, vals: Vec<Vec<&str>>| SourcePack {
+        id: tx.into(),
         tx: tx.into(),
         signer: "OWNER".into(),
         time: None,
@@ -381,12 +382,13 @@ fn structure_records_on_chain() {
         meta: None,
     };
     let doc = |cols: Vec<(&str, ColMeta)>, pk: &str, clear: bool| SourcePack {
+        id: "s".into(),
         tx: "s".into(),
         signer: "OWNER".into(),
         time: None,
         schema: Schema { cols: vec!["id".into()], id: 0 },
         recs: vec![],
-        meta: Some(Doc { cols: cols.into_iter().map(|(n, m)| (n.to_string(), m)).collect(), pk: pk.into(), keys: Default::default(), clear, dropped: false }.to_json()),
+        meta: Some(Doc { cols: cols.into_iter().map(|(n, m)| (n.to_string(), m)).collect(), pk: pk.into(), keys: Default::default(), clear, dropped: false, snap: vec![] }.to_json()),
     };
     let p1 = data("t1", &["id", "sku", "qty"], 0, vec![vec!["1", "A", "5"], vec!["2", "B", "7"]]);
     let d1 = doc(vec![("id", ColMeta::plain("id")), ("sku", ColMeta::plain("sku")), ("count", ColMeta::typed("qty", Ty::Int(crate::schema::IntKind::Int, false))), ("bin", ColMeta { fill: Json::Str("A1".into()), ..ColMeta::plain("bin") })], "id", false);
@@ -485,4 +487,100 @@ fn screens_build_valid_sql() {
     assert!(a.drafts[0].tables[0].open);
     ok(&mut a, "RENAME TABLE `t` TO `things`");
     assert_eq!(rows(&mut a, "SELECT COUNT(*) FROM things"), vec![vec!["1".to_string()]]);
+}
+
+#[test]
+fn checkpoints_and_chunked_writes() {
+    use crate::pack::{self, Record, Schema, SourcePack};
+    use crate::schema::{ColMeta, Doc};
+    let schema = Schema { cols: vec!["id".into(), "v".into()], id: 0 };
+    let data = |id: &str, signer: &str, vals: Vec<(&str, &str)>, dels: Vec<&str>| {
+        let mut recs: Vec<Record> = vals.iter().map(|(k, v)| Record { vals: vec![Json::Str(k.to_string()), Json::Str(v.to_string())], deleted: false }).collect();
+        recs.extend(dels.iter().map(|k| Record { vals: vec![Json::Str(k.to_string()), Json::Null], deleted: true }));
+        SourcePack { id: id.into(), tx: id.into(), signer: signer.into(), time: None, schema: schema.clone(), recs, meta: None }
+    };
+    let ck = |signer: &str, snap: Vec<&str>| SourcePack {
+        id: "ck".into(),
+        tx: "ck".into(),
+        signer: signer.into(),
+        time: None,
+        schema: Schema { cols: vec!["id".into()], id: 0 },
+        recs: vec![],
+        meta: Some(Doc { cols: vec![("id".into(), ColMeta::plain("id")), ("v".into(), ColMeta::plain("v"))], pk: "id".into(), keys: Default::default(), clear: false, dropped: false, snap: snap.into_iter().map(String::from).collect() }.to_json()),
+    };
+    let history = vec![
+        data("p1", "O", vec![("A", "1"), ("B", "2")], vec![]),
+        data("x1", "U", vec![("E", "9")], vec![]),
+        data("p2", "O", vec![("A", "5")], vec!["B"]),
+        data("S", "O", vec![("A", "5"), ("C", "3")], vec![]),
+        data("p3", "O", vec![("F", "6")], vec![]),
+        ck("O", vec!["S"]),
+        ck("U", vec!["x1"]),
+        data("p4", "O", vec![("D", "4")], vec![]),
+    ];
+    let official = |s: &str| s == "O";
+    let (m, doc) = pack::merge_events(&history, &official, &|_| true);
+    let got: Vec<(String, String)> = m.iter().map(|r| (r.key.clone(), r.vals[1].1.cell_text())).collect();
+    let want: Vec<(String, String)> = vec![("A".into(), "5".into()), ("C".into(), "3".into()), ("F".into(), "6".into()), ("D".into(), "4".into())];
+    assert_eq!(got, want, "state = snapshot + what came after it; the unofficial checkpoint is ignored");
+    assert!(doc.unwrap().snap.is_empty());
+    // readers going newest-first can stop once the snapshot pack is in
+    let newest_first: Vec<SourcePack> = history.iter().rev().cloned().collect();
+    assert!(!pack::checkpoint_covers(&newest_first[..3], &official));
+    assert!(pack::checkpoint_covers(&newest_first[..5], &official));
+    // ... and get the same answer from just that part of history
+    let part: Vec<SourcePack> = newest_first[..5].iter().rev().cloned().collect();
+    let (m2, _) = pack::merge_events(&part, &official, &|_| true);
+    assert_eq!(m2.iter().map(|r| r.key.clone()).collect::<Vec<_>>(), vec!["A", "C", "F", "D"]);
+    // a checkpoint whose snapshot pack is missing is not trusted: full replay
+    let broken: Vec<SourcePack> = history.iter().filter(|p| p.id != "S").cloned().collect();
+    let (m3, _) = pack::merge_events(&broken, &official, &|_| true);
+    assert!(m3.iter().any(|r| r.key == "E"), "no valid checkpoint: everything replays");
+
+    // cheapest write: 1 pack direct; many packs → one chunked pack
+    let recs: Vec<Record> = (0..3000).map(|i| Record { vals: vec![Json::Str(format!("K{:05}", i)), Json::Str(format!("value {} {}", i * 7919 % 10007, i * 31))], deleted: false }).collect();
+    let small = pack::plan_best(&schema, &recs[..5], crate::iq::INLINE_CAP_V1, crate::iq::CHUNK_SIZE_V1, true).unwrap();
+    assert_eq!((small.len(), small[0].chunks), (1, 0));
+    let direct = pack::plan(&schema, &recs, crate::iq::INLINE_CAP_V1, true).unwrap();
+    let best = pack::plan_best(&schema, &recs, crate::iq::INLINE_CAP_V1, crate::iq::CHUNK_SIZE_V1, true).unwrap();
+    assert!(direct.len() >= 4 && best.len() == 1 && best[0].chunks >= 2, "{} direct packs vs {:?}", direct.len(), best.iter().map(|p| p.chunks).collect::<Vec<_>>());
+    assert!(best[0].cost() < direct.iter().map(|p| p.cost()).sum::<u64>());
+    // a record bigger than one transaction is fine now
+    let mut x: u64 = 88172645463325252;
+    let noise: String = (0..20000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect();
+    let huge = vec![Record { vals: vec![Json::Str("big".into()), Json::Str(noise)], deleted: false }];
+    assert!(pack::plan(&schema, &huge, crate::iq::INLINE_CAP_V1, true).is_err());
+    let hp = pack::plan_best(&schema, &huge, crate::iq::INLINE_CAP_V1, crate::iq::CHUNK_SIZE_V1, true).unwrap();
+    assert_eq!(hp.len(), 1);
+    assert!(hp[0].chunks >= 2);
+    let back = pack::decode_payload(&hp[0].payload).unwrap();
+    assert_eq!(back.1, huge);
+
+    // OPTIMIZE TABLE on a saved table: the next save rewrites every row
+    let mut a = db();
+    ok(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    ok(&mut a, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    a.drafts[0].tables[0].created = Some("sig".into());
+    for r in a.drafts[0].tables[0].rows.iter_mut() {
+        r.sig = Some("s1".into());
+    }
+    a.ensure_base("k", 0);
+    for tv in a.bases.values_mut() {
+        tv.loading = false;
+        tv.done = true;
+    }
+    let cap = a.inline_cap();
+    assert!(a.plan_for("k", 0, cap).as_ref().unwrap().is_empty());
+    let m = ok(&mut a, "OPTIMIZE TABLE t");
+    assert!(a.drafts[0].tables[0].checkpoint, "{}", m);
+    let plan = a.plan_for("k", 0, cap).clone().unwrap();
+    assert_eq!(plan.iter().map(|p| p.count).sum::<usize>(), 2, "every live row is rewritten");
+    assert!(a.drafts[0].tables[0].schema_changed());
 }

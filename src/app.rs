@@ -81,6 +81,10 @@ pub struct TableView {
     pub done: bool,
     pub err: Option<String>,
     pub load_all: bool,
+    /// Reading stopped at a checkpoint: older history wasn't needed.
+    pub cut: bool,
+    /// Chunked rows still being reassembled (direct Solana reads).
+    pub chunk_waits: usize,
     pub mode: Mode,
     pub who: Who,
     pub text: String,
@@ -128,13 +132,21 @@ pub enum P {
     RpcMeta(String, u32),
     RpcSigs(String, u32),
     RpcTxs(crate::chain::Page),
+    /// Reading a row that was sent in chunks.
+    RpcChunk(crate::chain::ChunkRead),
     // files and links (attach.rs)
     AttachCheck(crate::attach::Job),
+    /// Does an interrupted upload session exist?
+    AttachSession(crate::attach::Job),
     AttachHash(crate::attach::Job),
     AttachSent(crate::attach::Job),
     /// (signature, read from Solana rather than IQ's gateway)
     TxView(String, bool),
     Files(String),
+    // IQ git links (git.rs)
+    GitMeta(String),
+    GitRows(String),
+    GitTree(String),
     Ignore,
 }
 
@@ -159,6 +171,8 @@ pub struct SendReview {
 pub struct PlanCache {
     pub rev: u64,
     pub cap: usize,
+    /// Saved records the plan was made from (checkpoints rewrite them all).
+    pub base: usize,
     pub result: Result<Vec<pack::PlannedPack>, String>,
 }
 
@@ -212,6 +226,8 @@ pub struct App {
     pub pending_filter: Option<String>,
     /// Which account panel is open on the account page ("add", "send", "").
     pub panel: String,
+    /// Live links to IQ git repositories.
+    pub git: crate::git::Git,
 }
 
 thread_local! {
@@ -352,6 +368,7 @@ impl App {
             send_review: None,
             pending_filter: None,
             panel: String::new(),
+            git: Default::default(),
         }
     }
 
@@ -378,7 +395,7 @@ impl App {
     pub fn get(&mut self, path: &str, p: P) {
         let id = self.nid();
         self.pending.insert(id, p);
-        let url = format!("{}{}", self.settings.gateway.trim_end_matches('/'), path);
+        let url = format!("{}{}", self.gateway_url(), path);
         host::fetch(id, "GET", &url, "", "");
     }
 
@@ -435,13 +452,24 @@ impl App {
 
     /// Read tables straight from Solana instead of the IQ gateway.
     pub fn use_rpc(&self) -> bool {
-        self.settings.source == "rpc" || self.settings.cluster == "devnet"
+        self.settings.source == "rpc"
+    }
+
+    /// IQ's gateway for the cluster in use: its devnet twin on devnet
+    /// (unless a custom gateway is set).
+    pub fn gateway_url(&self) -> String {
+        let g = self.settings.gateway.trim_end_matches('/').to_string();
+        if self.settings.cluster == "devnet" && g == "https://gateway.iqlabs.dev" {
+            return DEV_GATEWAY.into();
+        }
+        g
     }
 
     pub fn render(&mut self) {
         self.sync_sheet();
         let html = crate::views::render(self);
         host::render(&html);
+        self.git_fetch_wanted();
     }
 
     // ------------------------------------------------------------ routing
@@ -586,6 +614,8 @@ impl App {
             done: false,
             err: None,
             load_all: false,
+            cut: false,
+            chunk_waits: 0,
             mode: Mode::Records,
             who: Who::Official,
             text: String::new(),
@@ -659,6 +689,44 @@ impl App {
             return self.table.as_mut();
         }
         self.bases.get_mut(pda).filter(|t| t.gen == gen)
+    }
+
+    /// The wallet whose records count as official for this table: the
+    /// database's creator (explorer), or the draft's owner (editor).
+    pub fn official_for(&self, pda: &str) -> Option<String> {
+        if let Some(c) = self.table.as_ref().filter(|t| t.pda == pda).and_then(|t| t.creator.clone()) {
+            return Some(c);
+        }
+        for d in &self.drafts {
+            for t in 0..d.tables.len() {
+                if self.table_pda_of(&d.key, t).map(|(_, p)| p == pda).unwrap_or(false) {
+                    // the database's creator: from the name check, the database list, or our own wallet
+                    let root = b58(&iq::db_root_pda(d.name.as_bytes()));
+                    let listed = self.dbroots.ready().and_then(|rs| rs.iter().find(|r| r.pda == root)).map(|r| r.creator.clone());
+                    return self.creator_of(&d.key).or(listed).or_else(|| d.wallet.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Reading a table newest-first for everything (an editor base): stop at
+    /// the owner's latest checkpoint once its packs are in. Returns true if
+    /// reading can stop.
+    pub fn stop_at_checkpoint(&mut self, pda: &str, gen: u32) -> bool {
+        let Some(owner) = self.official_for(pda) else { return false };
+        let Some(t) = self.tv_mut(pda, gen) else { return false };
+        let packs: Vec<pack::SourcePack> = t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
+        if !pack::checkpoint_covers(&packs, &|s| s == owner) {
+            return false;
+        }
+        t.cut = true;
+        if !t.load_all || t.done {
+            return false;
+        }
+        t.done = true;
+        t.load_all = false;
+        true
     }
 
     /// Fetch the next page of rows for the explorer table or an editor base.
@@ -857,6 +925,7 @@ impl App {
             ("file", "attach") => self.attach_file(arg, val),
             (_, "open-tx") => self.open_tx(arg, val),
             (_, "viewer-close") => self.viewer = None,
+            (_, a) if a.starts_with("git-") => self.git_action(a, arg),
             (_, "viewer-download") => self.viewer_download(),
             (_, "attach-col") => {
                 let mut it = arg.splitn(2, ':');
@@ -930,6 +999,10 @@ impl App {
                 self.name_checks.clear();
                 self.dbroots = Load::None;
                 self.files.clear();
+                // the same addresses hold different data on the other cluster
+                self.bases.clear();
+                self.base_cache.clear();
+                self.table = None;
             }
             "tx" => {
                 self.settings.tx_format = match val {
@@ -1063,6 +1136,10 @@ impl App {
                         t.load_all = false;
                     }
                 }
+                if (again || finished) && self.stop_at_checkpoint(&pda, gen) {
+                    again = false;
+                    finished = true;
+                }
                 if again {
                     self.more_rows_for(&pda);
                 } else if finished {
@@ -1139,9 +1216,10 @@ impl App {
 
     fn more_async(&mut self, p: P, ok: bool, status: u32, data: Vec<u8>) -> bool {
         match p {
-            P::RpcRoots | P::RpcMeta(..) | P::RpcSigs(..) | P::RpcTxs(..) => self.chain_async(p, ok, status, data),
-            P::AttachCheck(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => self.attach_async(p, ok, status, data),
+            P::RpcRoots | P::RpcMeta(..) | P::RpcSigs(..) | P::RpcTxs(..) | P::RpcChunk(..) => self.chain_async(p, ok, status, data),
+            P::AttachCheck(_) | P::AttachSession(_) | P::AttachHash(_) | P::AttachSent(_) | P::TxView(..) | P::Files(_) => self.attach_async(p, ok, status, data),
             P::SaveCheck { .. } => self.save_async(p, ok, status, data),
+            P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
         }
     }
@@ -1527,34 +1605,59 @@ impl App {
     pub fn plan_for(&mut self, key: &str, t: usize, cap: usize) -> &Result<Vec<pack::PlannedPack>, String> {
         let rev = *self.revs.get(&(key.to_string(), t)).unwrap_or(&0);
         let ck = (key.to_string(), t);
-        let stale = self.plans.get(&ck).map(|p| p.rev != rev || p.cap != cap).unwrap_or(true);
+        let checkpoint = self.draft_idx(key).and_then(|i| self.drafts[i].tables.get(t)).map(|tb| tb.checkpoint && !tb.dropped).unwrap_or(false);
+        let base = if checkpoint { self.sheet_base(key, t).0.len() } else { 0 };
+        let stale = self.plans.get(&ck).map(|p| p.rev != rev || p.cap != cap || p.base != base).unwrap_or(true);
         if stale {
+            let chunk = if cap <= iq::INLINE_CAP_LEGACY { iq::CHUNK_SIZE_LEGACY } else { iq::CHUNK_SIZE_V1 };
+            let live = if checkpoint { self.sheet_rows(key, t) } else { vec![] };
             let result = match self.draft_idx(key).and_then(|i| self.drafts[i].tables.get(t)).filter(|tb| !tb.dropped) {
                 Some(tb) => {
                     let mut tb = tb.clone();
                     tb.fix_meta();
                     let schema = pack::Schema { cols: tb.col_keys(), id: tb.id_col };
-                    let recs: Vec<pack::Record> = tb
-                        .rows
-                        .iter()
-                        .filter(|r| r.sig.is_none())
-                        .map(|r| {
-                            let mut vals = r.vals.clone();
-                            vals.resize(tb.columns.len(), Json::Null);
-                            pack::Record { vals, deleted: r.deleted }
-                        })
-                        .collect();
+                    let nc = tb.columns.len();
+                    // a checkpoint rewrites every live row; otherwise only the unsaved ones go
+                    let (recs, ghosts): (Vec<pack::Record>, Vec<usize>) = if checkpoint {
+                        (
+                            live.iter()
+                                .filter(|r| r.state != crate::sheet::RowState::Deleted)
+                                .map(|r| {
+                                    let mut vals = r.vals.clone();
+                                    vals.resize(nc, Json::Null);
+                                    pack::Record { vals, deleted: false }
+                                })
+                                .collect(),
+                            vec![],
+                        )
+                    } else {
+                        tb.rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.sig.is_none())
+                            .map(|(i, r)| {
+                                let mut vals = r.vals.clone();
+                                vals.resize(nc, Json::Null);
+                                (pack::Record { vals, deleted: r.deleted }, i)
+                            })
+                            .unzip()
+                    };
                     if recs.is_empty() {
                         Ok(vec![])
                     } else if let Some(bad) = recs.iter().position(|r| r.key(&schema).is_empty()) {
                         Err(format!("Row {} has no value in the ID column \"{}\"", bad + 1, tb.columns.get(tb.id_col).cloned().unwrap_or_default()))
                     } else {
-                        pack::plan(&schema, &recs, cap, tb.compress)
+                        pack::plan_best(&schema, &recs, cap, chunk, tb.compress).map(|mut ps| {
+                            for p in ps.iter_mut() {
+                                p.ghosts = ghosts.get(p.first..p.first + p.count).map(|g| g.to_vec()).unwrap_or_default();
+                            }
+                            ps
+                        })
                     }
                 }
                 None => Ok(vec![]),
             };
-            self.plans.insert(ck.clone(), PlanCache { rev, cap, result });
+            self.plans.insert(ck.clone(), PlanCache { rev, cap, base, result });
         }
         &self.plans.get(&ck).unwrap().result
     }
@@ -1574,6 +1677,8 @@ impl App {
 }
 
 pub const ROWS_PER_PAGE: usize = 50;
+/// IQ's gateway for devnet (the one the IQ SDKs switch to on devnet).
+pub const DEV_GATEWAY: &str = "https://dev-gateway.iqlabs.dev";
 
 pub fn decode_row(r: &Json) -> Option<Result<pack::SourcePack, String>> {
     let p = r.get("p").str()?;
@@ -1581,6 +1686,7 @@ pub fn decode_row(r: &Json) -> Option<Result<pack::SourcePack, String>> {
         return None;
     }
     Some(pack::decode_any(p).map(|(schema, recs, meta)| pack::SourcePack {
+        id: r.get("id").str_or(""),
         tx: r.get("__txSignature").str_or(""),
         signer: r.get("__signer").str_or(""),
         time: r.get("__blockTime").f64().map(|f| f as i64),

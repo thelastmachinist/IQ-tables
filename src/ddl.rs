@@ -280,6 +280,14 @@ impl App {
                 let t = self.tbl(key, &n)?;
                 msg(self.truncate(key, t)?)
             }
+            Stmt::Optimize(names) => {
+                let mut out = vec![];
+                for n in names {
+                    let t = self.tbl(key, &n)?;
+                    out.push(self.checkpoint(key, t, true)?);
+                }
+                msg(out.join(" "))
+            }
             Stmt::CreateView { name, or_replace, cols, sql, q } => self.create_view(key, &name, or_replace, cols, &sql, &q),
             Stmt::DropView { names, if_exists } => {
                 let mut out = vec![];
@@ -998,6 +1006,26 @@ impl App {
             format!("{} will be emptied when you save (one small write, whatever its size).", tb.title)
         } else {
             format!("{} emptied.", tb.title)
+        })
+    }
+
+    /// Mark a table for a checkpoint (or un-mark it): the next save rewrites
+    /// its rows in as few writes as possible and records that readers can
+    /// start there instead of replaying its whole history.
+    pub fn checkpoint(&mut self, key: &str, t: usize, on: bool) -> R<String> {
+        self.require_owner(key, t)?;
+        let di = self.draft_idx(key).unwrap();
+        let tb = self.drafts[di].tables[t].clone();
+        if tb.created.is_none() {
+            return Ok(format!("{} isn't saved yet, so it has no history to skip.", tb.title));
+        }
+        self.drafts[di].tables[t].checkpoint = on;
+        self.bump(key, t);
+        self.save_drafts();
+        Ok(if on {
+            format!("{} will get a checkpoint when you save: its rows are rewritten together, and from then on it opens without replaying older history.", tb.title)
+        } else {
+            format!("Checkpoint for {} cancelled.", tb.title)
         })
     }
 

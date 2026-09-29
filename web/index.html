@@ -161,6 +161,15 @@ body.dropping::after { content: "Drop account or key files to log in"; position:
 .warnbox .btn { margin-left: 8px; }
 .devnet { background: var(--warn-soft); color: var(--warn); text-align: center; font-size: .85rem; padding: 4px 16px; }
 .link.file { text-align: left; }
+.link.git { text-align: left; }
+.link.git .muted { font-size: .9em; }
+.gitcols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+.gitcols h4 { margin: 10px 0 6px; }
+ul.commits, ul.files { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow: auto; }
+ul.commits li, ul.files li { padding: 3px 0; overflow-wrap: anywhere; }
+ul.commits li.on > .link { font-weight: 700; color: var(--ink); }
+.gitpanel code { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .gitcols { grid-template-columns: 1fr; } }
 .cell-link { margin-top: 2px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nowrap { white-space: nowrap; }
 input.inline { padding: 3px 6px; min-width: 110px; max-width: 200px; }

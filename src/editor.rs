@@ -110,6 +110,8 @@ impl App {
                 done: false,
                 err: None,
                 load_all: true,
+                cut: false,
+                chunk_waits: 0,
                 mode: Mode::Records,
                 who: Who::All,
                 text: String::new(),
@@ -1081,13 +1083,14 @@ impl App {
         let meta = d.tables.iter().filter(|t| t.meta_changed(wallet.as_deref())).count() + d.tables.iter().filter(|t| t.dropped).count().min(1);
         let n = d.tables.len();
         let mut packs = structure;
+        total += structure as u64 * pack::write_cost(0);
         for t in 0..n {
             if let Ok(p) = self.plan_for(key, t, cap) {
                 packs += p.len();
+                total += p.iter().map(|x| x.cost()).sum::<u64>();
             }
         }
         total += meta as u64 * iq::TX_FEE;
-        total += packs as u64 * (iq::FEE_DIRECT_WRITE + iq::TX_FEE);
         (total, packs)
     }
 

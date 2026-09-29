@@ -528,6 +528,17 @@ impl App {
                     }
                 }
             }
+            "op-checkpoint" => {
+                let (key, t, tb) = self.cur_tb()?;
+                if arg == "on" {
+                    self.run_ui_sql(&key, &format!("OPTIMIZE TABLE {}", q(&tb.title)));
+                } else {
+                    match self.checkpoint(&key, t, false) {
+                        Ok(m) => self.ok(m),
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
             "op-truncate" => {
                 if let Ok(t) = arg.parse::<usize>() {
                     self.drafts[di].sel = t;

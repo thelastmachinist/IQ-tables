@@ -331,12 +331,22 @@ impl<'s> Parser<'s> {
                 self.skip_rest();
                 Ok(Stmt::Rollback)
             }
-            "LOCK" | "UNLOCK" | "OPTIMIZE" | "ANALYZE" | "CHECK" | "REPAIR" | "FLUSH" | "CHECKSUM" | "SAVEPOINT" | "RELEASE" | "KILL" | "RESET" | "PURGE" | "HANDLER" | "DO" | "CHANGE" | "CACHE" | "LOAD" | "INSTALL" | "UNINSTALL" => {
+            "OPTIMIZE" | "CHECKPOINT" => {
+                // OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE a, b  ·  CHECKPOINT [TABLE] a, b
+                self.i += 1;
+                while self.eat_kw("NO_WRITE_TO_BINLOG") || self.eat_kw("LOCAL") || self.eat_kw("TABLE") || self.eat_kw("TABLES") {}
+                let mut names = vec![self.table_name()?];
+                while self.eat_sym(",") {
+                    names.push(self.table_name()?);
+                }
+                Ok(Stmt::Optimize(names))
+            }
+            "LOCK" | "UNLOCK" | "ANALYZE" | "CHECK" | "REPAIR" | "FLUSH" | "CHECKSUM" | "SAVEPOINT" | "RELEASE" | "KILL" | "RESET" | "PURGE" | "HANDLER" | "DO" | "CHANGE" | "CACHE" | "LOAD" | "INSTALL" | "UNINSTALL" => {
                 self.i += 1;
                 self.skip_rest();
                 Ok(Stmt::Noop(match up.as_str() {
                     "LOCK" | "UNLOCK" => "Tables don't need locking: your changes wait in the editor until you save them.".into(),
-                    "OPTIMIZE" | "ANALYZE" | "CHECK" | "REPAIR" | "CHECKSUM" => format!("{} TABLE: nothing to do — there are no index files to rebuild; rows are read straight from the blockchain.", up),
+                    "ANALYZE" | "CHECK" | "REPAIR" | "CHECKSUM" => format!("{} TABLE: nothing to do — there are no index files to rebuild; rows are read straight from the blockchain.", up),
                     "LOAD" => "LOAD DATA isn't available in a browser — use Import (CSV, JSON or SQL) instead.".into(),
                     _ => format!("{} has no effect here.", up),
                 }))

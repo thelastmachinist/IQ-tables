@@ -26,6 +26,7 @@ const SEED_INSTRUCTION: &[u8] = b"instructionmY}AGBJiqLabs";
 const SEED_USER: &[u8] = b"usermY}AGBJiqLabs";
 const SEED_CODE_ACCOUNT: &[u8] = b"codemY}AGBJiqLabs";
 const SEED_USER_INVENTORY: &[u8] = b"inventorymY}AGBJiqLabs";
+const SEED_BUNDLE: &[u8] = b"bundlemY}AGBJiqLabs";
 
 // Anchor discriminators from idl/code_in.json.
 const IX_INITIALIZE_DB_ROOT: [u8; 8] = [189, 253, 79, 50, 58, 187, 182, 196];
@@ -37,7 +38,11 @@ const IX_REALLOC_ACCOUNT: [u8; 8] = [51, 237, 126, 233, 52, 244, 186, 244];
 const IX_USER_INVENTORY_CODE_IN: [u8; 8] = [81, 177, 5, 122, 213, 125, 21, 238];
 const IX_UPDATE_TABLE: [u8; 8] = [224, 23, 10, 48, 181, 73, 121, 187];
 const IX_UPDATE_DB_ROOT_TABLE_LIST: [u8; 8] = [57, 58, 185, 208, 50, 95, 94, 76];
+const IX_SEND_CODE: [u8; 8] = [239, 129, 35, 208, 62, 168, 110, 201];
+const IX_CREATE_SESSION: [u8; 8] = [242, 193, 143, 179, 150, 25, 122, 227];
+const IX_POST_CHUNK: [u8; 8] = [209, 8, 101, 123, 165, 205, 108, 54];
 const ACC_DB_ROOT: [u8; 8] = [245, 92, 214, 180, 144, 59, 3, 240];
+const ACC_SESSION: [u8; 8] = [74, 34, 65, 133, 96, 163, 80, 69];
 const ACC_TABLE: [u8; 8] = [34, 100, 138, 97, 236, 129, 230, 112];
 const ACC_USER_STATE: [u8; 8] = [72, 177, 85, 249, 76, 167, 186, 126];
 
@@ -77,6 +82,11 @@ pub fn code_account_pda(user: &Pubkey) -> Pubkey {
 }
 pub fn user_inventory_pda(user: &Pubkey) -> Pubkey {
     find_program_address(&[SEED_USER_INVENTORY, user], &program_id()).0
+}
+/// A chunk session: `["bundle…", program, user, seq u64 LE]`.
+pub fn session_pda(user: &Pubkey, seq: u64) -> Pubkey {
+    let p = program_id();
+    find_program_address(&[SEED_BUNDLE, &p, user, &seq.to_le_bytes()], &p).0
 }
 pub fn ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     find_program_address(&[owner, token_program, mint], &pk(ATA_PROGRAM_STR)).0
@@ -273,6 +283,172 @@ pub fn user_inventory_code_in_inline(user: &Pubkey, metadata: &str, iq_ata: Opti
         ],
         Borsh::new(&IX_USER_INVENTORY_CODE_IN).string("").string(metadata).u8(0).0,
     )
+}
+
+// ------------------------------------------------ data bigger than one tx
+// IQ's own ways to store data larger than one transaction (the SDK's
+// `prepareCodeIn`): fewer than 10 chunks go as a linked list of `send_code`
+// transactions (each names the one before, back to "Genesis"); 10 or more
+// go to a session account (`create_session`, then `post_chunk` by index).
+// The final `db_code_in` / `user_inventory_code_in` then carries only the
+// metadata and points at the chunks: the tail signature, or the session.
+
+/// Chunk sizes the SDK uses (bytes of UTF-8 text per chunk).
+pub const CHUNK_SIZE_V1: usize = 3600;
+pub const CHUNK_SIZE_LEGACY: usize = 850;
+/// From this many chunks on, the SDK uses a session instead of a linked list.
+pub const LINKED_LIST_THRESHOLD: usize = 10;
+
+/// Where chunked data lives, for the final code-in instruction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChunkPath {
+    /// Everything inside the metadata.
+    Inline,
+    /// Tail signature of a `send_code` chain.
+    Linked(String),
+    /// A session account with its sequence number and chunk count.
+    Session { seq: u64, total: u32 },
+}
+
+/// Split text into chunks of at most `size` UTF-8 bytes, never inside a
+/// character (the SDK's `toChunks`).
+pub fn to_chunks(data: &str, size: usize) -> Vec<String> {
+    if data.len() <= size {
+        return vec![data.to_string()];
+    }
+    let mut out = vec![];
+    let mut cur = String::new();
+    for ch in data.chars() {
+        if cur.len() + ch.len_utf8() > size {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+pub fn send_code(user: &Pubkey, code: &str, before_tx: &str) -> Instruction {
+    ix(
+        vec![AccountMeta::ws(*user), AccountMeta::w(code_account_pda(user)), AccountMeta::r(SYSTEM_PROGRAM)],
+        Borsh::new(&IX_SEND_CODE).string(code).string(before_tx).u8(0).u8(0).0,
+    )
+}
+
+pub fn create_session(user: &Pubkey, seq: u64) -> Instruction {
+    ix(
+        vec![AccountMeta::ws(*user), AccountMeta::w(user_state_pda(user)), AccountMeta::w(session_pda(user, seq)), AccountMeta::r(SYSTEM_PROGRAM)],
+        Borsh::new(&IX_CREATE_SESSION).u64(seq).0,
+    )
+}
+
+pub fn post_chunk(user: &Pubkey, seq: u64, index: u32, chunk: &str) -> Instruction {
+    ix(
+        vec![AccountMeta::s(*user), AccountMeta::w(session_pda(user, seq))],
+        Borsh::new(&IX_POST_CHUNK).u32(index).string(chunk).u8(0).u8(0).0,
+    )
+}
+
+/// `db_code_in` for data that went out in chunks (or inline, like
+/// [`db_code_in_inline`]). `iq_ata` only applies to the inline path.
+pub fn db_code_in(user: &Pubkey, db_id: &[u8], table_seed: &[u8], path: &ChunkPath, metadata: &str, iq_ata: Option<Pubkey>) -> Instruction {
+    let p = program_id();
+    let root = db_root_pda(db_id);
+    let (session, path_str) = session_account(user, path);
+    let data = Borsh::new(&IX_DB_CODE_IN).bytes(db_id).bytes(table_seed).string(&path_str).string(metadata);
+    let data = finish_session(data, path);
+    let inline = *path == ChunkPath::Inline;
+    ix(
+        vec![
+            AccountMeta::ws(*user),
+            AccountMeta::w(user_inventory_pda(user)),
+            AccountMeta::r(SYSTEM_PROGRAM),
+            AccountMeta::w(fee_receiver()),
+            session,
+            AccountMeta::r(if inline { iq_ata.unwrap_or(p) } else { p }),
+            AccountMeta::r(root),
+            AccountMeta::w(table_pda(&root, table_seed)),
+            AccountMeta::r(p),
+            AccountMeta::r(p),
+        ],
+        data.0,
+    )
+}
+
+/// `user_inventory_code_in` for a file that went out in chunks (or inline).
+pub fn user_inventory_code_in(user: &Pubkey, path: &ChunkPath, metadata: &str, iq_ata: Option<Pubkey>) -> Instruction {
+    let p = program_id();
+    let (session, path_str) = session_account(user, path);
+    let data = Borsh::new(&IX_USER_INVENTORY_CODE_IN).string(&path_str).string(metadata);
+    let data = finish_session(data, path);
+    let inline = *path == ChunkPath::Inline;
+    ix(
+        vec![
+            AccountMeta::ws(*user),
+            AccountMeta::w(user_inventory_pda(user)),
+            AccountMeta::r(SYSTEM_PROGRAM),
+            AccountMeta::w(fee_receiver()),
+            session,
+            AccountMeta::r(if inline { iq_ata.unwrap_or(p) } else { p }),
+        ],
+        data.0,
+    )
+}
+
+fn session_account(user: &Pubkey, path: &ChunkPath) -> (AccountMeta, String) {
+    match path {
+        ChunkPath::Inline => (AccountMeta::r(program_id()), String::new()),
+        ChunkPath::Linked(tail) => (AccountMeta::r(program_id()), tail.clone()),
+        ChunkPath::Session { seq, .. } => {
+            let s = session_pda(user, *seq);
+            (AccountMeta::w(s), crate::solana::b58(&s))
+        }
+    }
+}
+
+fn finish_session(b: Borsh, path: &ChunkPath) -> Borsh {
+    match path {
+        ChunkPath::Session { seq, total } => b.u8(1).u64(*seq).u32(*total),
+        _ => b.u8(0),
+    }
+}
+
+/// Metadata for data sent in chunks: everything but the data itself.
+pub fn chunked_metadata(filetype: &str, filename: &str, total_chunks: usize) -> String {
+    json::obj(vec![("filetype", json::s(filetype)), ("method", json::n(0)), ("filename", json::s(filename)), ("total_chunks", json::n(total_chunks))]).to_string()
+}
+
+/// `send_code` arguments (code, before_tx) from a transaction.
+pub fn decode_send_code(data: &[u8]) -> Option<(String, String)> {
+    if data.len() < 8 || data[..8] != IX_SEND_CODE {
+        return None;
+    }
+    let mut r = Rd { b: data, i: 8 };
+    let code = String::from_utf8(r.bytes()?).ok()?;
+    let before = String::from_utf8(r.bytes()?).ok()?;
+    Some((code, before))
+}
+
+/// `post_chunk` arguments (index, chunk) from a transaction.
+pub fn decode_post_chunk(data: &[u8]) -> Option<(u32, String)> {
+    if data.len() < 8 || data[..8] != IX_POST_CHUNK {
+        return None;
+    }
+    let mut r = Rd { b: data, i: 8 };
+    let index = r.u32()?;
+    let chunk = String::from_utf8(r.bytes()?).ok()?;
+    Some((index, chunk))
+}
+
+/// A session account: Some(total chunks) once finalized.
+pub fn decode_session(data: &[u8]) -> Option<Option<u32>> {
+    if data.len() < 14 || data[..8] != ACC_SESSION {
+        return None;
+    }
+    let total = u32::from_le_bytes([data[9], data[10], data[11], data[12]]);
+    Some((data[13] == 1).then_some(total))
 }
 
 /// Metadata for an inline file inscription, as the SDK's `codeIn` builds it.
@@ -496,6 +672,13 @@ pub fn decode_user_state_seq(data: &[u8]) -> Option<u64> {
 // Program write fees per upload method, from IQ Labs' own iq6900 cost model
 // (verified there against mainnet transfers to the fee receiver).
 pub const FEE_DIRECT_WRITE: u64 = 1_000_000; // 0.001 SOL
+/// Chunked writes (measured on devnet, flat whatever the number of chunks):
+/// the finalizing code-in costs 0.003 SOL after a linked list, 0.005 SOL
+/// after a session; the chunks themselves only pay the network fee. A
+/// session also creates a small account (its deposit, ~0.00072 SOL).
+pub const FEE_LINKED_WRITE: u64 = 3_000_000;
+pub const FEE_SESSION_WRITE: u64 = 5_000_000;
+pub const SESSION_RENT_ESTIMATE: u64 = 730_000;
 pub const TX_FEE: u64 = 5_000; // per signature
 /// One-time rent for a wallet's first IQ write (user_inventory + code_account
 /// + user_state). Measured on devnet: ~0.051 SOL; kept a little above.

@@ -267,6 +267,72 @@ pub struct PlannedPack {
     pub pack_id: String,
     pub raw_bytes: usize,
     pub size: usize,
+    /// Sent in several transactions with IQ's chunked upload (0 = one
+    /// direct write).
+    pub chunks: usize,
+    /// Unsaved rows (indexes in the draft table) this pack saves.
+    pub ghosts: Vec<usize>,
+}
+
+impl PlannedPack {
+    /// What writing this pack costs (program fee + network fees, and the
+    /// session account's deposit).
+    pub fn cost(&self) -> u64 {
+        write_cost(self.chunks)
+    }
+}
+
+/// Cost of one write: direct (chunks = 0), a linked list (< 10 chunks) or a
+/// session (10+). Measured against IQ's program on devnet.
+pub fn write_cost(chunks: usize) -> u64 {
+    let tx = iq::TX_FEE;
+    match chunks {
+        0 => iq::FEE_DIRECT_WRITE + tx,
+        n if n < iq::LINKED_LIST_THRESHOLD => iq::FEE_LINKED_WRITE + (n as u64 + 1) * tx,
+        n => iq::FEE_SESSION_WRITE + iq::SESSION_RENT_ESTIMATE + (n as u64 + 1) * tx,
+    }
+}
+
+/// Chunks the SDK would split this row into (`to_chunks` over the row JSON).
+pub fn chunk_count(payload: &str, chunk_size: usize) -> usize {
+    let row = row_json(payload);
+    if row.len() <= chunk_size {
+        return 1;
+    }
+    iq::to_chunks(&row, chunk_size).len()
+}
+
+/// The cheapest way to write these records: one direct write per pack (the
+/// old way, each ≤ `cap`), or everything as one pack sent in chunks (IQ's
+/// linked-list or session upload — cheaper from about four packs on, has no
+/// size limit, and appears all at once when its last transaction lands).
+pub fn plan_best(schema: &Schema, recs: &[Record], cap: usize, chunk_size: usize, compress: bool) -> Result<Vec<PlannedPack>, String> {
+    if recs.is_empty() {
+        return Ok(vec![]);
+    }
+    let direct = plan(schema, recs, cap, compress);
+    let direct_cost = direct.as_ref().map(|p| p.iter().map(|x| x.cost()).sum::<u64>()).ok();
+    if let Ok(p) = &direct {
+        if p.len() <= 1 {
+            return direct;
+        }
+    }
+    let payload = encode_payload(schema, recs, compress);
+    let n = chunk_count(&payload, chunk_size);
+    let one = PlannedPack {
+        first: 0,
+        count: recs.len(),
+        pack_id: pack_id(&payload),
+        raw_bytes: layout(schema, recs).len(),
+        size: payload.len(),
+        chunks: n.max(2),
+        payload,
+        ghosts: vec![],
+    };
+    match direct_cost {
+        Some(c) if c <= one.cost() => direct,
+        _ => Ok(vec![one]),
+    }
 }
 
 /// Split records into as few packs as possible, each small enough to be
@@ -335,6 +401,8 @@ pub fn plan(schema: &Schema, recs: &[Record], cap: usize, compress: bool) -> Res
             raw_bytes: layout(schema, &recs[i..i + good]).len(),
             payload: good_p,
             size,
+            chunks: 0,
+            ghosts: vec![],
         });
         i += good;
     }
@@ -345,6 +413,8 @@ pub fn plan(schema: &Schema, recs: &[Record], cap: usize, compress: bool) -> Res
 
 #[derive(Clone, Debug)]
 pub struct SourcePack {
+    /// The on-chain row's id (the pack id).
+    pub id: String,
     pub tx: String,
     pub signer: String,
     pub time: Option<i64>,
@@ -377,7 +447,39 @@ pub fn merge_events(packs: &[SourcePack], official: &dyn Fn(&str) -> bool, take:
     let mut order: Vec<String> = vec![];
     let mut map: std::collections::HashMap<String, Merged> = std::collections::HashMap::new();
     let mut doc: Option<crate::schema::Doc> = None;
-    for p in packs {
+    // The newest official checkpoint whose packs are all here: start from its
+    // packs (the whole table as the owner saved it) and replay only what came
+    // after them.
+    let mut start = 0;
+    let mut skip: Vec<usize> = vec![];
+    if let Some((ci, d)) = latest_checkpoint(packs, official) {
+        let idx: Vec<usize> = d.snap.iter().filter_map(|id| packs[..ci].iter().rposition(|p| p.meta.is_none() && p.id == *id && official(&p.signer))).collect();
+        if idx.len() == d.snap.len() {
+            let first = *idx.iter().min().unwrap();
+            for &i in &idx {
+                if take(&packs[i]) {
+                    apply_records(&packs[i], &mut map, &mut order);
+                }
+            }
+            let mut plain = d.clone();
+            plain.snap.clear();
+            doc = Some(plain);
+            skip = idx;
+            skip.push(ci);
+            // structure records between the snapshot and the checkpoint are
+            // already part of it
+            for (i, p) in packs.iter().enumerate().take(ci).skip(first) {
+                if p.meta.is_some() {
+                    skip.push(i);
+                }
+            }
+            start = first;
+        }
+    }
+    for (pi, p) in packs.iter().enumerate().skip(start) {
+        if skip.contains(&pi) {
+            continue;
+        }
         if let Some(m) = &p.meta {
             if !official(&p.signer) {
                 continue;
@@ -409,23 +511,53 @@ pub fn merge_events(packs: &[SourcePack], official: &dyn Fn(&str) -> bool, take:
         if !take(p) {
             continue;
         }
-        for r in &p.recs {
-            let key = r.key(&p.schema);
-            if r.deleted {
-                map.remove(&key);
-                continue;
-            }
-            let vals: Vec<(String, Json)> =
-                p.schema.cols.iter().cloned().zip(r.vals.iter().cloned()).collect();
-            let versions = map.get(&key).map(|m| m.versions + 1).unwrap_or(1);
-            if !map.contains_key(&key) {
-                order.push(key.clone());
-            }
-            map.insert(
-                key.clone(),
-                Merged { key, vals, tx: p.tx.clone(), signer: p.signer.clone(), time: p.time, versions },
-            );
-        }
+        apply_records(p, &mut map, &mut order);
     }
     (order.into_iter().filter_map(|k| map.remove(&k)).collect(), doc)
+}
+
+fn apply_records(p: &SourcePack, map: &mut std::collections::HashMap<String, Merged>, order: &mut Vec<String>) {
+    for r in &p.recs {
+        let key = r.key(&p.schema);
+        if r.deleted {
+            map.remove(&key);
+            continue;
+        }
+        let vals: Vec<(String, Json)> = p.schema.cols.iter().cloned().zip(r.vals.iter().cloned()).collect();
+        let versions = map.get(&key).map(|m| m.versions + 1).unwrap_or(1);
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key.clone(), Merged { key, vals, tx: p.tx.clone(), signer: p.signer.clone(), time: p.time, versions });
+    }
+}
+
+/// The newest checkpoint written by the owner: (position, its record).
+pub fn latest_checkpoint(packs: &[SourcePack], official: &dyn Fn(&str) -> bool) -> Option<(usize, crate::schema::Doc)> {
+    packs.iter().enumerate().rev().find_map(|(i, p)| {
+        let m = p.meta.as_ref()?;
+        if !official(&p.signer) {
+            return None;
+        }
+        let d = crate::schema::Doc::from_json(m)?;
+        (!d.snap.is_empty()).then_some((i, d))
+    })
+}
+
+/// Reading newest first: has a complete official checkpoint been seen, so
+/// older history isn't needed?
+pub fn checkpoint_covers(newest_first: &[SourcePack], official: &dyn Fn(&str) -> bool) -> bool {
+    for (i, p) in newest_first.iter().enumerate() {
+        let Some(m) = &p.meta else { continue };
+        if !official(&p.signer) {
+            continue;
+        }
+        let Some(d) = crate::schema::Doc::from_json(m) else { continue };
+        if d.snap.is_empty() {
+            continue;
+        }
+        // its snapshot packs come after it in newest-first order
+        return d.snap.iter().all(|id| newest_first[i..].iter().any(|q| q.meta.is_none() && q.id == *id && official(&q.signer)));
+    }
+    false
 }

@@ -1,8 +1,11 @@
 //! Files in table cells, and opening them again.
 //!
-//! A small file is inscribed on its own with `user_inventory_code_in` — the
-//! IQ SDK's `codeIn` direct path, same metadata, text stored as text and
-//! binary as base64 — from the database's wallet. The cell then holds an
+//! A file is inscribed on its own with IQ's `codeIn`, like the SDK does it,
+//! from the database's wallet: a small one in one `user_inventory_code_in`
+//! (text stored as text, binary as base64); a bigger one in parts — a linked
+//! list of `send_code` transactions below 10 parts, a session of
+//! `post_chunk`s from 10 — finalized by a `user_inventory_code_in` that
+//! points at them. The cell then holds an
 //! `iq://tx/<signature>#<filename>` link. Opening a link asks IQ's gateway
 //! (`/data/<sig>`) first and falls back to reading the transaction from
 //! Solana, so it works for files inscribed by any IQ tool.
@@ -24,6 +27,10 @@ pub enum Stage {
     /// Grow pre-upgrade accounts so a v1 (4 KB) write fits.
     Grow(Vec<(Pubkey, u64)>),
     Write,
+    /// Part `i` of a file sent in parts.
+    Chunk(usize),
+    /// The code-in that points at the parts.
+    Final,
 }
 
 #[derive(Clone)]
@@ -40,6 +47,16 @@ pub struct Job {
     pub stage: Stage,
     /// Already topped up from the main balance once.
     pub funded: bool,
+    /// The file's content as stored (text, or base64 for binary files).
+    pub data: String,
+    pub filetype: String,
+    /// Parts, when the file is too big for one transaction.
+    pub chunks: Vec<String>,
+    /// Session sequence number (None = linked list).
+    pub seq: Option<u64>,
+    pub session_exists: Option<bool>,
+    /// Signature of the last part sent.
+    pub last: Option<String>,
 }
 
 impl Job {
@@ -47,6 +64,9 @@ impl Job {
         format!("{}:{}:{}", self.key, self.t, self.r)
     }
 }
+
+/// Biggest file that goes into a cell (after base64 for binary files).
+pub const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// An opened `iq://tx/…` link.
 pub struct Viewed {
@@ -106,6 +126,25 @@ pub fn viewed(filetype: &str, filename: &str, data: String, signer: String, time
         note: None,
         source,
     };
+    // a file of an IQ git commit: base64 bytes stored as octet-stream
+    if let Some(path) = filename.strip_prefix("iqgit-blob:") {
+        v.filename = path.to_string();
+        v.filetype = crate::git::filetype_of(path).to_string();
+        if let Some(b) = base64_decode(data.trim()) {
+            let img = inline_image(&v.filetype) && v.filetype != "image/svg+xml";
+            match String::from_utf8(b) {
+                Ok(t) if !img && !t.contains('\0') => v.text = Some(t),
+                Ok(t) => v.bytes = Some(t.into_bytes()),
+                Err(e) => {
+                    if v.filetype.starts_with("text/") {
+                        v.filetype = "application/octet-stream".into();
+                    }
+                    v.bytes = Some(e.into_bytes());
+                }
+            }
+            return v;
+        }
+    }
     if !is_text(&v.filetype) && looks_b64(&data) {
         if let Some(b) = base64_decode(data.trim()) {
             v.bytes = Some(b);
@@ -223,19 +262,10 @@ impl App {
         };
         let metadata = iq::file_metadata(&ftype, &name, &data);
         let size = metadata.len();
-        let legacy_only = self.settings.tx_format == TxFormat::Legacy;
-        let cap = if legacy_only { iq::INLINE_CAP_LEGACY } else { iq::INLINE_CAP_V1 };
-        if size > cap {
-            let room = cap.saturating_sub(iq::file_metadata(&ftype, &name, "").len());
-            return self.err(format!(
-                "{} is {} once encoded; a one-transaction file can carry {} (about {} of binary data or {} of text). Bigger files need IQ's chunked upload, which the portal doesn't do yet.",
-                name,
-                ui::bytes(size),
-                ui::bytes(cap),
-                ui::bytes(room * 3 / 4),
-                ui::bytes(room)
-            ));
+        if data.len() > MAX_FILE_BYTES {
+            return self.err(format!("{} is {} once encoded; files up to {} can go into a cell here.", name, ui::bytes(data.len()), ui::bytes(MAX_FILE_BYTES)));
         }
+        let legacy_only = self.settings.tx_format == TxFormat::Legacy;
         let job = Job {
             key,
             t,
@@ -248,6 +278,12 @@ impl App {
             iq_ata: None,
             stage: Stage::Write,
             funded: false,
+            data,
+            filetype: ftype,
+            chunks: vec![],
+            seq: None,
+            session_exists: None,
+            last: None,
         };
         if let Some(m) = self.account.as_ref().and_then(|a| a.main()).map(|w| w.address()) {
             self.fetch_balance(&m);
@@ -274,6 +310,7 @@ impl App {
             iq::ata(&user, &mint, &solana::pk(iq::TOKEN_2022_STR)),
             solana::pk(iq::TX_V1_FEATURE_GATE_STR),
             user,
+            iq::user_state_pda(&user),
         ];
         let params = Json::Arr(vec![
             Json::Arr(addrs.iter().map(|a| json::s(&b58(a))).collect()),
@@ -288,6 +325,8 @@ impl App {
             Stage::Init => "Setting up the wallet's IQ account (one time)…".to_string(),
             Stage::Grow(_) => "Enlarging the wallet's IQ accounts for 4 KB writes (one time)…".to_string(),
             Stage::Write => format!("Inscribing {}…", job.filename),
+            Stage::Chunk(i) => format!("Inscribing {} — part {} of {}…", job.filename, i + 1, job.chunks.len()),
+            Stage::Final => format!("Finishing {}…", job.filename),
         };
         self.attach_status_set(&job, &msg);
         let params = json::parse("[{\"commitment\":\"confirmed\"}]").unwrap();
@@ -312,10 +351,16 @@ impl App {
                 self.attach_check(job) // re-read sizes (pre-upgrade accounts need growing)
             }
             Stage::Grow(_) => {
-                job.stage = Stage::Write;
+                job.stage = if job.chunks.is_empty() { Stage::Write } else { Stage::Chunk(0) };
                 self.attach_send(job);
             }
-            Stage::Write => self.attach_done(job, sig),
+            Stage::Write | Stage::Final => self.attach_done(job, sig),
+            Stage::Chunk(i) => {
+                job.last = Some(sig.to_string());
+                job.session_exists = Some(true);
+                job.stage = if i + 1 < job.chunks.len() { Stage::Chunk(i + 1) } else { Stage::Final };
+                self.attach_send(job);
+            }
         }
     }
 
@@ -415,16 +460,25 @@ impl App {
                     None
                 };
                 let bal = vals.get(5).and_then(|x| x.get("lamports").u64()).unwrap_or(0);
-                if !job.legacy && !vals.get(4).map(iq::v1_active).unwrap_or(false) {
-                    self.attach_fail(format!(
-                        "{} needs a v1 transaction (it's over {} encoded), and v1 transactions aren't active on {} yet. Files up to about 500 bytes work now.",
-                        job.filename,
-                        ui::bytes(iq::INLINE_CAP_LEGACY),
-                        self.settings.cluster
-                    ));
-                    return true;
+                // v1 (4 KB) transactions when the cluster has them, like the SDK
+                let v1 = self.settings.tx_format != TxFormat::Legacy && vals.get(4).map(iq::v1_active).unwrap_or(false);
+                let cap = if v1 { iq::INLINE_CAP_V1 } else { iq::INLINE_CAP_LEGACY };
+                job.legacy = !v1 || job.metadata.len() <= iq::INLINE_CAP_LEGACY;
+                if job.metadata.len() > cap {
+                    // too big for one transaction: IQ's chunked upload, as the SDK splits it
+                    if job.chunks.is_empty() {
+                        job.chunks = iq::to_chunks(&job.data, if v1 { iq::CHUNK_SIZE_V1 } else { iq::CHUNK_SIZE_LEGACY });
+                    }
+                    if job.chunks.len() >= iq::LINKED_LIST_THRESHOLD && job.seq.is_none() {
+                        job.seq = Some(vals.get(6).and_then(net::account_data).and_then(|d| iq::decode_user_state_seq(&d)).unwrap_or(0));
+                    }
+                } else {
+                    job.chunks.clear();
                 }
-                let write = iq::FEE_DIRECT_WRITE + iq::TX_FEE;
+                let write = match job.chunks.len() {
+                    0 => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
+                    n => crate::pack::write_cost(n),
+                };
                 let (stage, need) = if !exists(0) {
                     (Stage::Init, iq::USER_INIT_RENT_ESTIMATE + write + iq::TX_FEE)
                 } else {
@@ -437,8 +491,14 @@ impl App {
                             grow.push((iq::code_account_pda(&user), iq::CODE_ACCOUNT_SPACE));
                         }
                     }
+                    let first = match (&job.stage, job.chunks.is_empty()) {
+                        (Stage::Chunk(i), false) => Stage::Chunk(*i),
+                        (Stage::Final, false) => Stage::Final,
+                        (_, false) => Stage::Chunk(0),
+                        _ => Stage::Write,
+                    };
                     if grow.is_empty() {
-                        (Stage::Write, write)
+                        (first, write)
                     } else {
                         (Stage::Grow(grow), 50_000_000 + write)
                     }
@@ -467,6 +527,17 @@ impl App {
                     return true;
                 }
                 job.stage = stage;
+                // an interrupted session is continued rather than re-created
+                if let (Some(seq), None, Stage::Chunk(0)) = (job.seq, job.session_exists, &job.stage) {
+                    let sess = iq::session_pda(&user, seq);
+                    let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", b58(&sess))).unwrap();
+                    self.rpc("getAccountInfo", params, P::AttachSession(job));
+                    return true;
+                }
+                self.attach_send(job);
+            }
+            P::AttachSession(mut job) => {
+                job.session_exists = Some(res().map(|v| !v.get("value").is_null()).unwrap_or(false));
                 self.attach_send(job);
             }
             P::AttachHash(job) => {
@@ -479,9 +550,27 @@ impl App {
                     Stage::Init => vec![iq::user_initialize(&kp.pubkey)],
                     Stage::Grow(list) => list.iter().map(|(t, n)| iq::realloc_account(&kp.pubkey, t, *n)).collect(),
                     Stage::Write => vec![iq::user_inventory_code_in_inline(&kp.pubkey, &job.metadata, job.iq_ata)],
+                    Stage::Chunk(i) => match job.seq {
+                        None => vec![iq::send_code(&kp.pubkey, &job.chunks[*i], job.last.as_deref().filter(|_| *i > 0).unwrap_or("Genesis"))],
+                        Some(seq) => {
+                            let mut v = vec![];
+                            if *i == 0 && job.session_exists != Some(true) {
+                                v.push(iq::create_session(&kp.pubkey, seq));
+                            }
+                            v.push(iq::post_chunk(&kp.pubkey, seq, *i as u32, &job.chunks[*i]));
+                            v
+                        }
+                    },
+                    Stage::Final => {
+                        let path = match job.seq {
+                            Some(seq) => iq::ChunkPath::Session { seq, total: job.chunks.len() as u32 },
+                            None => iq::ChunkPath::Linked(job.last.clone().unwrap_or_default()),
+                        };
+                        vec![iq::user_inventory_code_in(&kp.pubkey, &path, &iq::chunked_metadata(&job.filetype, &job.filename, job.chunks.len()), None)]
+                    }
                 };
                 let msg = solana::compile(&kp.pubkey, &ixs, bh);
-                let v1 = job.stage == Stage::Write && !job.legacy;
+                let v1 = matches!(job.stage, Stage::Write | Stage::Chunk(_) | Stage::Final) && !job.legacy;
                 let (raw, _) = if v1 { solana::v1_signed(&msg, &kp.seed) } else { solana::legacy_signed(&msg, &kp.seed) };
                 let limit = if v1 { solana::V1_MAX_TX_BYTES } else { solana::LEGACY_MAX_TX_BYTES };
                 if raw.len() > limit {
@@ -498,7 +587,8 @@ impl App {
                     let what = match job.stage {
                         Stage::Init => "Wallet setup".to_string(),
                         Stage::Grow(_) => "Account resize".to_string(),
-                        Stage::Write => format!("File {}", job.filename),
+                        Stage::Write | Stage::Final => format!("File {}", job.filename),
+                        Stage::Chunk(i) => format!("Part {} of {}", i + 1, job.filename),
                     };
                     let now = host::now_ms();
                     self.timer(1200, P::ConfirmTick { what, sig, since: now, after: After::Attach(job) });

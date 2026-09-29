@@ -135,6 +135,28 @@ fn instructions_match_sdk() {
     same_ix(&iq::update_table(&signer, &uspec(Some(&w2))), x.get("updateTableLocked"), "update_table locked");
     same_ix(&iq::update_table(&signer, &uspec(Some(&[]))), x.get("updateTableOpen"), "update_table open");
     same_ix(&iq::update_db_root_table_list(&signer, &db_id, &[b"fasteners".to_vec(), b"suppliers".to_vec()]), x.get("updateTableList"), "update_db_root_table_list");
+    // data bigger than one transaction
+    let c = f.get("chunks");
+    assert_eq!(crate::solana::b58(&iq::session_pda(&signer, 3)), c.get("session").str().unwrap(), "session pda");
+    let text = c.get("text").str().unwrap();
+    for (size, key) in [(iq::CHUNK_SIZE_V1, "v1"), (iq::CHUNK_SIZE_LEGACY, "legacy")] {
+        let want: Vec<String> = c.get(key).arr().iter().map(|v| v.str_or("")).collect();
+        assert_eq!(iq::to_chunks(text, size), want, "chunking at {}", size);
+    }
+    same_ix(&iq::send_code(&signer, "chunk é", "Genesis"), x.get("sendCode"), "send_code");
+    same_ix(&iq::create_session(&signer, 3), x.get("createSession"), "create_session");
+    same_ix(&iq::post_chunk(&signer, 3, 5, "part five"), x.get("postChunk"), "post_chunk");
+    let md = c.get("metadata").str().unwrap();
+    assert_eq!(iq::chunked_metadata("application/octet-stream", "3.bin", 12), md);
+    let tail = iq::ChunkPath::Linked(c.get("tail").str().unwrap().to_string());
+    let sess = iq::ChunkPath::Session { seq: 3, total: 12 };
+    same_ix(&iq::db_code_in(&signer, &db_id, &seed, &tail, md, None), x.get("dbCodeInLinked"), "db_code_in linked list");
+    same_ix(&iq::db_code_in(&signer, &db_id, &seed, &sess, md, None), x.get("dbCodeInSession"), "db_code_in session");
+    same_ix(&iq::user_inventory_code_in(&signer, &tail, md, None), x.get("inventoryLinked"), "user_inventory_code_in linked list");
+    same_ix(&iq::user_inventory_code_in(&signer, &sess, md, None), x.get("inventorySession"), "user_inventory_code_in session");
+    let inline = iq::ChunkPath::Inline;
+    let row_md = iq::inline_metadata(7, row);
+    same_ix(&iq::db_code_in(&signer, &db_id, &seed, &inline, &row_md, Some(ata)), x.get("dbCodeInAta"), "db_code_in (general) inline");
 }
 
 #[test]
@@ -292,7 +314,7 @@ fn packs_roundtrip_and_fit() {
 fn merge_latest_wins_and_tombstones() {
     let schema = pack::Schema { cols: vec!["id".into(), "v".into()], id: 0 };
     let rec = |id: &str, v: i32, del: bool| pack::Record { vals: vec![json::s(id), json::n(v)], deleted: del };
-    let sp = |tx: &str, recs| pack::SourcePack { tx: tx.into(), signer: "S".into(), time: None, schema: schema.clone(), recs, meta: None };
+    let sp = |tx: &str, recs| pack::SourcePack { id: tx.into(), tx: tx.into(), signer: "S".into(), time: None, schema: schema.clone(), recs, meta: None };
     let merged = pack::merge(&[
         sp("t1", vec![rec("a", 1, false), rec("b", 2, false), rec("c", 3, false)]),
         sp("t2", vec![rec("a", 10, false), rec("b", 0, true)]),
@@ -560,4 +582,50 @@ fn dropping_a_table_forgets_what_was_computed_for_its_position() {
     assert_eq!((count(&mut app, 0), count(&mut app, 1)), (1, 3));
     app.run_sql("k", "DROP TABLE a");
     assert_eq!(count(&mut app, 0), 3, "table b moved to position 0; its own plan is used");
+}
+
+#[test]
+fn iq_git_links() {
+    use crate::git;
+    // addresses as they exist on mainnet (IQ git's own derivation)
+    let owner = "BniQFboKCynd5Xfwb3nWudAaDq4pa3yWq4zjNHVespG4";
+    let pda = "FLYAenCNTwiR7FaxDuVuxkqWtSXs6oNXjzZrwWimwAPt";
+    assert_eq!(b58(&iq::db_root_pda(&iq::seed_bytes(git::GIT_DB))), "AVJUfjuGiJcsGVZT13gD3vAbJqXPcrXXMcTZJuTgCs5x");
+    assert_eq!(git::commits_pda(owner, "blockchain-internet"), pda);
+    assert_eq!(git::browser_pda(&format!("https://browser.iqlabs.dev/{}", pda)), Some(pda));
+    assert_eq!(git::browser_pda(&format!("browser.iqlabs.dev/{}/", pda)), Some(pda));
+    assert_eq!(git::browser_pda("https://browser.iqlabs.dev/alice.sol"), None);
+    let name = format!("git_commits:{}:blockchain-internet", owner);
+    assert_eq!(git::repo_of(pda, &name), Some((owner.to_string(), "blockchain-internet".to_string())));
+    // the same name on a table somewhere else isn't the repository
+    assert_eq!(git::repo_of("GFLaoPfndXaxHZE3GpZ3NysTLwNuXA4xp2R1CmUFuFY2", &name), None);
+    assert_eq!(git::repo_of(pda, "notes"), None);
+    // gateway rows (shape as served by gateway.iqlabs.dev), plus a row someone else inscribed
+    let tree_a = "5ZpBaYn9HsCV8wpbzj1yoiqTTn6UkNoq3RuhkCKBJdiroxqxPjXgdt24eoJ9kGep52FTX88n26A9Vkw3bDy94p2z";
+    let tree_b = "2uRwrfNobjpMiSUmVfMcxa5fc1i2JJhDNJRPkxLX1TD8X55r3S9Y9ftYEBEMb46hRAxzQVmQg2ws1v6USzsdjnDj";
+    let rows = json::parse(&format!(
+        r#"[{{"id":"7f5f5851","message":"first","treeTxId":"{a}","timestamp":1781197549125,"author":"{o}","__signer":"{o}"}},
+            {{"id":"a8ccd41d","message":"edit\nmore","treeTxId":"{b}","parentCommitId":"7f5f5851","timestamp":1781198047455,"author":"{o}","__signer":"{o}"}},
+            {{"id":"spoof","message":"totally the latest","treeTxId":"{b}","timestamp":1799999999999,"author":"{o}","__signer":"GFLaoPfndXaxHZE3GpZ3NysTLwNuXA4xp2R1CmUFuFY2"}}]"#,
+        a = tree_a,
+        b = tree_b,
+        o = owner
+    ))
+    .unwrap();
+    let c = git::parse_commits(rows.arr(), owner);
+    assert_eq!(c.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["a8ccd41d", "7f5f5851"], "newest first, owner's commits only");
+    assert_eq!(c[0].parent, "7f5f5851");
+    assert!(git::pinned_link("blockchain-internet", &c[0]).starts_with(&format!("iq://tx/{}#blockchain-internet%40a8ccd41d", tree_b)));
+    let (sig, label) = crate::attach::parse_tx_link(&git::pinned_link("blockchain-internet", &c[0])).unwrap();
+    assert_eq!((sig.as_str(), label.as_str()), (tree_b, "blockchain-internet@a8ccd41d"));
+    // a tree inscription and a file of it
+    let tree = git::parse_tree(r#"{"iqpages.json":{"txId":"21Y6pXb84UfKxQDsJjWuw3hEv1yrgjzvwdMvA54zcc78TbSxhRzBh8Th8k9w7SdyPDgpSSjj63GX4PpHEECnGLez","hash":"31"},"index.html":{"txId":"2sWxhbizTf5EhJ96pWzf43QJnGshbGDD35ZrzcsM4v6dhL2qufiqAoc1jWeuRruiXif5sXsywAoRVWDrkymen2RM","hash":"c9"}}"#).unwrap();
+    assert_eq!(tree.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), vec!["index.html", "iqpages.json"]);
+    assert_eq!(git::parse_tree(r#"{"a":{"nope":1}}"#), None);
+    let v = crate::attach::viewed("application/octet-stream", "iqgit-blob:index.html", crate::crypto::base64_encode(b"<!doctype html>\n<p>hi</p>"), owner.into(), None, "IQ gateway");
+    assert_eq!((v.filename.as_str(), v.filetype.as_str(), v.text.as_deref()), ("index.html", "text/html", Some("<!doctype html>\n<p>hi</p>")));
+    let v = crate::attach::viewed("application/octet-stream", "iqgit-blob:logo.png", crate::crypto::base64_encode(&[137, 80, 78, 71, 0, 1]), owner.into(), None, "IQ gateway");
+    assert_eq!((v.filetype.as_str(), v.bytes.as_ref().map(|b| b.len())), ("image/png", Some(6)));
+    assert_eq!(git::ago(10_000_000.0, 10_000_000 - 3 * 86_400_000), "3 days ago");
+    assert_eq!(git::ago(10_000_000.0, 10_000_000 - 3_600_000), "1 hour ago");
 }

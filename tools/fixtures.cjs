@@ -206,6 +206,38 @@ out.ix.updateTableList = ser(
   iq.contract.updateDbRootTableListInstruction(b, { db_root: root, signer }, { db_root_id: dbId, new_table_seeds: ["fasteners", "suppliers"].map((s) => Buffer.from(s)) })
 );
 
+// data bigger than one transaction (the SDK's prepareCodeIn linked-list and session paths)
+{
+  const BN = require("@coral-xyz/anchor").BN;
+  const sess = iq.contract.getSessionPda(signer, 3, pid);
+  const RECV = new PublicKey(iq.constants.DEFAULT_WRITE_FEE_RECEIVER);
+  const tail = bs58.encode(rnd(64));
+  const bigRow = JSON.stringify({ id: "big", p: "é漢".repeat(2000) + "x".repeat(333) });
+  out.chunks = {
+    text: bigRow,
+    tail,
+    session: sess.toBase58(),
+    metadata: JSON.stringify({ filetype: "application/octet-stream", method: 0, filename: "3.bin", total_chunks: 12 }),
+  };
+  out.ix.sendCode = ser(iq.contract.sendCodeInstruction(b, { user: signer, code_account: iq.contract.getCodeAccountPda(signer, pid), system_program: SYS }, { code: "chunk é", before_tx: "Genesis", method: 0, decode_break: 0 }));
+  out.ix.createSession = ser(iq.contract.createSessionInstruction(b, { user: signer, user_state: iq.contract.getUserPda(signer, pid), session: sess, system_program: SYS }, { seq: new BN(3) }));
+  out.ix.postChunk = ser(iq.contract.postChunkInstruction(b, { user: signer, session: sess }, { index: 5, chunk: "part five", method: 0, decode_break: 0 }));
+  const dbAcc = (session) => ({
+    user: signer, signer, user_inventory: iq.contract.getUserInventoryPda(signer, pid), db_root: root,
+    table: iq.contract.getTablePda(root, tseed, pid), system_program: SYS, receiver: RECV, session, iq_ata: undefined,
+  });
+  out.ix.dbCodeInLinked = ser(iq.contract.dbCodeInInstruction(b, dbAcc(undefined), { db_root_id: dbId, table_seed: tseed, on_chain_path: tail, metadata: out.chunks.metadata, session: null }));
+  out.ix.dbCodeInSession = ser(iq.contract.dbCodeInInstruction(b, dbAcc(sess), { db_root_id: dbId, table_seed: tseed, on_chain_path: sess.toBase58(), metadata: out.chunks.metadata, session: { seq: new BN(3), total_chunks: 12 } }));
+  const invAcc = (session) => ({ user: signer, user_inventory: iq.contract.getUserInventoryPda(signer, pid), system_program: SYS, receiver: RECV, session, iq_ata: undefined });
+  out.ix.inventoryLinked = ser(iq.contract.userInventoryCodeInInstruction(b, invAcc(undefined), { on_chain_path: tail, metadata: out.chunks.metadata, session: null }));
+  out.ix.inventorySession = ser(iq.contract.userInventoryCodeInInstruction(b, invAcc(sess), { on_chain_path: sess.toBase58(), metadata: out.chunks.metadata, session: { seq: new BN(3), total_chunks: 12 } }));
+  // the SDK's own chunking of the same text at both sizes
+  const src = fs.readFileSync(SDK_DIST + "/sdk/writer/code_in.js", "utf8");
+  const toChunks = new Function("Buffer", src.match(/function toChunks[\s\S]*?\n}\n/)[0] + "; return toChunks;")(Buffer);
+  out.chunks.v1 = toChunks(bigRow, iq.constants.CHUNK_SIZE_V1 || 3600);
+  out.chunks.legacy = toChunks(bigRow, iq.constants.CHUNK_SIZE || 850);
+}
+
 // ATA derivation
 const owner = new PublicKey(rnd(32));
 const mint = new PublicKey(iq.constants.DEFAULT_IQ_MINT);

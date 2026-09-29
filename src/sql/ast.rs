@@ -260,6 +260,8 @@ pub enum Stmt {
     DropTable { names: Vec<String>, if_exists: bool },
     RenameTable(Vec<(String, String)>),
     Truncate(String),
+    /// OPTIMIZE TABLE a, b: write a checkpoint for each on the next save.
+    Optimize(Vec<String>),
     CreateView { name: String, or_replace: bool, cols: Vec<String>, sql: String, q: Box<Query> },
     DropView { names: Vec<String>, if_exists: bool },
     CreateIndex { name: String, table: String, cols: Vec<String>, unique: bool },

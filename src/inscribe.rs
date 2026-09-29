@@ -24,14 +24,43 @@ pub enum StepKind {
     /// Grow accounts made by the pre-upgrade program so v1 writes fit.
     Grow(Vec<(Pubkey, u64)>),
     Pack { t: usize, rows: Vec<usize>, payload: String, pack_id: String, count: usize },
-    /// A table-structure record (types, keys, renames; TRUNCATE / DROP).
-    Schema { t: usize, payload: String, doc: String },
+    /// A table-structure record (types, keys, renames; TRUNCATE / DROP; a
+    /// checkpoint, which also marks `rows` saved).
+    Schema { t: usize, payload: String, doc: String, rows: Vec<usize>, checkpoint: bool },
+    /// One part of a record sent with IQ's chunked upload (`send_code` for a
+    /// linked list, `create_session` + `post_chunk` for a session).
+    Chunk { job: usize, i: usize },
+    /// The `db_code_in` that makes a chunked record appear.
+    Finalize { job: usize },
     /// Rename a table or change who may write to it (grow the account first if needed).
     /// Rename / change writers; the table's own columns, ID column and
     /// ext keys are kept as the chain has them.
     UpdateTable { t: usize, realloc: Option<u64>, cols: Vec<String>, id_col: String, ext: Vec<String> },
     /// Rewrite the database's table list (a dropped table comes off it).
     TableList { seeds: Vec<Vec<u8>>, realloc: Option<u64> },
+}
+
+/// A record too big for one transaction (or cheaper in parts).
+#[derive(Clone, Debug)]
+pub struct Job {
+    /// What it becomes once finalized: a Pack or a Schema step.
+    pub what: StepKind,
+    pub chunks: Vec<String>,
+    /// Session sequence number (None = linked list).
+    pub seq: Option<u64>,
+    /// Whether the session account already exists (an interrupted upload).
+    pub exists: Option<bool>,
+    /// Signature of the last chunk sent (the linked list's tail).
+    pub last: Option<String>,
+}
+
+impl Job {
+    pub fn table(&self) -> usize {
+        match &self.what {
+            StepKind::Pack { t, .. } | StepKind::Schema { t, .. } => *t,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +85,8 @@ pub enum RunOp {
     RootData,
     Blockhash,
     Simulate,
+    /// Does an interrupted session's account exist already?
+    Session,
     Send,
     Status,
     Tick,
@@ -84,6 +115,7 @@ pub struct Run {
     pub contributor: bool,
     /// Dropped tables whose record is written: leave the editor when done.
     pub dropped_done: Vec<String>,
+    pub jobs: Vec<Job>,
 }
 
 impl Run {
@@ -111,15 +143,30 @@ impl Run {
                 tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?"),
                 pack_id
             ),
-            StepKind::Schema { t, .. } => {
+            StepKind::Schema { t, checkpoint, .. } => {
                 let tb = tables.get(*t);
                 let what = match tb {
+                    _ if *checkpoint => "Checkpoint",
                     Some(x) if x.dropped => "Delete",
                     Some(x) if x.clear => "Empty and update the structure of",
                     _ => "Save the structure of",
                 };
                 format!("{} \"{}\"", what, tb.map(|x| x.title.as_str()).unwrap_or("?"))
             }
+            StepKind::Chunk { job, i } => match self.jobs.get(*job) {
+                Some(j) => format!(
+                    "Upload part {}/{} of \"{}\"{}",
+                    i + 1,
+                    j.chunks.len(),
+                    tables.get(j.table()).map(|x| x.title.as_str()).unwrap_or("?"),
+                    if j.seq.is_some() && *i == 0 { " (opens an upload session)" } else { "" }
+                ),
+                None => "Upload part".into(),
+            },
+            StepKind::Finalize { job } => match self.jobs.get(*job) {
+                Some(j) => format!("{} — one write in {} parts", self.describe(&Step { kind: j.what.clone(), sig: None, cost: None }, tables), j.chunks.len()),
+                None => "Finish upload".into(),
+            },
             StepKind::UpdateTable { t, .. } => format!("Update the name / writers of \"{}\"", tables.get(*t).map(|x| x.title.as_str()).unwrap_or("?")),
             StepKind::TableList { .. } => "Update the database's list of tables".into(),
         }
@@ -134,8 +181,38 @@ fn guard(k: &StepKind) -> u64 {
         StepKind::UserInit => iq::USER_INIT_RENT_ESTIMATE,
         StepKind::Grow(_) => 50_000_000,
         StepKind::Pack { .. } | StepKind::Schema { .. } => iq::FEE_DIRECT_WRITE + iq::TX_FEE,
+        StepKind::Chunk { .. } => iq::SESSION_RENT_ESTIMATE + iq::TX_FEE,
+        StepKind::Finalize { .. } => iq::FEE_SESSION_WRITE + iq::TX_FEE,
         StepKind::UpdateTable { realloc, .. } | StepKind::TableList { realloc, .. } => iq::TX_FEE + realloc.map(|r| iq::rent_exempt(r as usize) / 4).unwrap_or(0),
     }
+}
+
+/// A record written by itself: one direct write when it fits, else chunks.
+fn push_record(steps: &mut Vec<Step>, jobs: &mut Vec<Job>, kind: StepKind, payload: &str, cap: usize, chunk: usize, next_seq: &mut u64) {
+    if pack::inscribed_size(payload) <= cap {
+        steps.push(Step { kind, sig: None, cost: None });
+    } else {
+        push_chunked(steps, jobs, kind, payload, chunk, next_seq);
+    }
+}
+
+/// IQ's chunked upload for one record: a linked list below 10 chunks, a
+/// session from 10 (each session takes the wallet's next sequence number,
+/// which only advances when a session is finalized).
+fn push_chunked(steps: &mut Vec<Step>, jobs: &mut Vec<Job>, kind: StepKind, payload: &str, chunk: usize, next_seq: &mut u64) {
+    let chunks = iq::to_chunks(&pack::row_json(payload), chunk);
+    let seq = (chunks.len() >= iq::LINKED_LIST_THRESHOLD).then(|| {
+        let s = *next_seq;
+        *next_seq += 1;
+        s
+    });
+    let n = chunks.len();
+    let job = jobs.len();
+    jobs.push(Job { what: kind, chunks, seq, exists: None, last: None });
+    for i in 0..n {
+        steps.push(Step { kind: StepKind::Chunk { job, i }, sig: None, cost: None });
+    }
+    steps.push(Step { kind: StepKind::Finalize { job }, sig: None, cost: None });
 }
 
 impl App {
@@ -181,6 +258,7 @@ impl App {
             stop: false,
             contributor: false,
             dropped_done: vec![],
+            jobs: vec![],
         });
         self.prep();
     }
@@ -286,6 +364,12 @@ impl App {
                             ui::sol(need)
                         );
                         self.pause(msg);
+                    } else if let Some(sess) = match &r.steps[r.i].kind {
+                        StepKind::Chunk { job, i: 0 } => r.jobs.get(*job).filter(|j| j.exists.is_none()).and_then(|j| j.seq).map(|s| iq::session_pda(&r.kp.pubkey, s)),
+                        _ => None,
+                    } {
+                        let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", b58(&sess))).unwrap();
+                        self.rpc("getAccountInfo", params, P::Run(RunOp::Session));
                     } else if matches!(r.steps[r.i].kind, StepKind::Table(_)) {
                         let root = b58(&iq::db_root_pda(self.draft_name().as_bytes()));
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", root)).unwrap();
@@ -305,6 +389,22 @@ impl App {
                 }
                 Ok(None) => self.fail("The database (DbRoot) doesn't exist yet, so tables can't be created."),
                 Err(e) => self.fail(format!("Could not read the DbRoot: {}", e)),
+            },
+            RunOp::Session => match res {
+                Ok(v) => {
+                    let r = self.run.as_mut().unwrap();
+                    let exists = !v.get("value").is_null();
+                    if let StepKind::Chunk { job, .. } = r.steps[r.i].kind.clone() {
+                        if let Some(j) = r.jobs.get_mut(job) {
+                            j.exists = Some(exists);
+                            if exists {
+                                r.note(true, "An earlier upload session was interrupted; continuing it.");
+                            }
+                        }
+                    }
+                    self.request_blockhash();
+                }
+                Err(e) => self.fail(format!("Could not check the upload session: {}", e)),
             },
             RunOp::Blockhash => match res.map(|v| v.get("value").get("blockhash").str().and_then(base58::decode32)) {
                 Ok(Some(bh)) => self.build_and_go(bh),
@@ -498,6 +598,9 @@ impl App {
             }
         }
         let cap = if legacy { iq::INLINE_CAP_LEGACY } else { iq::INLINE_CAP_V1 };
+        let chunk = if legacy { iq::CHUNK_SIZE_LEGACY } else { iq::CHUNK_SIZE_V1 };
+        let mut jobs: Vec<Job> = vec![];
+        let mut next_seq = seq;
         let tables = self.drafts[di].tables.clone();
         let mut list_change = false;
         for (t, tb) in tables.iter().enumerate() {
@@ -521,32 +624,40 @@ impl App {
                     steps.push(Step { kind: StepKind::UpdateTable { t, realloc, cols, id_col, ext }, sig: None, cost: None });
                 }
             }
-            if tb.schema_changed() && !contributor {
+            // a checkpoint rewrites the table and writes its record last
+            let checkpoint = tb.checkpoint && !tb.dropped && !contributor && tb.created.is_some();
+            if tb.schema_changed() && !contributor && !checkpoint {
                 let payload = pack::encode_schema(&tb.doc().to_json(), cap);
-                if pack::inscribed_size(&payload) > cap {
-                    self.fail(format!("The structure of \"{}\" is too large for one {} transaction ({} bytes).", tb.title, if legacy { "legacy" } else { "v1" }, pack::inscribed_size(&payload)));
-                    return;
-                }
-                steps.push(Step { kind: StepKind::Schema { t, payload, doc: tb.doc_text() }, sig: None, cost: None });
+                let kind = StepKind::Schema { t, payload: payload.clone(), doc: tb.doc_text(), rows: vec![], checkpoint: false };
+                push_record(&mut steps, &mut jobs, kind, &payload, cap, chunk, &mut next_seq);
             }
             if tb.dropped {
                 list_change = true;
                 continue;
             }
             let ghost_idx: Vec<usize> = tb.rows.iter().enumerate().filter(|(_, r)| r.sig.is_none()).map(|(i, _)| i).collect();
-            if ghost_idx.is_empty() {
+            if ghost_idx.is_empty() && !checkpoint {
                 continue;
             }
             let plan = self.plan_for(&key, t, cap).clone();
             match plan {
                 Ok(packs) => {
-                    for p in packs {
-                        let rows = ghost_idx[p.first..p.first + p.count].to_vec();
-                        steps.push(Step {
-                            kind: StepKind::Pack { t, rows, payload: p.payload, pack_id: p.pack_id, count: p.count },
-                            sig: None,
-                            cost: None,
-                        });
+                    for p in &packs {
+                        let kind = StepKind::Pack { t, rows: p.ghosts.clone(), payload: p.payload.clone(), pack_id: p.pack_id.clone(), count: p.count };
+                        if p.chunks == 0 {
+                            steps.push(Step { kind, sig: None, cost: None });
+                        } else {
+                            push_chunked(&mut steps, &mut jobs, kind, &p.payload, chunk, &mut next_seq);
+                        }
+                    }
+                    if checkpoint {
+                        let mut d = tb.doc();
+                        d.dropped = false;
+                        d.clear = packs.is_empty();
+                        d.snap = packs.iter().map(|p| p.pack_id.clone()).collect();
+                        let payload = pack::encode_schema(&d.to_json(), cap);
+                        let kind = StepKind::Schema { t, payload: payload.clone(), doc: tb.doc_text(), rows: ghost_idx.clone(), checkpoint: true };
+                        push_record(&mut steps, &mut jobs, kind, &payload, cap, chunk, &mut next_seq);
                     }
                 }
                 Err(e) => {
@@ -597,6 +708,7 @@ impl App {
         }
         r.balance = Some(bal);
         r.steps = steps;
+        r.jobs = jobs;
         r.i = 0;
         let n = r.steps.len();
         if n == 0 {
@@ -701,6 +813,32 @@ impl App {
                     ixs.push(iq::realloc_account(&kp.pubkey, target, *size));
                 }
             }
+            StepKind::Chunk { job, i } => {
+                let jb = &r.jobs[*job];
+                match jb.seq {
+                    None => {
+                        let prev = if *i == 0 { "Genesis".to_string() } else { jb.last.clone().unwrap_or_else(|| "Genesis".into()) };
+                        ixs.push(iq::send_code(&kp.pubkey, &jb.chunks[*i], &prev));
+                    }
+                    Some(seq) => {
+                        if *i == 0 && jb.exists != Some(true) {
+                            ixs.push(iq::create_session(&kp.pubkey, seq));
+                        }
+                        ixs.push(iq::post_chunk(&kp.pubkey, seq, *i as u32, &jb.chunks[*i]));
+                    }
+                }
+            }
+            StepKind::Finalize { job } => {
+                let jb = &r.jobs[*job];
+                let n = jb.chunks.len();
+                let path = match jb.seq {
+                    Some(seq) => iq::ChunkPath::Session { seq, total: n as u32 },
+                    None => iq::ChunkPath::Linked(jb.last.clone().unwrap_or_default()),
+                };
+                let md = iq::chunked_metadata("application/octet-stream", &format!("{}.bin", jb.seq.unwrap_or(r.seq)), n);
+                let tb = &d.tables[jb.table()];
+                ixs.push(iq::db_code_in(&kp.pubkey, &db_id, &iq::seed_bytes(&tb.name), &path, &md, None));
+            }
             StepKind::Pack { t, payload, .. } | StepKind::Schema { t, payload, .. } => {
                 let tb = &d.tables[*t];
                 let md = iq::inline_metadata(r.seq, &pack::row_json(payload));
@@ -789,7 +927,23 @@ impl App {
         let sig = r.sig.clone().unwrap_or_default();
         let i = r.i;
         r.steps[i].sig = Some(sig.clone());
-        let kind = r.steps[i].kind.clone();
+        let mut kind = r.steps[i].kind.clone();
+        let mut chunked = false;
+        match &kind {
+            StepKind::Chunk { job, .. } => {
+                if let Some(j) = r.jobs.get_mut(*job) {
+                    j.last = Some(sig.clone());
+                    j.exists = Some(true);
+                }
+            }
+            StepKind::Finalize { job } => {
+                if let Some(j) = r.jobs.get(*job) {
+                    kind = j.what.clone();
+                    chunked = true;
+                }
+            }
+            _ => {}
+        }
         let cost = r.steps[i].cost;
         let key = r.draft.clone();
         let signer = b58(&r.kp.pubkey);
@@ -818,10 +972,19 @@ impl App {
                 x.chain_writers = Some(x.desired_writers(Some(&signer_s)));
             }
             StepKind::TableList { .. } => {}
-            StepKind::Schema { t, payload, doc } => {
+            StepKind::Chunk { .. } | StepKind::Finalize { .. } => {}
+            StepKind::Schema { t, payload, doc, rows, checkpoint } => {
                 let x = &mut self.drafts[di].tables[*t];
                 x.chain_doc = Some(doc.clone());
                 x.clear = false;
+                if *checkpoint {
+                    x.checkpoint = false;
+                    for &ri in rows {
+                        if let Some(row) = x.rows.get_mut(ri) {
+                            row.sig = Some(sig.clone());
+                        }
+                    }
+                }
                 let dropped = x.dropped.then(|| x.name.clone());
                 let root = iq::db_root_pda(self.drafts[di].name.as_bytes());
                 let tpda = b58(&iq::table_pda(&root, &iq::seed_bytes(&self.drafts[di].tables[*t].name)));
@@ -857,12 +1020,16 @@ impl App {
         }
         r.i += 1;
         let replan = matches!(kind, StepKind::UserInit) && !r.legacy;
-        if let (Some((tpda, row)), true) = (notify, self.settings.notify_gateway && self.settings.cluster != "devnet") {
+        if chunked {
+            // the gateway reassembles chunked rows itself
+            notify = None;
+        }
+        if let (Some((tpda, row)), true) = (notify, self.settings.notify_gateway) {
             // Warm the gateway cache so the explorer shows the rows right away.
             let body = format!("{{\"txSignature\":\"{}\",\"signer\":\"{}\",\"row\":{}}}", sig, signer, row);
             let id = self.nid();
             self.pending.insert(id, P::Ignore);
-            let url = format!("{}/table/{}/notify", self.settings.gateway.trim_end_matches('/'), tpda);
+            let url = format!("{}/table/{}/notify", self.gateway_url(), tpda);
             host::fetch(id, "POST", &url, &body, "application/json");
         }
         if replan {

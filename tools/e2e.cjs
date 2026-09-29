@@ -60,6 +60,8 @@ const chain = {
   txs: new Map(), // sig -> { raw (base64), blockTime }
   addrSigs: new Map(), // address -> [sig] oldest first
   files: new Map(), // sig -> { metadata, signer, blockTime }
+  codes: new Map(), // send_code tx sig -> { code, before }
+  sessions: new Map(), // session pda -> Map(index -> chunk)
   assets: new Map(), // wallet -> [asset] oldest first
   batches: 0,
 };
@@ -160,6 +162,69 @@ function decodeRoot(st, k) {
 function encodeRoot(st, k, root, size) {
   const enc = accCoder.encode("DbRoot", root);
   return enc; // caller handles sizing
+}
+
+// Reassemble data sent in chunks, the way IQ's readers do.
+function assemble(st, path, total) {
+  if (path.length >= 80) {
+    const parts = [];
+    let cur = path, guard = 0;
+    while (cur && cur !== "Genesis") {
+      const c = (st.pendingCodes || []).find((x) => x.sig === cur) || chain.codes.get(cur);
+      if (!c || ++guard > 1000) throw new Error("linked list broken at " + cur);
+      parts.unshift(c.code);
+      cur = c.before;
+    }
+    return parts.join("");
+  }
+  const m = new Map(chain.sessions.get(path) || []);
+  for (const p of st.pendingPosts || []) if (p.session === path) m.set(p.index, p.chunk);
+  const out = [];
+  for (let i = 0; i < total; i++) {
+    if (!m.has(i)) throw new Error(`session ${path} is missing chunk ${i} of ${total}`);
+    out.push(m.get(i));
+  }
+  return out.join("");
+}
+function userSeq(st, user) {
+  const a = st.accounts.get(iq.contract.getUserPda(user, PID).toBase58());
+  return a ? Number(accCoder.decode("UserState", a.data).total_session_files.toString()) : 0;
+}
+// A chunked finalize: fee by method (as measured on devnet), the session is
+// closed and the user's sequence number advances.
+function finalizeChunks(st, signer, a, ix, sessionIdx) {
+  const md = JSON.parse(a.metadata);
+  if (md.data !== undefined) throw new Error("chunked metadata must not carry data");
+  if (md.total_chunks === undefined) throw new Error("chunked metadata needs total_chunks");
+  let data;
+  if (a.session) {
+    const seq = Number(a.session.seq.toString());
+    const sess = iq.contract.getSessionPda(signer, seq, PID).toBase58();
+    if (a.on_chain_path !== sess) throw new Error("session path mismatch");
+    if (ix.keys[sessionIdx].pubkey.toBase58() !== sess) throw new Error("session account mismatch");
+    if (seq !== userSeq(st, signer)) throw new Error(`session seq ${seq} != user_state ${userSeq(st, signer)}`);
+    const acc = st.accounts.get(sess);
+    if (!acc) throw new Error("session not found");
+    if (acc.data[13] === 1) throw new Error("custom program error: 0x177e SessionFinalized");
+    acc.data.writeUInt32LE(a.session.total_chunks, 9);
+    acc.data[13] = 1;
+    data = assemble(st, sess, a.session.total_chunks);
+    const us = st.accounts.get(iq.contract.getUserPda(signer, PID).toBase58());
+    const u = accCoder.decode("UserState", us.data);
+    u.total_session_files = new anchor.BN(seq + 1);
+    const enc = accCoder.encode("UserState", u);
+    us.data = Buffer.concat([enc, Buffer.alloc(Math.max(0, us.data.length - enc.length))]);
+    debit(st, signer.toBase58(), 5_000_000, "session write fee");
+    credit(st, FEE_RECEIVER, 5_000_000);
+    st.sessionWrites = (st.sessionWrites || 0) + 1;
+  } else {
+    if (a.on_chain_path.length < 80) throw new Error("linked-list path must be a signature");
+    data = assemble(st, a.on_chain_path);
+    debit(st, signer.toBase58(), 3_000_000, "linked-list write fee");
+    credit(st, FEE_RECEIVER, 3_000_000);
+    st.linkedWrites = (st.linkedWrites || 0) + 1;
+  }
+  return data;
 }
 
 function execute(st, tx) {
@@ -270,42 +335,90 @@ function execute(st, tx) {
         user: signer, signer, user_inventory: iq.contract.getUserInventoryPda(signer, PID), db_root: root, table: tpda,
         system_program: new PublicKey(SYS), receiver: new PublicKey(FEE_RECEIVER),
       }, a);
-      sameIx(ix, expected, dec.name);
+      if (a.on_chain_path !== "" || a.session) {
+        const sessAcc = a.session ? iq.contract.getSessionPda(signer, Number(a.session.seq.toString()), PID) : undefined;
+        sameIx(ix, iq.contract.dbCodeInInstruction(builder, {
+          user: signer, signer, user_inventory: iq.contract.getUserInventoryPda(signer, PID), db_root: root, table: tpda,
+          system_program: new PublicKey(SYS), receiver: new PublicKey(FEE_RECEIVER), session: sessAcc,
+        }, a), dec.name + " (chunked)");
+      } else {
+        sameIx(ix, expected, dec.name);
+      }
       if (!st.accounts.get(iq.contract.getUserInventoryPda(signer, PID).toBase58())) throw new Error("custom program error: user not initialized");
       const tacc = st.accounts.get(tpda.toBase58());
       if (!tacc) throw new Error("table not found");
       const meta = accCoder.decode("Table", tacc.data);
       if (meta.writers.length && !meta.writers.some((w) => w.equals(signer))) throw new Error("custom program error: 0x1770 NotAuthorized (signer not in writers)");
-      if (a.on_chain_path !== "" || a.session) throw new Error("expected an inline write");
       if (Buffer.byteLength(a.metadata) > 3400) throw new Error("metadata over the inline cap: " + Buffer.byteLength(a.metadata));
       const invLen = st.accounts.get(iq.contract.getUserInventoryPda(signer, PID).toBase58()).data.length;
       if (Buffer.byteLength(a.metadata) > 700 && invLen < 4213) throw new Error("custom program error: AccountDataTooSmall (pre-upgrade user_inventory, needs realloc)");
       const md = JSON.parse(a.metadata);
-      if (md.total_chunks !== 1 || md.method !== 0) throw new Error("bad metadata envelope");
-      const row = JSON.parse(md.data);
+      let row, chunkedPath = "";
+      if (a.on_chain_path !== "" || a.session) {
+        row = JSON.parse(finalizeChunks(st, signer, a, ix, 4));
+        chunkedPath = a.on_chain_path;
+      } else {
+        if (md.total_chunks !== 1 || md.method !== 0) throw new Error("bad metadata envelope");
+        row = JSON.parse(md.data);
+      }
       const cols = new Set([...meta.column_names.map((c) => Buffer.from(c).toString()), Buffer.from(meta.id_col).toString()]);
       for (const k of Object.keys(row)) if (!cols.has(k)) throw new Error("custom program error: 0x1787 SchemaMismatch " + k);
-      debit(st, signer.toBase58(), 1_000_000, "write fee");
-      credit(st, FEE_RECEIVER, 1_000_000);
+      if (!chunkedPath) {
+        debit(st, signer.toBase58(), 1_000_000, "write fee");
+        credit(st, FEE_RECEIVER, 1_000_000);
+      }
       st.pendingRows = st.pendingRows || [];
-      st.pendingRows.push({ table: tpda.toBase58(), row, signer: signer.toBase58() });
+      st.pendingRows.push({ table: tpda.toBase58(), row, signer: signer.toBase58(), path: chunkedPath });
     } else if (dec.name === "user_inventory_code_in") {
       const inv = iq.contract.getUserInventoryPda(signer, PID);
+      const chunked = a.on_chain_path !== "" || !!a.session;
+      const sessAcc = a.session ? iq.contract.getSessionPda(signer, Number(a.session.seq.toString()), PID) : undefined;
       sameIx(ix, iq.contract.userInventoryCodeInInstruction(builder, {
-        user: signer, user_inventory: inv, system_program: new PublicKey(SYS), receiver: new PublicKey(FEE_RECEIVER), session: undefined, iq_ata: undefined,
-      }, a), dec.name);
+        user: signer, user_inventory: inv, system_program: new PublicKey(SYS), receiver: new PublicKey(FEE_RECEIVER), session: sessAcc, iq_ata: undefined,
+      }, a), dec.name + (chunked ? " (chunked)" : ""));
       const invAcc = st.accounts.get(inv.toBase58());
       if (!invAcc) throw new Error("custom program error: user not initialized");
-      if (a.on_chain_path !== "" || a.session) throw new Error("expected an inline file");
       const bytes = Buffer.byteLength(a.metadata);
       if (bytes > 3400) throw new Error("metadata over the inline cap");
       if (bytes > 700 && invAcc.data.length < 4213) throw new Error("custom program error: AccountDataTooSmall");
       const md = JSON.parse(a.metadata);
-      if (md.total_chunks !== 1 || md.method !== 0 || typeof md.data !== "string" || !md.filename || !md.filetype) throw new Error("bad file metadata envelope");
-      debit(st, signer.toBase58(), 1_000_000, "write fee");
-      credit(st, FEE_RECEIVER, 1_000_000);
+      let stored = a.metadata;
+      if (chunked) {
+        if (md.method !== 0 || !md.filename || !md.filetype || md.total_chunks < 1) throw new Error("bad chunked file metadata");
+        md.data = finalizeChunks(st, signer, a, ix, 4);
+        stored = JSON.stringify(md);
+        chain.chunkedFiles = (chain.chunkedFiles || 0) + 1;
+      } else {
+        if (md.total_chunks !== 1 || md.method !== 0 || typeof md.data !== "string" || !md.filename || !md.filetype) throw new Error("bad file metadata envelope");
+        debit(st, signer.toBase58(), 1_000_000, "write fee");
+        credit(st, FEE_RECEIVER, 1_000_000);
+      }
       st.pendingFiles = st.pendingFiles || [];
-      st.pendingFiles.push({ signer: signer.toBase58(), metadata: a.metadata });
+      st.pendingFiles.push({ signer: signer.toBase58(), metadata: stored, listed: a.metadata });
+    } else if (dec.name === "send_code") {
+      sameIx(ix, iq.contract.sendCodeInstruction(builder, { user: signer, code_account: iq.contract.getCodeAccountPda(signer, PID), system_program: new PublicKey(SYS) }, a), dec.name);
+      const ca = st.accounts.get(iq.contract.getCodeAccountPda(signer, PID).toBase58());
+      if (!ca) throw new Error("custom program error: code account missing (user not initialized)");
+      if (Buffer.byteLength(a.code) + 200 > ca.data.length) throw new Error("custom program error: AccountDataTooSmall (code account)");
+      st.pendingCodes = st.pendingCodes || [];
+      st.pendingCodes.push({ sig: tx.sig, code: a.code, before: a.before_tx });
+    } else if (dec.name === "create_session") {
+      const seq = Number(a.seq.toString());
+      const sess = iq.contract.getSessionPda(signer, seq, PID);
+      sameIx(ix, iq.contract.createSessionInstruction(builder, { user: signer, user_state: iq.contract.getUserPda(signer, PID), session: sess, system_program: new PublicKey(SYS) }, a), dec.name);
+      if (seq !== userSeq(st, signer)) throw new Error(`create_session seq ${seq} != user_state ${userSeq(st, signer)}`);
+      if (st.accounts.get(sess.toBase58())) throw new Error("custom program error: session already in use");
+      const data = Buffer.concat([Buffer.from([74, 34, 65, 133, 96, 163, 80, 69]), Buffer.alloc(6)]);
+      debit(st, signer.toBase58(), 721_360, "session rent");
+      st.accounts.set(sess.toBase58(), { lamports: 721_360, data, owner: PID.toBase58() });
+    } else if (dec.name === "post_chunk") {
+      const sess = K(1).toBase58();
+      sameIx(ix, iq.contract.postChunkInstruction(builder, { user: signer, session: K(1) }, a), dec.name);
+      const acc = st.accounts.get(sess);
+      if (!acc) throw new Error("session not found");
+      if (acc.data[13] === 1) throw new Error("custom program error: 0x177e SessionFinalized");
+      st.pendingPosts = st.pendingPosts || [];
+      st.pendingPosts.push({ session: sess, index: a.index, chunk: a.chunk });
     } else if (dec.name === "update_table") {
       const root = iq.contract.getDbRootPda(Buffer.from(a.db_root_id), PID);
       const seed = Buffer.from(a.table_seed);
@@ -362,15 +475,23 @@ function submit(raw, simulate) {
     chain.tableUpdates = (chain.tableUpdates || 0) + (st.tableUpdates || 0);
     chain.listUpdates = (chain.listUpdates || 0) + (st.listUpdates || 0);
     const bt = ++blockTime;
+    for (const c of st.pendingCodes || []) chain.codes.set(c.sig, { code: c.code, before: c.before });
+    for (const p of st.pendingPosts || []) {
+      const m = chain.sessions.get(p.session) || new Map();
+      m.set(p.index, p.chunk);
+      chain.sessions.set(p.session, m);
+    }
+    chain.sessionWrites = (chain.sessionWrites || 0) + (st.sessionWrites || 0);
+    chain.linkedWrites = (chain.linkedWrites || 0) + (st.linkedWrites || 0);
     for (const p of st.pendingRows || []) {
       const list = chain.rows.get(p.table) || [];
-      list.push({ ...p.row, __txSignature: tx.sig, __signer: p.signer, __blockTime: bt });
+      list.push({ ...p.row, __txSignature: tx.sig, __signer: p.signer, __blockTime: bt, __onChainPath: p.path || "" });
       chain.rows.set(p.table, list);
     }
     for (const f of st.pendingFiles || []) {
       chain.files.set(tx.sig, { ...f, blockTime: bt });
       const list = chain.assets.get(f.signer) || [];
-      list.push({ signature: tx.sig, slot: 1000, err: null, memo: null, blockTime: bt, confirmationStatus: "finalized", onChainPath: "", metadata: f.metadata });
+      list.push({ signature: tx.sig, slot: 1000, err: null, memo: null, blockTime: bt, confirmationStatus: "finalized", onChainPath: "", metadata: f.listed || f.metadata });
       chain.assets.set(f.signer, list);
     }
     chain.txs.set(tx.sig, { raw: Buffer.from(raw).toString("base64"), blockTime: bt });
@@ -481,6 +602,38 @@ chain.rows.set("3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP", [
   { id: "n3", text: "a visitor wrote this", __txSignature: "5sigC", __signer: "8QWrZjNNFzngKWCLCrFkAy7ydnagrBSVYdJFyEvw9agh", __blockTime: 1777000200 },
 ]);
 
+// An IQ git repository, stored the way IQ Labs' git stores it: commits are
+// rows of table git_commits:<owner>:<repo> in the database iq-git-v1, a
+// commit's tree is a JSON inscription {path: {txId, hash}} named iqgit-tree,
+// and each file an inscription iqgit-blob:<path> with base64 bytes.
+const GIT = (() => {
+  const owner = new PublicKey(Buffer.alloc(32, 11)).toBase58();
+  const repo = "hello-iq";
+  const root = iq.contract.getDbRootPda(iq.utils.toSeedBytes("iq-git-v1"), PID);
+  const pda = iq.contract.getTablePda(root, iq.utils.toSeedBytes(`git_commits:${owner}:${repo}`), PID).toBase58();
+  return { owner, repo, pda, trees: [] };
+})();
+const fakeSig = () => bs58.encode(require("crypto").randomBytes(64));
+function gitCommit(message, files, signer = GIT.owner) {
+  const bt = Math.floor(Date.now() / 1000);
+  const tree = {};
+  for (const [p, content] of Object.entries(files)) {
+    const sig = fakeSig();
+    chain.files.set(sig, { metadata: JSON.stringify({ filetype: "application/octet-stream", method: 0, filename: "iqgit-blob:" + p, total_chunks: 1, data: Buffer.from(content).toString("base64") }), signer, blockTime: bt });
+    tree[p] = { txId: sig, hash: require("crypto").createHash("sha256").update(content).digest("hex") };
+  }
+  const treeSig = fakeSig();
+  chain.files.set(treeSig, { metadata: JSON.stringify({ filetype: "application/json", method: 0, filename: "iqgit-tree", total_chunks: 1, data: JSON.stringify(tree) }), signer, blockTime: bt });
+  const list = chain.rows.get(GIT.pda) || [];
+  const parent = list.length ? list[list.length - 1].id : undefined;
+  const id = require("crypto").randomUUID();
+  list.push({ id, message, treeTxId: treeSig, ...(parent ? { parentCommitId: parent } : {}), timestamp: Date.now() + list.length, author: signer, __txSignature: fakeSig(), __signer: signer, __blockTime: bt });
+  chain.rows.set(GIT.pda, list);
+  GIT.trees.push(treeSig);
+  return { id, tree: treeSig };
+}
+gitCommit("first version", { "index.html": "<h1>v1</h1>", "README.md": "# hello-iq\n" });
+
 function liveRoots() {
   const out = [...fixtureRoots];
   for (const [k, a] of chain.accounts) {
@@ -510,6 +663,7 @@ function gateway(url, method, body) {
       const t = accCoder.decode("Table", a.data);
       return { name: Buffer.from(t.name).toString(), columns: t.column_names.map((c) => Buffer.from(c).toString()), idCol: Buffer.from(t.id_col).toString(), lastTimestamp: 0, gate: null };
     }
+    if (m[1] === GIT.pda) return { name: `git_commits:${GIT.owner}:${GIT.repo}`, columns: ["id", "message", "treeTxId", "parentCommitId", "timestamp", "author"], idCol: "id", lastTimestamp: 0, gate: null };
     if (m[1] === "3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP") return { name: "notes", columns: ["id", "text"], idCol: "id", lastTimestamp: 1777000200, gate: null };
     return { error: "not found" };
   }
@@ -584,7 +738,7 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const req = route.request();
     const url = req.url();
     if (url.startsWith("https://iq.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: html });
-    if (url.startsWith("https://gateway.iqlabs.dev/")) {
+    if (url.startsWith("https://gateway.iqlabs.dev/") || url.startsWith("https://dev-gateway.iqlabs.dev/")) {
       const res = gateway(url, req.method(), req.postData());
       return route.fulfill({ status: res.error ? 404 : 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
     }
@@ -895,17 +1049,18 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await page.setInputFiles("input[data-fileb64='attach-sel']", { name: "torque-spec.txt", mimeType: "text/plain", buffer: Buffer.from(spec) });
   await waitText("linked in the cell", 30000);
   check(chain.ixSeen.user_inventory_code_in === 1 && chain.ixSeen.user_initialize === 1, "file inscribed with user_inventory_code_in (after the wallet's one-time setup), checked against the SDK builder");
-  const fileSig = [...chain.files.keys()][0];
+  const fileSig = [...chain.files.keys()].pop();
   check((await cell(0, 5).innerText()).includes("torque-spec.txt"), "the cell links to the file");
   check(JSON.parse(chain.files.get(fileSig).metadata).data === spec, "file stored as text, exactly like the SDK's codeIn");
 
   console.log("Save to blockchain (one button, automatic top-up)");
   await page.click("button[data-a='ed-tab'][data-arg='save']");
   const t2 = await text();
-  const packMatch = t2.match(/fasteners: 600 changed row\(s\) in (\d+) write/);
-  check(!!packMatch, "save plan shown: " + (packMatch ? packMatch[0] : "missing"));
-  const nPacks = packMatch ? Number(packMatch[1]) : 0;
-  check(nPacks > 1 && nPacks <= 12, `600 records fit in ${nPacks} inscriptions`);
+  const packMatch = t2.match(/fasteners: 600 changed row\(s\) in one write sent in (\d+) parts/);
+  check(!!packMatch, "save plan: 600 rows as ONE write in parts (IQ's chunked upload is cheaper than 4 direct writes): " + (packMatch ? packMatch[0] : t2.match(/fasteners:[^\n]*/)));
+  const nParts = packMatch ? Number(packMatch[1]) : 0;
+  const nPacks = 1;
+  check(nParts > 1 && nParts < 10, `600 records fit in ${nParts} parts of a linked list`);
   const mainBefore = lam(mainAddr);
   await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
   await waitText("Saved ✓", 60000);
@@ -919,11 +1074,11 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const supMeta = accCoder.decode("Table", acct(supPda).data);
   check(fastMeta.writers.length === 0, "open table: no writer restriction");
   check(supMeta.writers.length === 1 && supMeta.writers[0].toBase58() === dbw, "locked table: writers = [database wallet]");
-  check((chain.rows.get(fastPda) || []).length === nPacks, `${nPacks} pack rows written to "fasteners"`);
+  check((chain.rows.get(fastPda) || []).length === 1 && chain.linkedWrites === 1 && chain.ixSeen.send_code >= nParts, `one pack row in "fasteners", finalized after ${nParts} send_code parts (checked against the SDK builder)`);
   check(!acct(iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("sheet1"), PID).toBase58()), "the dropped table was never created");
   check(chain.txCount.v1 > 0, `v1 transactions used once the feature gate is on (${chain.txCount.v1} v1, ${chain.txCount.legacy} legacy)`);
   check((chain.reallocs || 0) >= 1, "DbRoot realloc path exercised (" + (chain.reallocs || 0) + ")");
-  check(chain.notifies.length === (chain.rows.get(fastPda) || []).length + (chain.rows.get(supPda) || []).length, "IQ gateway notified for every write (" + chain.notifies.length + ")");
+  check(chain.notifies.length === [...(chain.rows.get(fastPda) || []), ...(chain.rows.get(supPda) || [])].filter((r) => !r.__onChainPath).length, "IQ gateway notified for every direct write (" + chain.notifies.length + ")");
   console.log("   instruction mix:", JSON.stringify(chain.ixSeen));
   await page.click("button[data-a='ed-tab'][data-arg='browse']");
   await page.waitForFunction(() => !document.querySelector(".pendbar"), null, { timeout: 20000 });
@@ -1034,6 +1189,19 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const supSheet = await sheetText();
   check(/Permian Industrial\t4\tOdessa\tTX/.test(supSheet) && /Brazos Bolt & Nut\t3\tWaco\tTX/.test(supSheet), "defaults fill the new row (TX) and the new column (3 for rows already saved)");
   check((await page.locator("table.sheet thead").innerText()).includes("town"), "renamed column shows in the sheet");
+  // a file bigger than one transaction goes into a cell in parts (IQ's session upload)
+  const bin = Buffer.alloc(40000);
+  { let z = 99991; for (let i = 0; i < bin.length; i++) { z = (z * 1103515245 + 12345) & 0x7fffffff; bin[i] = (z >> 16) & 255; } }
+  const vRows = await page.locator("table.sheet tbody tr").allInnerTexts();
+  const permian = vRows.findIndex((t) => t.includes("Permian Industrial"));
+  await cell(permian, 6).click();
+  const sessBefore = chain.sessionWrites || 0;
+  await page.setInputFiles("input[data-fileb64='attach-sel']", { name: "drawing.bin", mimeType: "application/octet-stream", buffer: bin });
+  await waitText("linked in the cell", 180000);
+  check((chain.sessionWrites || 0) === sessBefore + 1 && chain.chunkedFiles === 1 && chain.ixSeen.post_chunk >= 15, `a 40 KB file went into the cell in parts: create_session + ${chain.ixSeen.post_chunk / 2} post_chunk, then user_inventory_code_in (each checked against the SDK builder)`);
+  const bigSig = [...chain.files.keys()].pop();
+  check(JSON.parse(chain.files.get(bigSig).metadata).data === bin.toString("base64"), "the parts reassemble to the file, byte for byte");
+  check((await cell(permian, 6).innerText()).includes("drawing.bin"), "the cell links to the big file");
 
   // fasteners (table 0): types, rules, search, find & replace
   await page.goto(`https://iq.test/#/ws/${dkey}/0`);
@@ -1110,6 +1278,11 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   check(out2.includes(`Brazos Bolt & Nut\t${bz}`) && out2.includes(`Permian Industrial\t${pm}`), `JOIN + GROUP BY across saved and unsaved rows (${bz}, ${pm})`);
   out2 = await sql("CREATE TABLE scratch (id INT AUTO_INCREMENT PRIMARY KEY, note VARCHAR(20) NOT NULL); INSERT INTO scratch (note) VALUES ('a'), ('b'), ('c')");
   check((await sqlBad()).length === 0, "CREATE TABLE with types + INSERT");
+  let progSrc = "// generated by the end-to-end test\n";
+  { let y = 7; while (progSrc.length < 70000) { let line = "// "; for (let j = 0; j < 12; j++) { y = (y * 1103515245 + 12345) & 0x7fffffff; line += (y >> 4).toString(36).slice(-5); } progSrc += line + "\n"; } }
+  out2 = await sql(`CREATE TABLE programs (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, source LONGTEXT); INSERT INTO programs (name, source) VALUES ('generator', '${progSrc}')`);
+  check((await sqlBad()).length === 0, `a ${Math.round(progSrc.length / 1000)} KB program goes into one cell`);
+  const progPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("programs"), PID).toBase58();
   await page.click("button[data-a='ed-tab'][data-arg='sql']");
   await shot("06f-sql");
   const dump = await download(async () => { await page.click("button[data-a='ed-tab'][data-arg='export']"); await page.click("button[data-a='export'][data-arg='db-sql']"); });
@@ -1117,6 +1290,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await page.click("button[data-a='ed-tab'][data-arg='save']");
   const plan2 = (await text()).replace(/\s+/g, " ");
   check(plan2.includes("vendors: new structure") && plan2.includes("rename to “vendors”") && plan2.includes("change who can add rows") && plan2.includes("fasteners: new structure"), "Save lists structure, rename and writer changes");
+  check(/programs: 1 changed row\(s\) in one write sent in \d+ parts \(IQ's chunked upload, session\)/.test(plan2), "the big row is planned as one write in parts (session): " + (plan2.match(/programs: [^·]*/) || [""])[0]);
+  const sessBeforeSave = chain.sessionWrites || 0;
   const tuBefore = chain.tableUpdates || 0;
   await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
   await waitText("Saved ✓", 60000);
@@ -1130,6 +1305,9 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const iqtPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("_iqt"), PID).toBase58();
   const scratchPda = iq.contract.getTablePda(new PublicKey(rootPda), iq.utils.toSeedBytes("scratch"), PID).toBase58();
   check(!!acct(iqtPda) && !!acct(scratchPda), "views table and scratch table created");
+  const progRows = chain.rows.get(progPda) || [];
+  const progRow = progRows.find((r) => !/^IQT1[sS]/.test(r.p));
+  check(!!progRow && progRow.__onChainPath && progRow.__onChainPath.length < 80 && (chain.sessionWrites || 0) === sessBeforeSave + 1, "the program was written as one chunked row through a session (the file's session had used the previous sequence number)");
   // TRUNCATE and DROP a saved table
   await page.click("button[data-a='ed-tab'][data-arg='structure']");
   await page.waitForSelector("tr:has-text('scratch') button[data-a='op-truncate']");
@@ -1159,9 +1337,28 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   await waitText("fasteners");
   check(!(await text()).includes("scratch"), "Explore no longer lists the dropped table");
 
+  // checkpoint: fasteners has a history of edits by now
+  const histBefore = (chain.rows.get(fastPda) || []).length;
+  await page.goto(`https://iq.test/#/ws/${dkey}/0`);
+  await page.waitForSelector("table.sheet");
+  await page.click("button[data-a='ed-tab'][data-arg='operations']");
+  await waitText("Checkpoint on next save");
+  const opsText = (await text()).replace(/\s+/g, " ");
+  check(/replays its whole history: \d+ write\(s\) on the blockchain for 600 row\(s\)/.test(opsText), `Operations shows the table's history: ` + (opsText.match(/Opening this[^.]*\./) || [""])[0]);
+  await page.click("button[data-a='op-checkpoint'][data-arg='on']");
+  await waitText("checkpoint on next save");
+  check((await lastSql()) === "OPTIMIZE TABLE `fasteners`", "Checkpoint → OPTIMIZE TABLE");
+  await page.click("button[data-a='ed-tab'][data-arg='save']");
+  const plan3 = (await text()).replace(/\s+/g, " ");
+  check(plan3.includes("fasteners: checkpoint") && /fasteners: 600 row\(s\) rewritten/.test(plan3), "Save lists the checkpoint: " + (plan3.match(/fasteners: 600[^·]*/) || [""])[0]);
+  await page.click(`button[data-a='inscribe'][data-arg='${dkey}']`);
+  await waitText("Saved ✓", 90000);
+  const hist = chain.rows.get(fastPda) || [];
+  check(hist.length === histBefore + 2 && /^IQT1[sS]/.test(hist[hist.length - 1].p) && !!hist[hist.length - 2].__onChainPath, "checkpoint on chain: the whole table as one chunked pack, then the checkpoint record");
+
   // a clean browser reads the structure back from the chain
   {
-    const ctx2 = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const ctx2 = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
     const p2 = await ctx2.newPage();
     p2.on("pageerror", (e) => consoleErrors.push("pageerror(2): " + e.message));
     await p2.route("**/*", handler);
@@ -1182,6 +1379,27 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const st2 = (await p2.locator("#app").innerText()).replace(/\s+/g, " ");
     check(st2.includes("Choice: TX, OK, NM") && st2.includes("rating_range") && st2.includes("web") && st2.includes("Whole number"), "the editor rebuilds types, keys and rules from the chain");
     check(await p2.waitForSelector(".side button[data-a='view-open']:has-text('stainless_stock')", { timeout: 10000 }).then(() => true).catch(() => false), "…and the database's views");
+    const sql2 = async (q) => {
+      await p2.click("button[data-a='ed-tab'][data-arg='sql']");
+      await p2.fill("textarea[data-keys='sql']", q);
+      await p2.click("button[data-a='sql-run']");
+      await p2.waitForFunction(() => { const o = document.querySelector(".sqlout"); return o && /row|error|No /i.test(o.innerText); }, null, { timeout: 30000 });
+      await p2.waitForTimeout(300);
+      return p2.locator(".sqlout").innerText();
+    };
+    await p2.click(".side a.tb:has-text('fasteners')");
+    await p2.click("button[data-a='ed-tab'][data-arg='browse']");
+    await p2.waitForSelector("table.sheet", { timeout: 30000 });
+    const f2 = await sql2("SELECT COUNT(*) AS n, SUM(qty = 9999) AS edited, SUM(material = 'Bronze') AS bronze, SUM(part_no = 'FST-EDITED') AS renamed FROM fasteners");
+    check(f2.includes(`600\t1\t${nBrass}\t1`), `from the checkpoint: 600 rows with every earlier edit (${f2.split("\n").slice(1, 2).join(" ")})`);
+    await p2.click("button[data-a='ed-tab'][data-arg='operations']");
+    const ck2 = (await p2.locator("#app").innerText()).replace(/\s+/g, " ");
+    check(/opens from its last checkpoint: \d+ write\(s\) read for 600 row\(s\)/.test(ck2), "the editor found the checkpoint and reads fasteners from it: " + (ck2.match(/(This table opens|Opening this table)[^.]*\./) || [""])[0]);
+    await p2.click(".side a.tb:has-text('programs')");
+    await p2.click("button[data-a='ed-tab'][data-arg='browse']");
+    await p2.waitForSelector("table.sheet", { timeout: 30000 });
+    const pr2 = await sql2("SELECT name, LENGTH(source) AS len FROM programs");
+    check(pr2.includes(`generator\t${progSrc.length}`), `the ${progSrc.length}-character program reads back from its session chunks`);
     await ctx2.close();
   }
   await shot("06b-structure");
@@ -1232,6 +1450,52 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   check(/Official 600/.test(t6), "official records unaffected (600)");
   await shot("07-unofficial");
 
+  console.log("Live links to IQ git repositories");
+  {
+    const k3 = (await page.evaluate(() => JSON.parse(localStorage.getItem("iqtables:v1:drafts"))))[0].key;
+    await page.goto(`https://iq.test/#/ws/${k3}`);
+    await page.waitForSelector("button[data-a='ed-tab'][data-arg='sql']");
+    const link = `https://browser.iqlabs.dev/${GIT.pda}`;
+    out = await sql(`CREATE TABLE software (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(80) NOT NULL, repo VARCHAR(200)); INSERT INTO software (name, repo) VALUES ('Hello IQ', '${link}')`);
+    check((await sqlBad()).length === 0, "a table of software with IQ's browser link to a repository");
+    await sql("SELECT name, repo FROM software");
+    const gitBtn = page.locator(".sqlout button[data-a='git-open']");
+    await gitBtn.waitFor({ timeout: 10000 });
+    await page.waitForFunction(() => /first version/.test((document.querySelector(".sqlout button[data-a='git-open']") || {}).innerText || ""), null, { timeout: 10000 });
+    check((await gitBtn.innerText()).includes("hello-iq"), "the cell shows the repository and its newest commit: " + (await gitBtn.innerText()).replace(/\s+/g, " "));
+    // the project moves on; the table doesn't change
+    const c2 = gitCommit("second version", { "index.html": "<h1>v2</h1>", "README.md": "# hello-iq\nnow with v2\n", "app.js": "console.log('v2')\n" });
+    gitCommit("totally the latest", { "index.html": "<h1>spoofed</h1>" }, new PublicKey(Buffer.alloc(32, 12)).toBase58());
+    await gitBtn.click();
+    await page.waitForSelector(".gitpanel");
+    await page.click(".gitpanel button[data-a='git-refresh']");
+    await page.waitForFunction(() => /second version/.test(document.querySelector(".gitpanel .commits").innerText), null, { timeout: 10000 });
+    const commits = await page.locator(".gitpanel .commits").innerText();
+    check(/second version\s*latest/.test(commits) && !commits.includes("totally the latest"), "a new commit shows up as latest; a commit inscribed by someone else is ignored");
+    await page.waitForSelector(".gitpanel button[data-a='open-tx'][data-val='app.js']", { timeout: 10000 });
+    check((await page.locator(".gitpanel .files li").count()) === 3, "the newest commit's files are listed (from its tree inscription)");
+    await shot("07b-git-panel");
+    await page.click(".gitpanel button[data-a='open-tx'][data-val='index.html']");
+    await page.waitForFunction(() => /<h1>v2<\/h1>/.test((document.querySelector(".modal pre") || {}).innerText || ""), null, { timeout: 10000 });
+    check((await page.locator(".modal h3").last().innerText()).includes("index.html"), "a file of the commit opens as text (IQ git's base64 blob decoded)");
+    await page.click("button[data-a='viewer-close']");
+    await page.click(".gitpanel button[data-a='git-commit']:has-text('first version')");
+    await page.waitForSelector(".gitpanel .files li:nth-child(2)", { timeout: 10000 });
+    const pin = (await page.locator(".gitpanel code").innerText()).trim();
+    check(pin.startsWith(`iq://tx/${GIT.trees[0]}#hello-iq%40`) && (await page.locator(".gitpanel .files li").count()) === 2, "an older commit shows its own files and a link that pins that version: " + pin);
+    await page.click("button[data-a='git-close']");
+    await page.waitForFunction(() => /second version/.test((document.querySelector(".sqlout button[data-a='git-open']") || {}).innerText || ""), null, { timeout: 10000 });
+    const cellNow = await sql("SELECT repo FROM software");
+    check(cellNow.includes("second version") && (await sql("SELECT COUNT(*) AS n FROM software WHERE repo = '" + link + "'")).includes("1"), "the cell now shows the new commit; its value is still the same link");
+    out = await sql(`INSERT INTO software (name, repo) VALUES ('Hello IQ v1', '${pin}'); SELECT name, repo FROM software WHERE name = 'Hello IQ v1'`);
+    await page.click(".sqlout button[data-a='open-tx']");
+    await page.waitForSelector(".modal .files li", { timeout: 10000 });
+    check((await page.locator(".modal .files").innerText()).includes("README.md"), "the pinned link opens that commit's file list");
+    await page.click("button[data-a='viewer-close']");
+    await sql("DROP TABLE software");
+    void c2;
+  }
+
   console.log("Reading straight from Solana (no gateway)");
   await page.goto("https://iq.test/#/settings");
   await page.selectOption("select[data-arg='source']", "rpc");
@@ -1245,6 +1509,9 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
   const t7 = (await text()).replace(/\s+/g, " ");
   check(/Unofficial 1/.test(t7) && t7.includes("FST-EDITED"), "rows rebuilt from the table's transactions: 600 official + 1 unofficial");
   check(chain.batches > 0, "transactions fetched with batched JSON-RPC (" + chain.batches + " batch)");
+  await page.goto(`https://iq.test/#/t/${rootPda}/${progPda}`);
+  await page.waitForSelector("table.data td:has-text('generator')", { timeout: 30000 });
+  check(true, "a row sent through a session is rebuilt from its post_chunk transactions (getSignaturesForAddress on the session + getTransaction)");
   await page.goto("https://iq.test/#/settings");
   await page.selectOption("select[data-arg='source']", "gateway");
 

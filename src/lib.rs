@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod dates;
 pub mod ddl;
 pub mod editor;
+pub mod git;
 pub mod host;
 pub mod inscribe;
 pub mod iq;

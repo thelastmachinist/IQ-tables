@@ -38,6 +38,7 @@ pub fn render(app: &mut App) -> String {
         Route::About => about(&mut h),
     }
     h.push_str("</main><footer>IQ Tables · a community portal for <a href=\"https://iqlabs.dev\" target=\"_blank\" rel=\"noopener\">IQ Labs</a> on-chain tables · written in Rust, running as WebAssembly · <a href=\"#/about\">how it works</a></footer>");
+    crate::git::panel(app, &mut h);
     viewer(app, &mut h);
     if let Some(m) = &app.busy {
         h.push_str(&format!("<div class=\"modal\" role=\"alert\" aria-busy=\"true\"><div class=\"card sheet center\"><p class=\"big\">{}</p><p class=\"muted small\">Deriving the key from your passphrase takes a moment.</p></div></div>", esc(m)));
@@ -70,7 +71,7 @@ fn header(app: &App, h: &mut String) {
     va::account_button(app, h);
     h.push_str("</header>");
     if app.settings.cluster == "devnet" {
-        h.push_str("<div class=\"devnet\">Devnet — test SOL only · reading straight from Solana</div>");
+        h.push_str(if app.use_rpc() { "<div class=\"devnet\">Devnet — test SOL only · reading straight from Solana</div>" } else { "<div class=\"devnet\">Devnet — test SOL only</div>" });
     }
 }
 
@@ -113,6 +114,11 @@ pub fn link_html(app: &App, raw: &str) -> Option<String> {
         parse_pk(pda)?;
         let label = app.dbroots.ready().and_then(|rs| rs.iter().find(|r| r.pda == pda)).map(|r| r.name()).unwrap_or_else(|| format!("database {}", solana::short(pda)));
         return Some(format!("<a href=\"#/db/{}\" title=\"{}\">↗ {}</a>", esc(pda), esc(s), esc(&label)));
+    }
+    if let Some(pda) = crate::git::browser_pda(s) {
+        if let Some(c) = crate::git::cell(app, pda, s) {
+            return Some(c);
+        }
     }
     if s.starts_with("https://") || s.starts_with("http://") {
         let shown = s.split_once("://").map(|x| x.1).unwrap_or(s);
@@ -181,10 +187,11 @@ pub fn cell_html(app: &App, v: &Json, max: usize) -> String {
 
 fn viewer(app: &App, h: &mut String) {
     let Some(v) = app.viewer.as_ref() else { return };
-    let gw = app.settings.gateway.trim_end_matches('/');
+    let gw_url = app.gateway_url();
+    let gw = gw_url.as_str();
     h.push_str("<div class=\"modal\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Inscription\"><div class=\"card sheet\">");
     let title = match &v.state {
-        Load::Ready(x) => x.filename.clone(),
+        Load::Ready(x) if x.filename != "iqgit-tree" => x.filename.clone(),
         _ => v.label.clone(),
     };
     h.push_str(&format!("<div class=\"tablehead\"><h3 class=\"grow\">📎 {}</h3><button class=\"x\" data-a=\"viewer-close\" aria-label=\"Close\">×</button></div>", esc(&title)));
@@ -210,6 +217,9 @@ fn viewer(app: &App, h: &mut String) {
             match (&x.bytes, &x.text) {
                 (Some(b), _) if img => h.push_str(&format!("<img class=\"preview\" alt=\"{}\" src=\"data:{};base64,{}\">", esc(&x.filename), esc(&x.filetype.to_ascii_lowercase()), base64_encode(b))),
                 (_, Some(t)) if img => h.push_str(&format!("<img class=\"preview\" alt=\"{}\" src=\"data:image/svg+xml;base64,{}\">", esc(&x.filename), base64_encode(t.as_bytes()))),
+                (_, Some(t)) if x.filename == "iqgit-tree" && crate::git::parse_tree(t).is_some() => {
+                    crate::git::tree_html(&crate::git::parse_tree(t).unwrap_or_default(), h);
+                }
                 (_, Some(t)) => {
                     // an IQ Tables pack (or any row) is shown decoded
                     let parsed = crate::json::parse(t).ok();
@@ -821,7 +831,7 @@ fn settings(app: &App, h: &mut String) {
         esc(&s.rpc)
     ));
     h.push_str(&format!(
-        "<label>Cluster<select data-in=\"set\" data-arg=\"cluster\"><option value=\"mainnet\" {}>mainnet-beta</option><option value=\"devnet\" {}>devnet (free test SOL — reads come straight from Solana)</option></select></label>",
+        "<label>Cluster<select data-in=\"set\" data-arg=\"cluster\"><option value=\"mainnet\" {}>mainnet-beta</option><option value=\"devnet\" {}>devnet (free test SOL; reads through IQ's devnet gateway)</option></select></label>",
         if s.cluster == "mainnet" { "selected" } else { "" },
         if s.cluster == "devnet" { "selected" } else { "" }
     ));

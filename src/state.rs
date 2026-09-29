@@ -113,6 +113,9 @@ pub struct DraftTable {
     pub clear: bool,
     /// DROP TABLE is waiting to be saved.
     pub dropped: bool,
+    /// A checkpoint (OPTIMIZE TABLE) is waiting to be saved: the whole table
+    /// is rewritten so readers can skip its history.
+    pub checkpoint: bool,
     /// Display name and writer list as last seen on chain (to spot renames
     /// and privilege changes waiting to be saved).
     pub chain_title: Option<String>,
@@ -208,6 +211,7 @@ impl DraftTable {
             keys: self.keys.clone(),
             clear: self.clear,
             dropped: self.dropped,
+            snap: vec![],
         }
     }
     /// The structure without the one-off events, as text (for comparing).
@@ -219,7 +223,7 @@ impl DraftTable {
     }
     /// Does saving need to write a structure record?
     pub fn schema_changed(&self) -> bool {
-        if self.clear || self.dropped {
+        if self.clear || self.dropped || self.checkpoint {
             return true;
         }
         match &self.chain_doc {
@@ -351,6 +355,9 @@ pub fn drafts_to_json(ds: &[Draft]) -> Json {
                                     if let Some(w) = &t.chain_writers {
                                         o.set("chainWriters", Json::Arr(w.iter().map(|x| json::s(x)).collect()));
                                     }
+                                    if t.checkpoint {
+                                        o.set("checkpoint", Json::Bool(true));
+                                    }
                                     o
                                 })
                                 .collect(),
@@ -405,6 +412,7 @@ pub fn drafts_from_json(v: &Json) -> Vec<Draft> {
                             Json::Arr(v) => Some(v.iter().filter_map(|w| w.str().map(String::from)).collect()),
                             _ => None,
                         },
+                        checkpoint: t.get("checkpoint").bool().unwrap_or(false),
                         ..Default::default()
                     };
                     if tb.title.is_empty() {
