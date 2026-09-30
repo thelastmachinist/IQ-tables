@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "iq_tables"
 version = "0.1.0"
+
+[[package]]
+name = "iqt_decoder"
+version = "1.0.0"
+dependencies = [
+ "iq_tables",
+]

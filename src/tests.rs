@@ -706,3 +706,185 @@ fn review_hardening() {
     assert_eq!(crate::crowd::Manifest::from_json(&m("https://x.example/f", 1 << 20)).unwrap().source, "https://x.example/f");
     assert!(crate::crowd::Manifest::from_json(&m("", 1 << 30)).is_none(), "1 GB pieces are refused");
 }
+
+#[test]
+fn records_for_embeds() {
+    use crate::records::{self, Source, Who};
+    let owner = "B8d355pft6DfrQNetCqXNumRk8WoEs21waqeuPP3HUJC";
+    let row = |sig: &str, signer: &str, t: u64, recs: Vec<(Json, Json)>| {
+        let schema = pack::Schema { cols: vec!["part".into(), "note".into()], id: 0 };
+        let recs: Vec<pack::Record> = recs.into_iter().map(|(a, b)| pack::Record { vals: vec![a, b], deleted: false }).collect();
+        let p = pack::encode_payload(&schema, &recs, true);
+        json::obj(vec![
+            ("id", json::s(&pack::pack_id(&p))),
+            ("p", json::s(&p)),
+            ("__txSignature", json::s(sig)),
+            ("__signer", json::s(signer)),
+            ("__blockTime", json::n(t)),
+        ])
+    };
+    let rows = vec![
+        row("s2", "8QWrZjNNFzngKWCLCrFkAy7ydnagrBSVYdJFyEvw9agh", 20, vec![(json::s("spam"), json::s("buy now"))]),
+        row(
+            "s1",
+            owner,
+            10,
+            vec![
+                (json::s("bolt"), json::s("-cmd|' /C calc'!A0")),
+                (json::s("nut"), json::s("-12.5")),
+                (json::s("washer"), json::s("<b>\"x\", y</b>")),
+                (json::s("pin"), json::n(-3)),
+            ],
+        ),
+    ];
+    let decoded: Vec<_> = rows.iter().map(records::decode_row).collect();
+    let src = Source { rows: &rows, decoded: &decoded, meta: None, creator: Some(owner) };
+    assert!(src.packed());
+    assert_eq!(src.as_of().unwrap().0, "s2");
+    let (cols, official) = src.table(Who::Official, true);
+    assert_eq!(cols, vec!["part", "note"]);
+    assert_eq!(official.len(), 4, "the visitor's row isn't official");
+    assert_eq!(src.table(Who::All, true).1.len(), 5);
+    assert_eq!(src.table(Who::Unofficial, true).1.len(), 1);
+    let csv = records::csv(&cols, &official);
+    assert!(csv.contains("bolt,'-cmd|' /C calc'!A0\n"), "a formula-like cell is defused: {}", csv);
+    assert!(csv.contains("nut,-12.5\n"), "numbers written as text stay as they are");
+    assert!(csv.contains("washer,\"<b>\"\"x\"\", y</b>\"\n"), "quotes and commas are escaped");
+    let html = records::html(&cols, &official, "note -- here");
+    assert!(html.contains("&lt;b&gt;") && !html.contains("<b>"));
+    assert!(html.starts_with("<!-- note — here -->"), "a note can't close the comment early");
+    let j = records::json_rows(&cols, &official);
+    assert_eq!(j.arr()[0].get("part").str(), Some("bolt"));
+    // a pack in a future format is recognised as one, but not decoded here
+    let future = json::obj(vec![("p", json::s("IQT2abc"))]);
+    assert_eq!(records::format_tag(&future).as_deref(), Some("IQT2"));
+    assert!(records::decode_row(&future).is_none());
+    assert_eq!(records::format_tag(&json::obj(vec![("p", json::s("IQTx"))])), None);
+    // a pack survives the decoder's JSON interface unchanged
+    let d = decoded[1].as_ref().unwrap().as_ref().unwrap();
+    let (schema, recs, meta) = records::pack_from_json(&records::pack_json(&d.schema, &d.recs, &d.meta)).unwrap();
+    assert_eq!((schema, recs, meta), (d.schema.clone(), d.recs.clone(), d.meta.clone()));
+    // where the decoder lives: IQ browser links, with or without a path after the address
+    let pda = "7wnrMsuDvuhqqhrDwLnPzLvJnz6fGFwSkvdgMiXzCwJw";
+    assert_eq!(crate::embed::browser_address(&format!("https://browser.iqlabs.dev/{}", pda)).as_deref(), Some(pda));
+    assert_eq!(crate::embed::browser_address(&format!("https://browser.iqlabs.dev/{}/index.html", pda)).as_deref(), Some(pda));
+    assert_eq!(crate::embed::browser_address("https://browser.iqlabs.dev/"), None);
+    assert_eq!(crate::embed::browser_address(&format!("https://evil.example/{}", pda)), None);
+    // the loader shipped in the app is the one in embed/
+    assert!(crate::embed::LOADER.contains("export async function readTable"));
+}
+
+/// Anyone can write to a table, so everything that reads its rows must
+/// survive any input: no panic, no runaway allocation.
+#[test]
+fn hostile_input_never_panics() {
+    use crate::records::{self, Source, Who};
+    use crate::schema::Ty;
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let pieces = [
+        "IQT1", "IQT10", "z", "j", "s", "S", "é", "日本", "\u{0}", "{", "}", "[", "]", "\"", "\\", ":", ",", "c", "r", "d", "i", "0", "9", "-", "e", " ", "!",
+        "~",
+    ];
+    let good = pack::encode_payload(
+        &pack::Schema { cols: vec!["a".into(), "b".into()], id: 0 },
+        &[pack::Record { vals: vec![json::s("x"), json::n(1)], deleted: false }],
+        true,
+    );
+    let types: Vec<Ty> = ["INT", "BIGINT UNSIGNED", "DECIMAL", "DOUBLE", "DATE", "DATETIME", "TIMESTAMP", "TIME", "YEAR", "JSON", "BOOL", "VARCHAR"]
+        .iter()
+        .map(|t| {
+            let mut w = t.split(' ');
+            let name = w.next().unwrap();
+            let args = if name == "VARCHAR" { vec![crate::schema::TypeArg::Num(10)] } else { vec![] };
+            Ty::from_parts(name, &args, w.next().is_some()).unwrap()
+        })
+        .collect();
+    let result = std::panic::catch_unwind(move || {
+        for round in 0..10_000 {
+            // random text built from tricky pieces, or a real pack with bytes flipped
+            let p = if round % 5 == 0 {
+                let mut b = good.clone().into_bytes();
+                for _ in 0..1 + next() % 4 {
+                    let i = 4 + (next() as usize) % (b.len() - 4);
+                    b[i] = b'!' + (next() % 90) as u8;
+                }
+                String::from_utf8(b).unwrap_or_default()
+            } else {
+                (0..next() % 12).map(|_| pieces[(next() as usize) % pieces.len()]).collect::<String>()
+            };
+            let _ = pack::decode_any(&p);
+            if round % 100 == 0 {
+                // (a tiny stream may still claim a few KB per byte: slow to repeat)
+                let _ = codec::decompress(p.as_bytes());
+            }
+            let _ = codec::from_text(&p);
+            let _ = crate::dates::parse_date(&p);
+            let _ = crate::dates::parse_datetime(&p);
+            let _ = crate::dates::parse_time(&p);
+            let v = if round % 2 == 0 { json::s(&p) } else { Json::Num(p.clone()) };
+            for t in &types {
+                let _ = t.read(&v);
+            }
+            let _ = records::csv_value(&v);
+            let _ = json::parse(&p);
+            let _ = json::parse(&v.to_string()).expect("anything we write is valid JSON");
+            let row = json::obj(vec![("id", json::s("x")), ("p", json::s(&p)), ("__signer", json::s("w")), ("__blockTime", json::n(1))]);
+            let rows = vec![row];
+            let decoded: Vec<_> = rows.iter().map(records::decode_row).collect();
+            let src = Source { rows: &rows, decoded: &decoded, meta: None, creator: Some("w") };
+            let (c, r) = src.table(Who::All, true);
+            let _ = records::csv(&c, &r);
+            let _ = records::html(&c, &r, &p);
+            let _ = json::parse(&records::json_rows(&c, &r).to_string()).expect("JSON output stays valid");
+        }
+    });
+    assert!(result.is_ok(), "hostile input made the reader panic");
+    // a forged header can't make the decoder allocate for values it doesn't have
+    let mut forged = vec![b'Q', 1];
+    for v in [4096u64, 0, 0, 1_000_000, 0] {
+        codec::put_varint(&mut forged, v);
+    }
+    let mut cols = vec![b'Q', 1];
+    codec::put_varint(&mut cols, 4096);
+    for _ in 0..4096 {
+        codec::put_varint(&mut cols, 0);
+    }
+    codec::put_varint(&mut cols, 0);
+    codec::put_varint(&mut cols, 1_000_000);
+    codec::put_varint(&mut cols, 0);
+    assert!(pack::unlayout(&cols).is_none(), "4096 columns × 1,000,000 rows claimed in a few kilobytes is refused");
+    let z = format!("{}z{}", pack::MAGIC, codec::to_text(&codec::compress(&cols)));
+    assert!(pack::decode_any(&z).is_err());
+    // and a tiny stream can't claim megabytes of output
+    let mut bomb = vec![];
+    codec::put_varint(&mut bomb, codec::MAX_RAW);
+    bomb.extend_from_slice(&[0u8; 8]);
+    assert!(codec::decompress(&bomb).is_none());
+    // numbers that aren't numbers are written as text
+    assert_eq!(Json::Num("1]]".into()).to_string(), "\"1]]\"");
+    assert_eq!(Json::Num("-12.5e3".into()).to_string(), "-12.5e3");
+    for (s, ok) in [
+        ("0", true),
+        ("-0", true),
+        ("12", true),
+        ("1.5", true),
+        ("1e9", true),
+        ("1E-9", true),
+        ("01", false),
+        ("1.", false),
+        (".5", false),
+        ("+1", false),
+        ("NaN", false),
+        ("", false),
+        ("-", false),
+        ("1e", false),
+    ] {
+        assert_eq!(json::is_number(s), ok, "{}", s);
+    }
+}

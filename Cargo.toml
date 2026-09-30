@@ -12,6 +12,15 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# `app` is the whole portal. Without it, only the pure decoding modules are
+# built — what the embeddable decoder (decoder/) is made of.
+[features]
+default = ["app"]
+app = []
+
+[workspace]
+members = [".", "decoder"]
+
 [profile.release]
 opt-level = "z"
 lto = true

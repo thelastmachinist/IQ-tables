@@ -606,33 +606,85 @@ chain.rows.set("3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP", [
 // rows of table git_commits:<owner>:<repo> in the database iq-git-v1, a
 // commit's tree is a JSON inscription {path: {txId, hash}} named iqgit-tree,
 // and each file an inscription iqgit-blob:<path> with base64 bytes.
-const GIT = (() => {
-  const owner = new PublicKey(Buffer.alloc(32, 11)).toBase58();
-  const repo = "hello-iq";
+const REPOS = new Map(); // commit table -> repository
+function gitRepo(seed, repo) {
+  const owner = new PublicKey(Buffer.alloc(32, seed)).toBase58();
   const root = iq.contract.getDbRootPda(iq.utils.toSeedBytes("iq-git-v1"), PID);
   const pda = iq.contract.getTablePda(root, iq.utils.toSeedBytes(`git_commits:${owner}:${repo}`), PID).toBase58();
-  return { owner, repo, pda, trees: [] };
-})();
+  const R = { owner, repo, pda, trees: [] };
+  REPOS.set(pda, R);
+  return R;
+}
+const GIT = gitRepo(11, "hello-iq");
 const fakeSig = () => bs58.encode(require("crypto").randomBytes(64));
+// a file inscribed the way IQ git stores blobs (base64 bytes)
+function gitBlob(p, content, signer) {
+  const sig = fakeSig();
+  chain.files.set(sig, { metadata: JSON.stringify({ filetype: "application/octet-stream", method: 0, filename: "iqgit-blob:" + p, total_chunks: 1, data: Buffer.from(content).toString("base64") }), signer, blockTime: Math.floor(Date.now() / 1000) });
+  return sig;
+}
 function gitCommit(message, files, signer = GIT.owner) {
+  return repoCommit(GIT, message, files, signer);
+}
+function repoCommit(R, message, files, signer = R.owner) {
   const bt = Math.floor(Date.now() / 1000);
   const tree = {};
   for (const [p, content] of Object.entries(files)) {
-    const sig = fakeSig();
-    chain.files.set(sig, { metadata: JSON.stringify({ filetype: "application/octet-stream", method: 0, filename: "iqgit-blob:" + p, total_chunks: 1, data: Buffer.from(content).toString("base64") }), signer, blockTime: bt });
+    const sig = gitBlob(p, content, signer);
     tree[p] = { txId: sig, hash: require("crypto").createHash("sha256").update(content).digest("hex") };
   }
   const treeSig = fakeSig();
   chain.files.set(treeSig, { metadata: JSON.stringify({ filetype: "application/json", method: 0, filename: "iqgit-tree", total_chunks: 1, data: JSON.stringify(tree) }), signer, blockTime: bt });
-  const list = chain.rows.get(GIT.pda) || [];
+  const list = chain.rows.get(R.pda) || [];
   const parent = list.length ? list[list.length - 1].id : undefined;
   const id = require("crypto").randomUUID();
   list.push({ id, message, treeTxId: treeSig, ...(parent ? { parentCommitId: parent } : {}), timestamp: Date.now() + list.length, author: signer, __txSignature: fakeSig(), __signer: signer, __blockTime: bt });
-  chain.rows.set(GIT.pda, list);
-  GIT.trees.push(treeSig);
-  return { id, tree: treeSig };
+  chain.rows.set(R.pda, list);
+  R.trees.push(treeSig);
+  return { id, tree: treeSig, files: tree };
 }
 gitCommit("first version", { "index.html": "<h1>v1</h1>", "README.md": "# hello-iq\n" });
+
+// A hand-made WebAssembly module speaking the decoder interface (ABI `abi`)
+// that answers every message with `reply`; with `imports`, it also asks for
+// a function from outside (which a loader must refuse).
+function fakeDecoder(reply, { abi = 1, imports = false, capped = true, memories = 1 } = {}) {
+  const leb = (n) => { const o = []; do { let b = n & 127; n >>>= 7; if (n) b |= 128; o.push(b); } while (n); return o; };
+  const sleb = (n) => { const o = []; for (;;) { const b = n & 127; n >>= 7; if ((n === 0 && !(b & 64)) || (n === -1 && (b & 64))) { o.push(b); return o; } o.push(b | 128); } };
+  const str = (s) => [...leb(Buffer.byteLength(s)), ...Buffer.from(s)];
+  const sec = (id, body) => [id, ...leb(body.length), ...body];
+  const vec = (items) => [...leb(items.length), ...items.flat()];
+  const data = [...Buffer.from(JSON.stringify(reply))];
+  const I32 = 0x7f;
+  const types = vec([[0x60, 0, 1, I32], [0x60, 1, I32, 1, I32], [0x60, 2, I32, I32, 1, I32]]);
+  const base = imports ? 1 : 0;
+  const body = (instrs) => { const b = [0, ...instrs, 0x0b]; return [...leb(b.length), ...b]; };
+  const konst = (n) => [0x41, ...sleb(n)];
+  const bytes = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...sec(1, types),
+    ...(imports ? sec(2, vec([[...str("env"), ...str("peek"), 0, 0]])) : []),
+    ...sec(3, vec([[0], [1], [2], [0]])),
+    ...sec(5, vec(Array.from({ length: memories }, () => (capped ? [1, 2, 2] : [0, 2])))),
+    ...sec(7, vec([[...str("memory"), 2, 0], [...str("iqt_abi"), 0, base], [...str("iqt_alloc"), 0, base + 1], [...str("iqt_call"), 0, base + 2], [...str("iqt_len"), 0, base + 3]])),
+    ...sec(10, vec([body(konst(abi)), body(konst(65536)), body(konst(0)), body(konst(data.length))])),
+    ...sec(11, vec([[0, ...konst(0), 0x0b, ...leb(data.length), ...data]])),
+  ];
+  return Buffer.from(bytes);
+}
+
+// The IQ Tables repository, as deployed: the page plus the decoder, the
+// loader and the format registry. IQT9 is a (made-up) retired format that
+// only an older decoder reads.
+const DEC = gitRepo(13, "iq-tables");
+DEC.wasm = fs.readFileSync(path.join(ROOT, "site", "iqt-decoder.wasm"));
+DEC.iqt9 = gitBlob("iqt-decoder.wasm", fakeDecoder({ ok: { schema: { cols: ["part_no", "name", "note"], id: 0 }, records: [{ vals: ["FST-IQT9", "From a retired format", null], deleted: false }], meta: null } }), DEC.owner);
+DEC.files = () => ({
+  "index.html": "<!doctype html><title>IQ Tables</title>",
+  "iqt-decoder.wasm": DEC.wasm,
+  "iqt-loader.mjs": fs.readFileSync(path.join(ROOT, "embed", "iqt-loader.mjs")),
+  "iqt-formats.json": JSON.stringify({ abi: 1, formats: { IQT1: "current", IQT9: DEC.iqt9 } }),
+});
+DEC.first = repoCommit(DEC, "Deploy IQ Tables", DEC.files());
 
 function liveRoots() {
   const out = [...fixtureRoots];
@@ -663,7 +715,8 @@ function gateway(url, method, body) {
       const t = accCoder.decode("Table", a.data);
       return { name: Buffer.from(t.name).toString(), columns: t.column_names.map((c) => Buffer.from(c).toString()), idCol: Buffer.from(t.id_col).toString(), lastTimestamp: 0, gate: null };
     }
-    if (m[1] === GIT.pda) return { name: `git_commits:${GIT.owner}:${GIT.repo}`, columns: ["id", "message", "treeTxId", "parentCommitId", "timestamp", "author"], idCol: "id", lastTimestamp: 0, gate: null };
+    const R = REPOS.get(m[1]);
+    if (R) return { name: `git_commits:${R.owner}:${R.repo}`, columns: ["id", "message", "treeTxId", "parentCommitId", "timestamp", "author"], idCol: "id", lastTimestamp: 0, gate: null };
     if (m[1] === "3n7hcAoXkNhTc6CCGvVafkHfWmq3Rf72VXapMyzE6ZvP") return { name: "notes", columns: ["id", "text"], idCol: "id", lastTimestamp: 1777000200, gate: null };
     return { error: "not found" };
   }
@@ -766,6 +819,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const req = route.request();
     const url = req.url();
     if (url.startsWith("https://iq.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: html });
+    // the site as IQ's browser serves it: at the address of the repository it was deployed from
+    if (url.startsWith(`https://browser.iqlabs.dev/${DEC.pda}`)) return route.fulfill({ status: 200, contentType: "text/html", body: html });
     if (url.startsWith("https://files.test/")) {
       // an ordinary web server holding a file, with byte ranges and CORS
       const f = chain.webFiles && chain.webFiles[new URL(url).pathname];
@@ -1560,6 +1615,156 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     check(dl.suggestedFilename() === "homebrew.nes" && got.equals(rom), `the download is the organizer's file byte for byte (${got.length} bytes)`);
     await waitText("didn't match was skipped");
     check(true, "a recorded piece whose bytes don't match its fingerprint was skipped");
+  }
+
+  console.log("Embeds: snapshots, and live reads with the decoder");
+  {
+    // the official wallet: the database's creator
+    const fa = accCoder.decode("DbRoot", acct(rootPda).data).creator.toBase58();
+    const decSig = DEC.first.files["iqt-decoder.wasm"].txId;
+    await page.goto(`https://iq.test/#/t/${rootPda}/${fastPda}`);
+    await page.waitForFunction(() => /Official\s*600/.test(document.getElementById("app").innerText), null, { timeout: 20000 });
+    await page.click("button[data-a='embed-open']");
+    await page.waitForSelector(".embedpanel textarea.snapshot", { timeout: 30000 });
+    const panel = () => page.locator(".embedpanel").innerText();
+    const snap = await download(() => page.click(".embedpanel button[data-a='embed-dl'][data-arg='snapshot']"));
+    await page.click(".embedpanel button[data-a='embed-close']");
+    const tvCsv = await download(() => page.click("button[data-a='tv-export'][data-arg='csv']"));
+    await page.click("button[data-a='embed-open']");
+    await page.waitForSelector(".embedpanel textarea.snapshot", { timeout: 30000 });
+    const lines = snap.text.trimEnd().split("\n");
+    check(snap.name === "fasteners.csv" && lines.length === 601 && (await panel()).includes("600 rows"), `Snapshot: a CSV of the 600 official records (${lines.length - 1} rows)`);
+    check(snap.text === tvCsv.text, "the snapshot is exactly the explorer's CSV export of the official rows");
+    check((await page.locator(".embedpanel textarea.snapshot").inputValue()).startsWith(lines[0] + "\n"), "the dialog previews it");
+    await page.selectOption(".embedpanel select[data-arg='who']", "all");
+    await page.waitForFunction(() => /601 rows/.test(document.querySelector(".embedpanel").innerText), null, { timeout: 30000 });
+    await page.selectOption(".embedpanel select[data-arg='format']", "json");
+    const jd = await download(() => page.click(".embedpanel button[data-a='embed-dl'][data-arg='snapshot']"));
+    const arr = JSON.parse(jd.text);
+    check(jd.name === "fasteners.json" && arr.length === 601 && jd.text.includes("Community-submitted washer"), "Everyone's rows as JSON: 601, the community row included");
+    await page.selectOption(".embedpanel select[data-arg='format']", "html");
+    const hd = await download(() => page.click(".embedpanel button[data-a='embed-dl'][data-arg='snapshot']"));
+    check(hd.name === "fasteners.html" && hd.text.includes('<table class="iq-table">') && (hd.text.match(/<tr>/g) || []).length === 602, "an HTML table to paste into a page (601 rows + header)");
+    await page.selectOption(".embedpanel select[data-arg='who']", "official");
+    await page.click(".embedpanel button[data-a='embed-tab'][data-arg='live']");
+    await page.waitForSelector(".embedpanel input[data-arg='repo']");
+    check((await panel()).includes("isn't running from IQ's browser"), "Live, off IQ's browser: the dialog asks which repository holds the decoder");
+    await page.fill(".embedpanel input[data-arg='repo']", `https://browser.iqlabs.dev/${DEC.pda}`);
+    await page.press(".embedpanel input[data-arg='repo']", "Enter");
+    await page.waitForSelector(".embedpanel pre[data-snippet='server']", { timeout: 20000 });
+    const server = await page.locator(".embedpanel pre[data-snippet='server']").innerText();
+    check(server.includes(`table: "${fastPda}"`) && server.includes(`official: "${fa}"`) && server.includes(`rows: "official"`) && server.includes(`decoder: { repo: "${DEC.pda}", owner: "${DEC.owner}" }`) && !server.includes("pin:"), "the server snippet: the table, its official wallet, and the newest decoder in the repository");
+    check((await panel()).includes("iqt-decoder.wasm in iq-tables"), "the dialog shows which decoder it found");
+    await page.click(".embedpanel button[data-a='embed-pin'][data-arg='1']");
+    check((await page.locator(".embedpanel pre[data-snippet='server']").innerText()).includes(`pin: "${decSig}"`), "Pin this version: the snippet pins the decoder's inscription");
+    const web = await page.locator(".embedpanel pre[data-snippet='web']").innerText();
+    check(web.includes('<script type="module">') && web.includes("renderTable(") && web.includes(`pin: "${decSig}"`), "a web-page snippet too");
+    const ld = await download(() => page.click(".embedpanel button[data-a='embed-dl'][data-arg='loader']"));
+    check(ld.name === "iqt-loader.mjs" && ld.text === fs.readFileSync(path.join(ROOT, "embed", "iqt-loader.mjs"), "utf8"), "Download iqt-loader.mjs: the one file developers keep");
+    const [wd] = await Promise.all([page.waitForEvent("download"), page.click(".embedpanel button[data-a='embed-dl'][data-arg='decoder']")]);
+    check(wd.suggestedFilename() === `iqt-decoder-${decSig.slice(0, 8)}.wasm` && fs.readFileSync(await wd.path()).equals(DEC.wasm), "Download the decoder file: the deployed decoder, byte for byte");
+    await shot("09c-embed-live");
+    await page.click(".embedpanel button[data-a='embed-close']");
+    // served by IQ's browser, the page knows its own repository (another tab: this one stays signed in)
+    {
+      const p3 = await ctx.newPage();
+      await p3.route("**/*", handler);
+      await p3.goto(`https://browser.iqlabs.dev/${DEC.pda}#/t/${rootPda}/${fastPda}`);
+      await p3.waitForSelector("button[data-a='embed-open']", { timeout: 20000 });
+      await p3.click("button[data-a='embed-open']");
+      await p3.click(".embedpanel button[data-a='embed-tab'][data-arg='live']");
+      await p3.waitForSelector(".embedpanel pre[data-snippet='server']", { timeout: 20000 });
+      check((await p3.locator(".embedpanel input[data-arg='repo']").count()) === 0 && (await p3.locator(".embedpanel pre[data-snippet='server']").innerText()).includes(`repo: "${DEC.pda}"`), "served from IQ's browser, the dialog finds the decoder in the repository the site was deployed from");
+      await p3.close();
+    }
+
+    // the loader and decoder, outside the app (Node)
+    const L = await import(require("url").pathToFileURL(path.join(ROOT, "embed", "iqt-loader.mjs")).href);
+    const seen = [];
+    const down = { gateway: false, repo: false, data: false };
+    const mf = async (u, init = {}) => {
+      seen.push(u);
+      if (u.startsWith("https://gateway.iqlabs.dev/")) {
+        if (down.gateway) throw new TypeError("fetch failed");
+        if (down.repo && u.includes(`/table/${DEC.pda}/`)) return new Response("unavailable", { status: 503 });
+        if (down.data && u.includes("/data/")) return new Response("unavailable", { status: 503 });
+        const res = gateway(u, init.method || "GET", init.body);
+        return new Response(JSON.stringify(res), { status: res.error ? 404 : 200 });
+      }
+      if (u.startsWith("https://rpc.test/")) return new Response(JSON.stringify(rpc(init.body)), { status: 200 });
+      throw new TypeError("no route to " + u);
+    };
+    const base = { table: fastPda, official: fa, fetch: mf, store: null, decoder: { repo: DEC.pda, owner: DEC.owner } };
+    const fail = async (o) => { try { await L.readTable({ ...base, cacheMs: 0, ...o }); return "no error"; } catch (e) { return e.message; } };
+    const r1 = await L.readTable({ ...base, format: "csv" });
+    check(r1.data === snap.text && r1.count === 600 && r1.source === "gateway" && r1.decoderRef === decSig, `Node: readTable gives the snapshot's CSV exactly (600 rows), with the decoder ${decSig.slice(0, 8)}… from IQ git`);
+    const n1 = seen.length;
+    await L.readTable({ ...base, format: "csv" });
+    check(seen.length === n1, "a second read within cacheMs makes no requests");
+    const all = await L.readTable({ ...base, rows: "all", format: "json", cacheMs: 0 });
+    check(JSON.parse(all.data).length === 601 && all.data.includes("Community-submitted washer"), "rows \"all\" as JSON: 601, the community row included");
+    L.clearCache();
+    seen.length = 0;
+    const r2 = await L.readTable({ ...base, decoder: { pin: decSig }, format: "csv" });
+    check(r2.data === r1.data && !seen.some((u) => u.includes(`/table/${DEC.pda}/`)), "a pinned decoder loads by its inscription, without looking at the repository");
+    L.clearCache();
+    seen.length = 0;
+    const r3 = await L.readTable({ ...base, decoder: { wasm: fs.readFileSync(path.join(ROOT, "site", "iqt-decoder.wasm")) }, format: "csv" });
+    check(r3.data === r1.data && !seen.some((u) => u.includes("/data/")), "a local copy of the decoder (hosts that can't compile downloaded code) needs no download");
+    down.gateway = true;
+    const r4 = await L.readTable({ ...base, decoder: { wasm: DEC.wasm }, rpc: "https://rpc.test/", format: "csv", cacheMs: 0 });
+    down.gateway = false;
+    const sorted = (t) => t.trimEnd().split("\n").sort().join("\n");
+    check(r4.source === "solana" && sorted(r4.data) === sorted(r1.data) && r4.notes.some((n) => n.includes("gateway")), "IQ's gateway down: the rows are rebuilt from Solana (a chunked linked-list write included), same CSV");
+    const r5 = await L.readTable({ table: progPda, official: fa, fetch: mf, store: null, decoder: { wasm: DEC.wasm }, rpc: "https://rpc.test/", source: "solana", cacheMs: 0 });
+    check(r5.rows.some((row) => row.includes("generator") && row.includes(progSrc)), `source "solana": a ${Math.round(progSrc.length / 1000)} KB row sent through a session is rebuilt from its parts`);
+    check((await fail({ decoder: { wasm: fakeDecoder({ done: {} }, { imports: true }) } })).includes("refusing a decoder"), "a decoder that asks for anything outside itself is refused");
+    check((await fail({ decoder: { wasm: fakeDecoder({ done: {} }, { abi: 2 }) } })).includes("ABI 2"), "a decoder with another interface version is refused");
+    check((await fail({ decoder: { wasm: fakeDecoder({ done: {} }, { capped: false }) } })).includes("capped at 1 GiB"), "a decoder whose memory isn't capped is refused before it runs");
+    check((await fail({ decoder: { wasm: fakeDecoder({ done: {} }, { memories: 4 }) } })).includes("exactly one memory"), "a decoder with several memories (a way around the cap) is refused");
+    const write = await fail({ rpc: "https://rpc.test/", decoder: { wasm: fakeDecoder({ fetch: [{ url: "https://rpc.invalid/", method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendTransaction", params: ["AAAA"] }) }] }) } });
+    check(write.includes("isn't a read"), "a decoder can't send transactions (or any call but reads) through your RPC");
+    const post = await fail({ decoder: { wasm: fakeDecoder({ fetch: [{ url: `https://gateway.iqlabs.dev/table/${fastPda}/notify`, method: "POST", body: "{}" }] }) } });
+    check(post.includes("refused a request"), "a decoder can only GET from the gateway");
+    seen.length = 0;
+    const snoop = await fail({ decoder: { wasm: fakeDecoder({ fetch: [{ url: "http://169.254.169.254/latest/meta-data/", method: "GET" }] }) } });
+    check(snoop.includes("refused a request to http://169.254.169.254") && !seen.some((u) => u.includes("169.254")), "a decoder asking for any host but the gateway or RPC gets nothing");
+    const futPda = new PublicKey(Buffer.alloc(32, 21)).toBase58();
+    chain.rows.set(futPda, [{ id: "old1", p: "IQT9 written long ago", __txSignature: fakeSig(), __signer: fa, __blockTime: 1700000000 }]);
+    const r6 = await L.readTable({ ...base, table: futPda, cacheMs: 0 });
+    check(r6.rows.length === 1 && r6.rows[0][0] === "FST-IQT9", "a pack in a retired format goes to the older decoder that iqt-formats.json lists for it");
+    const mem = new Map();
+    const store = { get: (k) => mem.get(k) ?? null, set: (k, v) => { mem.set(k, v); } };
+    L.clearCache();
+    await L.readTable({ ...base, store, cacheMs: 0 });
+    L.clearCache();
+    down.data = true;
+    down.repo = true;
+    const r7 = await L.readTable({ ...base, store, cacheMs: 0 });
+    down.data = false;
+    down.repo = false;
+    check(r7.count === 600 && [...mem.keys()].some((k) => k.startsWith("iqt-decoder-")), "with a store, a restarted server runs its saved decoder while IQ's gateway can't serve it");
+    const loaderSrc = fs.readFileSync(path.join(ROOT, "embed", "iqt-loader.mjs"), "utf8");
+    const rendered = await page.evaluate(async ([src, opts]) => {
+      const m = await import("data:text/javascript;base64," + btoa(unescape(encodeURIComponent(src))));
+      const el = document.createElement("div");
+      document.body.appendChild(el);
+      await m.renderTable(el, opts);
+      const out = { rows: el.querySelectorAll("tbody tr").length, cols: el.querySelectorAll("thead th").length, stored: Object.keys(localStorage).filter((k) => k.startsWith("iqt-")).length };
+      el.remove();
+      return out;
+    }, [loaderSrc, { table: fastPda, official: fa, decoder: { repo: DEC.pda, owner: DEC.owner } }]);
+    check(rendered.rows === 600 && rendered.cols > 1 && rendered.stored >= 2, `In a web page: renderTable draws the 600 rows; the decoder is kept in localStorage (${rendered.stored} entries)`);
+    // following the newest decoder
+    const other = new PublicKey(Buffer.alloc(32, 22)).toBase58();
+    repoCommit(DEC, "not the owner", { ...DEC.files(), "iqt-decoder.wasm": fakeDecoder({ error: "impostor" }) }, other);
+    const fresh = { decoder: { ...base.decoder, refreshMs: 0 } };
+    L.clearCache();
+    check((await L.readTable({ ...base, ...fresh, cacheMs: 0 })).decoderRef === decSig, "a commit by anyone but the repository's owner is ignored");
+    repoCommit(DEC, "decoder 1.0.1", { ...DEC.files(), "iqt-decoder.wasm": fakeDecoder({ error: "hello from the newest decoder" }) });
+    check((await fail(fresh)).includes("hello from the newest decoder"), "the owner commits a new decoder: the next read uses it (no loader update)");
+    check((await fail({ decoder: { pin: decSig } })) === "no error", "…while a pinned read keeps the version it pinned");
+    repoCommit(DEC, "decoder 1.0.2", DEC.files());
   }
 
   console.log("Reading straight from Solana (no gateway)");

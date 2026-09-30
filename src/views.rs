@@ -39,6 +39,9 @@ pub fn render(app: &mut App) -> String {
     }
     h.push_str("</main><footer>IQ Tables · a community portal for <a href=\"https://iqlabs.dev\" target=\"_blank\" rel=\"noopener\">IQ Labs</a> on-chain tables · written in Rust, running as WebAssembly · <a href=\"#/about\">how it works</a></footer>");
     crate::git::panel(app, &mut h);
+    if matches!(app.route, Route::Table { .. }) {
+        crate::embed::panel(app, &mut h);
+    }
     viewer(app, &mut h);
     if let Some(m) = &app.busy {
         h.push_str(&format!("<div class=\"modal\" role=\"alert\" aria-busy=\"true\"><div class=\"card sheet center\"><p class=\"big\">{}</p><p class=\"muted small\">Deriving the key from your passphrase takes a moment.</p></div></div>", esc(m)));
@@ -479,38 +482,21 @@ fn search(app: &App, h: &mut String) {
 
 // ------------------------------------------------------------------ tables
 
-pub struct VRow {
-    pub key: String,
-    pub vals: Vec<Json>,
-    pub signer: String,
-    pub tx: String,
-    pub time: Option<i64>,
-    pub official: Option<bool>,
-    pub versions: usize,
-    pub packed: bool,
+pub use crate::records::VRow;
+
+/// What the explorer has read of a table, for `records`.
+pub fn source(tv: &TableView) -> crate::records::Source<'_> {
+    crate::records::Source { rows: &tv.rows, decoded: &tv.decoded, meta: tv.meta.ready(), creator: tv.creator.as_deref() }
 }
 
 fn is_packed_table(tv: &TableView) -> bool {
-    tv.decoded.iter().any(|d| d.is_some())
-}
-
-/// Every decoded pack (data and structure records), oldest first.
-fn all_packs(tv: &TableView) -> Vec<pack::SourcePack> {
-    // gateway returns newest first; merge wants oldest first
-    tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect()
+    source(tv).packed()
 }
 
 /// Records of one group of writers (None = all), with the owner's
 /// structure records applied, and the owner's latest structure.
 pub fn merged(tv: &TableView, official: Option<bool>) -> (Vec<pack::Merged>, Option<crate::schema::Doc>) {
-    let packs = all_packs(tv);
-    let creator = tv.creator.clone();
-    let is_owner = |s: &str| creator.as_deref().map(|c| c == s).unwrap_or(true);
-    let take = |p: &pack::SourcePack| match (official, &creator) {
-        (None, _) | (_, None) => true,
-        (Some(o), Some(c)) => (&p.signer == c) == o,
-    };
-    pack::merge_events(&packs, &is_owner, &take)
+    source(tv).merged(official)
 }
 
 pub fn merged_records(tv: &TableView, who: Who) -> Vec<pack::Merged> {
@@ -532,102 +518,7 @@ pub fn table_doc(tv: &TableView) -> Option<crate::schema::Doc> {
 
 /// Columns and rows for the current table view (filtered and sorted).
 pub fn view_rows(tv: &TableView) -> (Vec<String>, Vec<VRow>) {
-    let mut cols: Vec<String> = vec![];
-    let mut rows: Vec<VRow> = vec![];
-    let official_of = |signer: &str| tv.creator.as_ref().map(|c| c == signer);
-    if tv.mode == Mode::Records && is_packed_table(tv) {
-        // columns: the owner's structure (names, order, types), then any
-        // other keys found in rows (from other writers or older layouts)
-        let doc = table_doc(tv);
-        let mut keys: Vec<(String, Option<crate::schema::ColMeta>)> = vec![];
-        if let Some(d) = &doc {
-            for (n, m) in &d.cols {
-                cols.push(n.clone());
-                keys.push((m.key.clone(), Some(m.clone())));
-            }
-        }
-        let retired: Vec<String> = doc.as_ref().map(|d| d.keys.retired.clone()).unwrap_or_default();
-        let mut add = |recs: Vec<pack::Merged>, official: Option<bool>, rows: &mut Vec<VRow>, cols: &mut Vec<String>| {
-            for m in recs {
-                for (c, _) in &m.vals {
-                    if !keys.iter().any(|(k, _)| k == c) && !retired.contains(c) {
-                        keys.push((c.clone(), None));
-                        cols.push(c.clone());
-                    }
-                }
-                rows.push(VRow {
-                    key: m.key.clone(),
-                    vals: m.vals.iter().map(|(k, v)| Json::Arr(vec![Json::Str(k.clone()), v.clone()])).collect(),
-                    signer: m.signer.clone(),
-                    tx: m.tx.clone(),
-                    time: m.time,
-                    official: official.or_else(|| official_of(&m.signer)),
-                    versions: m.versions,
-                    packed: true,
-                });
-            }
-        };
-        if tv.creator.is_none() {
-            add(merged(tv, None).0, None, &mut rows, &mut cols);
-        } else {
-            if tv.who != Who::Unofficial {
-                add(merged(tv, Some(true)).0, Some(true), &mut rows, &mut cols);
-            }
-            if tv.who != Who::Official {
-                add(merged(tv, Some(false)).0, Some(false), &mut rows, &mut cols);
-            }
-        }
-        // align values to the columns, reading them through the types
-        for r in rows.iter_mut() {
-            let pairs: Vec<(String, Json)> = r.vals.iter().map(|p| (p.idx(0).str_or(""), p.idx(1).clone())).collect();
-            r.vals = keys
-                .iter()
-                .map(|(k, m)| match (pairs.iter().find(|(x, _)| x == k), m) {
-                    (Some((_, v)), Some(m)) => m.ty.read(v),
-                    (Some((_, v)), None) => v.clone(),
-                    (None, Some(m)) => m.fill.clone(),
-                    (None, None) => Json::Null,
-                })
-                .collect();
-        }
-    } else {
-        if let Load::Ready(m) = &tv.meta {
-            for c in m.get("columns").arr() {
-                if let Some(c) = c.str() {
-                    cols.push(c.to_string());
-                }
-            }
-        }
-        for r in &tv.rows {
-            for (k, _) in r.obj() {
-                if !k.starts_with("__") && !cols.contains(k) {
-                    cols.push(k.clone());
-                }
-            }
-        }
-        for r in &tv.rows {
-            let signer = r.get("__signer").str_or("");
-            let official = official_of(&signer);
-            let keep = match (tv.who, official) {
-                (_, None) | (Who::All, _) => true,
-                (Who::Official, Some(o)) => o,
-                (Who::Unofficial, Some(o)) => !o,
-            };
-            if !keep {
-                continue;
-            }
-            rows.push(VRow {
-                key: r.get("__txSignature").str_or(""),
-                vals: cols.iter().map(|c| r.get(c).clone()).collect(),
-                signer,
-                tx: r.get("__txSignature").str_or(""),
-                time: r.get("__blockTime").f64().map(|f| f as i64),
-                official,
-                versions: 1,
-                packed: pack::is_packed(r),
-            });
-        }
-    }
+    let (cols, mut rows) = source(tv).table(tv.who, tv.mode == Mode::Records);
     let q = tv.text.to_lowercase();
     if !q.is_empty() {
         rows.retain(|r| r.vals.iter().any(|v| v.cell_text().to_lowercase().contains(&q)) || r.signer.to_lowercase().contains(&q));
@@ -760,7 +651,7 @@ fn table(app: &App, h: &mut String) {
         if app.use_rpc() { "Read again from Solana" } else { "Reload from IQ's gateway, bypassing its cache" }
     ));
     h.push_str(
-        "<button class=\"btn\" data-a=\"tv-export\" data-arg=\"csv\">CSV</button><button class=\"btn\" data-a=\"tv-export\" data-arg=\"json\">JSON</button>",
+        "<button class=\"btn\" data-a=\"tv-export\" data-arg=\"csv\">CSV</button><button class=\"btn\" data-a=\"tv-export\" data-arg=\"json\">JSON</button><button class=\"btn\" data-a=\"embed-open\" title=\"Put this table on a website, in a spreadsheet or in your own code\">Embed</button>",
     );
     if packed && tv.db_id.is_some() {
         h.push_str("<button class=\"btn primary\" data-a=\"tv-draft\" data-arg=\"\" title=\"Open this table in the Editor\">Edit</button>");
@@ -928,6 +819,8 @@ fn about(h: &mut String) {
 <div class="card prose">
 <h3>Ghost data, then inscription</h3>
 <p>Drafts live in your browser. Inscribing turns them into IQ Labs table rows on Solana with <code>db_code_in</code>, the same instruction the official SDK uses. Before each step the transaction is simulated, so errors and the exact cost show up before any SOL moves.</p>
+<h3>Using a table elsewhere</h3>
+<p><b>Embed</b> on a table's page gives a snapshot (CSV for Excel or Google Sheets, JSON, or an HTML table) or a live read: a developer keeps one small file, <code>iqt-loader.mjs</code>, which reads the table each time with the IQ Tables decoder kept on IQ git. The decoder runs sealed off — it can't reach anything on the machine running it — and every storage format stays readable: a list in the same repository says which decoder reads each one. Only the official wallet's rows are included unless you ask for others.</p>
 <h3>Packing and compression</h3>
 <p>Each on-chain row holds a <em>pack</em> of many records: <code>{"id": pack-id, "p": "IQT1z…"}</code>. Records are laid out column by column, compressed with a small context-mixing compressor (order 1–5 contexts, a match model and logistic mixing — tighter than gzip or brotli on small tables), then written with a 92-character alphabet that never needs escaping inside JSON. A pack fills one transaction (up to 3,400 bytes of metadata with v1 transactions), so a single 0.001 SOL write can carry hundreds of records. Packs carry their own column list, so tables can gain columns later. Newer records replace older ones with the same id; deletions are tombstone records. Uncompressed packs (<code>IQT1j</code>) are available when you want rows searchable by the gateway.</p>
 <h3>Accounts and wallets</h3>

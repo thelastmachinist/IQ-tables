@@ -197,13 +197,7 @@ pub fn total_cost(m: &Manifest, legacy: bool) -> u64 {
     (0..m.count()).map(|i| piece_cost(m.range(i).1, legacy)).sum()
 }
 
-/// Does this explorer table look like a crowdfunded one (read all of it)?
-pub fn looks_crowd(packs: &[&SourcePack]) -> bool {
-    packs.iter().any(|p| match &p.meta {
-        Some(m) => !m.get("crowd").is_null(),
-        None => ["piece", "sha256", "tx"].iter().all(|k| p.schema.cols.iter().any(|c| c == k)),
-    })
-}
+pub use crate::pack::looks_crowd;
 
 fn hex32(h: [u8; 32]) -> String {
     hex(&h)

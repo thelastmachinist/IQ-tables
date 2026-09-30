@@ -442,9 +442,16 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 pub const MAX_RAW: u64 = 1 << 24;
 
 pub fn decompress(src: &[u8]) -> Option<Vec<u8>> {
+    decompress_max(src, MAX_RAW)
+}
+
+/// Decompress, refusing streams that would expand past `max` bytes.
+pub fn decompress_max(src: &[u8], max: u64) -> Option<Vec<u8>> {
     let mut i = 0;
     let n = get_varint(src, &mut i)?;
-    if n > MAX_RAW {
+    // the model can't squeeze more than a few thousand to one, so a tiny
+    // stream claiming megabytes is forged (and would only burn memory and time)
+    if n > MAX_RAW.min(max) || n > (src.len() as u64).saturating_mul(4096) + 4096 {
         return None;
     }
     let mut p = Predictor::new();

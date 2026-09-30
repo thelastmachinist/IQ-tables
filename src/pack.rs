@@ -132,6 +132,11 @@ pub fn unlayout(b: &[u8]) -> Option<(Schema, Vec<Record>)> {
         return None;
     }
     let nd = codec::get_varint(b, &mut i)? as usize;
+    // every value takes at least one byte, so a pack can't claim more values
+    // than it has bytes left (this keeps a forged header from allocating gigabytes)
+    if n.checked_mul(ncols)? > b.len() - i || nd > n {
+        return None;
+    }
     let mut recs: Vec<Record> = (0..n).map(|_| Record { vals: vec![Json::Null; ncols], deleted: false }).collect();
     for _ in 0..nd {
         let d = codec::get_varint(b, &mut i)? as usize;
@@ -144,7 +149,15 @@ pub fn unlayout(b: &[u8]) -> Option<(Schema, Vec<Record>)> {
             r.vals[c] = match tag {
                 0 => Json::Null,
                 1 => Json::Str(get_str(b, &mut i)?),
-                2 => Json::Num(get_str(b, &mut i)?),
+                2 => {
+                    // only real numbers stay numbers (the text is written into JSON as is)
+                    let t = get_str(b, &mut i)?;
+                    if json::is_number(&t) {
+                        Json::Num(t)
+                    } else {
+                        Json::Str(t)
+                    }
+                }
                 3 => Json::Bool(true),
                 4 => Json::Bool(false),
                 5 => json::parse(&get_str(b, &mut i)?).ok()?,
@@ -183,17 +196,40 @@ pub fn encode_schema(doc: &Json, cap: usize) -> String {
 
 /// Decode any pack: data (schema + records) or a structure record.
 pub fn decode_any(p: &str) -> Result<(Schema, Vec<Record>, Option<Json>), String> {
+    decode_any_max(p, codec::MAX_RAW)
+}
+
+/// The size a pack says it unpacks to, read from its first few characters
+/// (before doing any of the work).
+pub fn unpacked_size(p: &str) -> Option<u64> {
+    let body = p.strip_prefix(MAGIC)?;
+    let mode = body.chars().next()?;
+    let rest = &body[mode.len_utf8()..];
+    match mode {
+        'z' | 'S' => {
+            // 13 bits per character pair: 16 characters hold any varint
+            let head: String = rest.chars().take(16).collect();
+            let b = codec::from_text(&head)?;
+            let mut i = 0;
+            codec::get_varint(&b, &mut i)
+        }
+        _ => Some(rest.len() as u64),
+    }
+}
+
+/// `decode_any`, refusing packs that unpack past `max` bytes.
+pub fn decode_any_max(p: &str, max: u64) -> Result<(Schema, Vec<Record>, Option<Json>), String> {
     let body = p.strip_prefix(MAGIC).ok_or("not an IQT1 pack")?;
     let none = Schema { cols: vec!["id".into()], id: 0 };
     match body.chars().next() {
         Some('s') => Ok((none, vec![], Some(json::parse(&body[1..])?))),
         Some('S') => {
             let bytes = codec::from_text(&body[1..]).ok_or("bad text encoding")?;
-            let raw = codec::decompress(&bytes).ok_or("bad compressed stream")?;
+            let raw = codec::decompress_max(&bytes, max).ok_or("bad compressed stream (or too big)")?;
             let text = String::from_utf8(raw).map_err(|_| "bad structure record")?;
             Ok((none, vec![], Some(json::parse(&text)?)))
         }
-        _ => decode_payload(p).map(|(s, r)| (s, r, None)),
+        _ => decode_payload_max(p, max).map(|(s, r)| (s, r, None)),
     }
 }
 
@@ -202,21 +238,32 @@ pub fn is_packed(v: &Json) -> bool {
 }
 
 pub fn decode_payload(p: &str) -> Result<(Schema, Vec<Record>), String> {
+    decode_payload_max(p, codec::MAX_RAW)
+}
+
+fn decode_payload_max(p: &str, max: u64) -> Result<(Schema, Vec<Record>), String> {
     let body = p.strip_prefix(MAGIC).ok_or("not an IQT1 pack")?;
+    if p.len() as u64 > max.saturating_mul(2) + 4096 {
+        return Err("pack too big".into());
+    }
     let mode = body.chars().next().ok_or("empty pack")?;
-    let rest = &body[1..];
+    let rest = &body[mode.len_utf8()..];
     match mode {
         'z' => {
             let bytes = codec::from_text(rest).ok_or("bad text encoding")?;
-            let raw = codec::decompress(&bytes).ok_or("bad compressed stream")?;
+            let raw = codec::decompress_max(&bytes, max).ok_or("bad compressed stream (or too big)")?;
             unlayout(&raw).ok_or_else(|| "bad pack layout".to_string())
         }
         'j' => {
             let v = json::parse(rest)?;
             let cols: Vec<String> = v.get("c").arr().iter().map(|c| c.str_or("")).collect();
             let id = v.get("i").u64().unwrap_or(0) as usize;
-            if cols.is_empty() || id >= cols.len() {
+            if cols.is_empty() || cols.len() > 4096 || id >= cols.len() {
                 return Err("bad schema".into());
+            }
+            // rows are padded to the columns: keep that proportional to the pack's size
+            if v.get("r").arr().len().checked_mul(cols.len()).map(|n| n > rest.len() + 4096).unwrap_or(true) {
+                return Err("bad pack size".into());
             }
             let mut recs: Vec<Record> = v
                 .get("r")
@@ -555,4 +602,14 @@ pub fn checkpoint_covers(newest_first: &[SourcePack], official: &dyn Fn(&str) ->
         return d.snap.iter().all(|id| newest_first[i..].iter().any(|q| q.meta.is_none() && q.id == *id && official(&q.signer)));
     }
     false
+}
+
+/// A crowdfunded upload's table (its manifest is a structure record with
+/// `crowd`; registrations have columns piece, sha256, tx). Such a table is
+/// read whole: its oldest record is what counts, and anyone may add rows.
+pub fn looks_crowd(packs: &[&SourcePack]) -> bool {
+    packs.iter().any(|p| match &p.meta {
+        Some(m) => !m.get("crowd").is_null(),
+        None => ["piece", "sha256", "tx"].iter().all(|k| p.schema.cols.iter().any(|c| c == k)),
+    })
 }

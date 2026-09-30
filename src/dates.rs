@@ -108,7 +108,8 @@ fn month_from_name(s: &str) -> Option<u32> {
     if l.len() < 3 {
         return None;
     }
-    MONTHS.iter().position(|m| m.to_ascii_lowercase().starts_with(&l[..3]) && m.to_ascii_lowercase().starts_with(&l)).map(|i| i as u32 + 1)
+    let head = l.get(..3)?;
+    MONTHS.iter().position(|m| m.to_ascii_lowercase().starts_with(head) && m.to_ascii_lowercase().starts_with(&l)).map(|i| i as u32 + 1)
 }
 
 fn two_digit_year(y: i64) -> i64 {
@@ -251,6 +252,7 @@ pub fn time_str(neg: bool, secs: i64, micros: u32) -> String {
 }
 
 /// The browser's local time right now.
+#[cfg(feature = "app")]
 pub fn now_local() -> Dt {
     let ms = crate::host::now_ms() as i64 + crate::host::tz_offset_min() as i64 * 60_000;
     let mut d = Dt::from_unix(ms.div_euclid(1000));
@@ -258,6 +260,7 @@ pub fn now_local() -> Dt {
     d
 }
 
+#[cfg(feature = "app")]
 pub fn now_utc() -> Dt {
     let ms = crate::host::now_ms() as i64;
     Dt::from_unix(ms.div_euclid(1000))

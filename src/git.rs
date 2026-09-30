@@ -3,9 +3,9 @@
 //! IQ Labs' git keeps each repository's history in an IQ table of the
 //! database "iq-git-v1": the table `git_commits:<owner>:<repo>` with columns
 //! id, message, treeTxId, parentCommitId, timestamp (ms) and author. A
-//! commit's tree is a JSON inscription (`iqgit-tree`) mapping each path to
-//! `{txId, hash}`, and each file is an inscription named `iqgit-blob:<path>`
-//! holding its bytes in base64. IQ's browser shows a repository at
+//! commit's tree is a JSON inscription (`tree.json`, or `iqgit-tree` from
+//! older versions) mapping each path to `{txId, hash}`, and each file is an
+//! inscription holding its bytes in base64. IQ's browser shows a repository at
 //! `https://browser.iqlabs.dev/<commit table address>`.
 //!
 //! A cell holding that link shows the repository's newest commit, read when
@@ -29,6 +29,9 @@ pub const BROWSER: &str = "https://browser.iqlabs.dev/";
 /// How long a repository's commit list is reused before a cell re-reads it.
 const FRESH_MS: f64 = 120_000.0;
 const COMMITS_READ: usize = 50;
+/// Pages of a commit table read at most while looking for the owner's
+/// commits (2,000 rows, the same as iqt-loader.mjs).
+const COMMIT_PAGES: u32 = 40;
 
 #[derive(Clone, Debug)]
 pub struct Commit {
@@ -47,6 +50,10 @@ pub struct Repo {
     /// When the commit list was last read (ms).
     pub at: f64,
     pub busy: bool,
+    /// Reading older pages of the commit table (others' rows can push the
+    /// owner's commits past the first page).
+    pub cursor: Option<String>,
+    pub pages: u32,
 }
 
 /// What the app knows about an address behind an IQ browser link.
@@ -331,13 +338,27 @@ impl App {
                 _ => false,
             };
             if stale {
-                self.git_rows(&w);
+                self.git_read(&w);
             }
         }
     }
 
     fn git_rows(&mut self, pda: &str) {
-        self.get(&format!("/table/{}/rows?limit={}", pda, COMMITS_READ), P::GitRows(pda.to_string()));
+        let before = match self.git.repos.get_mut(pda) {
+            Some(Load::Ready(Some(r))) => r.cursor.clone(),
+            _ => None,
+        };
+        let q = before.map(|b| format!("&before={}", b)).unwrap_or_default();
+        self.get(&format!("/table/{}/rows?limit={}{}", pda, COMMITS_READ, q), P::GitRows(pda.to_string()));
+    }
+
+    /// Start reading a repository's commits from the newest.
+    fn git_read(&mut self, pda: &str) {
+        if let Some(Load::Ready(Some(r))) = self.git.repos.get_mut(pda) {
+            r.cursor = None;
+            r.pages = 0;
+        }
+        self.git_rows(pda);
     }
 
     pub fn git_action(&mut self, a: &str, arg: &str) {
@@ -356,7 +377,7 @@ impl App {
                     }
                     r.busy = true;
                 }
-                self.git_rows(arg);
+                self.git_read(arg);
             }
             _ => {}
         }
@@ -369,7 +390,15 @@ impl App {
             P::GitMeta(pda) => {
                 let v = if http_ok {
                     let name = json::parse(&text).ok().and_then(|m| m.get("name").str().map(String::from)).unwrap_or_default();
-                    Load::Ready(repo_of(&pda, &name).map(|(owner, name)| Repo { owner, name, commits: Load::Loading, at: 0.0, busy: true }))
+                    Load::Ready(repo_of(&pda, &name).map(|(owner, name)| Repo {
+                        owner,
+                        name,
+                        commits: Load::Loading,
+                        at: 0.0,
+                        busy: true,
+                        cursor: None,
+                        pages: 0,
+                    }))
                 } else if ok && status == 404 {
                     Load::Ready(None)
                 } else {
@@ -378,21 +407,39 @@ impl App {
                 let is_repo = matches!(v, Load::Ready(Some(_)));
                 self.git.repos.insert(pda.clone(), v);
                 if is_repo {
-                    self.git_rows(&pda);
+                    self.git_read(&pda);
                 }
             }
             P::GitRows(pda) => {
+                let mut more = false;
                 if let Some(Load::Ready(Some(r))) = self.git.repos.get_mut(&pda) {
-                    r.busy = false;
-                    r.at = host::now_ms();
-                    let got =
-                        if http_ok { json::parse(&text).map(|v| parse_commits(v.get("rows").arr(), &r.owner)) } else { Err(fetch_err(ok, status, &text)) };
-                    match got {
+                    let parsed = if http_ok { json::parse(&text) } else { Err(fetch_err(ok, status, &text)) };
+                    let got = parsed.map(|v| {
+                        let next = v.get("nextCursor").str().map(String::from);
+                        (parse_commits(v.get("rows").arr(), &r.owner), next)
+                    });
+                    // none of the owner's commits on this page: look further back
+                    if let Ok((cs, Some(next))) = &got {
+                        if cs.is_empty() && r.pages + 1 < COMMIT_PAGES {
+                            r.cursor = Some(next.clone());
+                            r.pages += 1;
+                            more = true;
+                        }
+                    }
+                    if !more {
+                        r.busy = false;
+                        r.at = host::now_ms();
+                    }
+                    match got.map(|(cs, _)| cs) {
+                        _ if more => {}
                         Ok(v) => r.commits = Load::Ready(v),
                         // keep what was shown if a refresh fails
                         Err(e) if !matches!(r.commits, Load::Ready(_)) => r.commits = Load::Err(e),
                         Err(e) => self.toast = Some((false, format!("Couldn't refresh {}: {}", r.name, e))),
                     }
+                }
+                if more {
+                    self.git_rows(&pda);
                 }
             }
             P::GitTree(tree) => {

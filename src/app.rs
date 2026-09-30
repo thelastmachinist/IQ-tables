@@ -52,12 +52,7 @@ pub enum Route {
     About,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Who {
-    Official,
-    Unofficial,
-    All,
-}
+pub use crate::records::Who;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -83,6 +78,13 @@ pub struct TableView {
     pub cut: bool,
     /// Chunked rows still being reassembled (direct Solana reads).
     pub chunk_waits: usize,
+    /// Read past the owner's checkpoint (other writers' older rows are wanted).
+    pub full: bool,
+    /// Unpacked bytes of other writers' packs so far (records::decode_row_for).
+    pub others_raw: u64,
+    /// Rows were decoded before the official wallet was known (with everyone
+    /// held to the small limits); decode them again once it is.
+    pub blind: bool,
     pub mode: Mode,
     pub who: Who,
     pub text: String,
@@ -175,6 +177,8 @@ pub enum P {
     CrowdDl(usize, usize),
     /// Read the current piece of the download again (after a pause).
     CrowdDlNext,
+    /// A decoder inscription to download (embed.rs).
+    EmbedWasm(String),
     // IQ git links (git.rs)
     GitMeta(String),
     GitRows(String),
@@ -260,6 +264,10 @@ pub struct App {
     pub uploads: HashMap<String, crate::upload::Batch>,
     /// Crowdfunded uploads (crowd.rs).
     pub crowd: crate::crowd::Crowd,
+    /// The open "use this table elsewhere" dialog (embed.rs).
+    pub embed: Option<crate::embed::Embed>,
+    /// This page's address (origin and path), from the browser.
+    pub page_url: String,
 }
 
 thread_local! {
@@ -417,6 +425,8 @@ impl App {
             git: Default::default(),
             uploads: HashMap::new(),
             crowd: Default::default(),
+            embed: None,
+            page_url: String::new(),
         }
     }
 
@@ -531,6 +541,7 @@ impl App {
             self.toast = None;
         }
         self.account_menu = false;
+        self.embed = None;
         self.route = match parts.as_slice() {
             ["db", pda] => Route::Db(pda.to_string()),
             ["t", root, pda, "r", rec] => Route::Table { root: Some(root.to_string()), pda: pda.to_string(), record: Some(pct_decode(rec)) },
@@ -664,6 +675,9 @@ impl App {
             load_all: false,
             cut: false,
             chunk_waits: 0,
+            full: false,
+            others_raw: 0,
+            blind: false,
             mode: Mode::Records,
             who: Who::Official,
             text: String::new(),
@@ -718,6 +732,7 @@ impl App {
         if let (Some((rp, creator, id, label)), Some(t)) = (info, self.table.as_mut()) {
             t.root = Some(rp);
             t.creator = Some(creator);
+            redecode(t);
             t.db_id = id;
             if !label.is_empty() {
                 t.label = Some(label);
@@ -764,6 +779,9 @@ impl App {
     pub fn stop_at_checkpoint(&mut self, pda: &str, gen: u32) -> bool {
         let Some(owner) = self.official_for(pda) else { return false };
         let Some(t) = self.tv_mut(pda, gen) else { return false };
+        if t.full {
+            return false;
+        }
         let packs: Vec<pack::SourcePack> = t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
         // a crowdfunded table is always read to its start: its first manifest is what counts
         if crate::crowd::looks_crowd(&packs.iter().collect::<Vec<_>>()) {
@@ -808,6 +826,7 @@ impl App {
     pub fn event(&mut self, kind: &str, action: &str, arg: &str, val: &str) -> bool {
         match (kind, action) {
             ("route", _) => self.route(val),
+            ("page", _) => self.page_url = val.to_string(),
             (_, "go") => host::set_hash(arg),
             (_, "toast-close") => self.toast = None,
             (_, "db-filter") => self.db_filter = val.to_string(),
@@ -978,6 +997,9 @@ impl App {
             (_, "open-tx") => self.open_tx(arg, val),
             (_, "viewer-close") => self.viewer = None,
             (_, a) if a.starts_with("git-") => self.git_action(a, arg),
+            (_, a) if a.starts_with("embed-") => {
+                self.embed_event(a, arg, val);
+            }
             (k, a) if a.starts_with("crowd-") && self.crowd_event(k, a, arg, val) => {}
             (_, "viewer-download") => self.viewer_download(),
             (_, "attach-col") => {
@@ -1137,6 +1159,7 @@ impl App {
                 };
                 if let (Some(t), Some(root)) = (self.table.as_mut().filter(|t| t.pda == pda && t.gen == gen), creator) {
                     t.creator = Some(b58(&root.creator));
+                    redecode(t);
                     if t.db_id.is_none() {
                         t.db_id = String::from_utf8(root.id.clone()).ok();
                     }
@@ -1159,6 +1182,7 @@ impl App {
             P::Rows(pda, gen) => {
                 let mut again = false;
                 let mut finished = false;
+                let official = self.official_for(&pda);
                 if let Some(t) = self.tv_mut(&pda, gen) {
                     t.loading = false;
                     if http_ok {
@@ -1166,7 +1190,8 @@ impl App {
                             Ok(v) => {
                                 let rows = v.get("rows").arr().to_vec();
                                 for r in &rows {
-                                    t.decoded.push(decode_row(r));
+                                    let d = decode_for(r, official.as_deref(), t);
+                                    t.decoded.push(d);
                                 }
                                 let n = rows.len();
                                 t.rows.extend(rows);
@@ -1274,6 +1299,7 @@ impl App {
             }
             P::SaveCheck { .. } => self.save_async(p, ok, status, data),
             P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
+            P::EmbedWasm(_) => self.embed_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
             P::CrowdHash(..) | P::CrowdPiece(_) | P::CrowdDl(..) | P::CrowdDlNext => self.crowd_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
@@ -1650,16 +1676,9 @@ impl App {
         let (cols, rows) = crate::views::view_rows(tv);
         let name = tv.label.clone().unwrap_or_else(|| tv.pda.clone());
         if fmt == "json" {
-            let arr: Vec<Json> = rows.iter().map(|r| Json::Obj(cols.iter().cloned().zip(r.vals.iter().cloned()).collect())).collect();
-            host::download(&format!("{}.json", safe_name(&name)), "application/json", Json::Arr(arr).to_string().as_bytes());
+            host::download(&format!("{}.json", safe_name(&name)), "application/json", crate::records::json_rows(&cols, &rows).to_string().as_bytes());
         } else {
-            let mut out = cols.iter().map(|c| ui::csv_cell(c)).collect::<Vec<_>>().join(",");
-            out.push('\n');
-            for r in &rows {
-                out.push_str(&r.vals.iter().map(|v| ui::csv_cell(&v.cell_text())).collect::<Vec<_>>().join(","));
-                out.push('\n');
-            }
-            host::download(&format!("{}.csv", safe_name(&name)), "text/csv", out.as_bytes());
+            host::download(&format!("{}.csv", safe_name(&name)), "text/csv", crate::records::csv(&cols, &rows).as_bytes());
         }
     }
 
@@ -1743,20 +1762,17 @@ pub const ROWS_PER_PAGE: usize = 50;
 pub const DEV_GATEWAY: &str = "https://dev-gateway.iqlabs.dev";
 pub const MAIN_GATEWAY: &str = "https://gateway.iqlabs.dev";
 
-pub fn decode_row(r: &Json) -> Option<Result<pack::SourcePack, String>> {
-    let p = r.get("p").str()?;
-    if !p.starts_with(pack::MAGIC) {
-        return None;
+pub use crate::records::decode_row;
+
+/// Decode a row read for table view `t`. Until the official wallet is known,
+/// everyone is held to the limits for other writers (anyone can write to a
+/// table, and a shared link opens the table before its database is known);
+/// `App::redecode` reads those rows again once it is.
+pub fn decode_for(r: &Json, official: Option<&str>, t: &mut TableView) -> Option<Result<pack::SourcePack, String>> {
+    if official.is_none() {
+        t.blind = true;
     }
-    Some(pack::decode_any(p).map(|(schema, recs, meta)| pack::SourcePack {
-        id: r.get("id").str_or(""),
-        tx: r.get("__txSignature").str_or(""),
-        signer: r.get("__signer").str_or(""),
-        time: r.get("__blockTime").f64().map(|f| f as i64),
-        schema,
-        recs,
-        meta,
-    }))
+    crate::records::decode_row_for(r, Some(official.unwrap_or("")), &mut t.others_raw)
 }
 
 pub fn fetch_err(ok: bool, status: u32, body: &str) -> String {
@@ -1775,7 +1791,7 @@ pub fn fetch_err(ok: bool, status: u32, body: &str) -> String {
     net::gateway_error(status, body)
 }
 
-fn safe_name(s: &str) -> String {
+pub fn safe_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
@@ -1807,4 +1823,17 @@ pub fn pct_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The official wallet is now known: decode again what was decoded without it.
+pub fn redecode(t: &mut TableView) {
+    if !t.blind {
+        return;
+    }
+    let Some(c) = t.creator.clone() else { return };
+    t.blind = false;
+    t.others_raw = 0;
+    let mut used = 0;
+    t.decoded = t.rows.iter().map(|r| crate::records::decode_row_for(r, Some(&c), &mut used)).collect();
+    t.others_raw = used;
 }

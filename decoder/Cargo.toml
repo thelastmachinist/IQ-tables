@@ -1,0 +1,12 @@
+[package]
+name = "iqt_decoder"
+version = "1.0.0"
+edition = "2021"
+description = "IQ Tables decoder: reads IQ Tables data from IQ Labs tables; runs sealed (no imports) under iqt-loader.js"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+iq_tables = { path = "..", default-features = false }

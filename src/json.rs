@@ -83,7 +83,7 @@ impl Json {
     /// Display text for a cell: strings unquoted, everything else as JSON.
     pub fn cell_text(&self) -> String {
         match self {
-            Json::Str(s) => s.clone(),
+            Json::Str(s) | Json::Num(s) => s.clone(),
             Json::Null => String::new(),
             other => other.to_string(),
         }
@@ -98,6 +98,45 @@ pub fn n<T: std::fmt::Display>(v: T) -> Json {
 }
 pub fn obj(pairs: Vec<(&str, Json)>) -> Json {
     Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// JSON's number grammar: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+pub fn is_number(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if b.first() == Some(&b'-') {
+        i += 1;
+    }
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            digits(&mut i);
+        }
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    i == b.len()
 }
 
 pub fn escape_into(out: &mut String, s: &str) {
@@ -136,7 +175,9 @@ fn write_json(out: &mut String, v: &Json) {
     match v {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Json::Num(s) => out.push_str(s),
+        // a number that isn't one (it came from somewhere untrusted) goes out as text
+        Json::Num(s) if is_number(s) => out.push_str(s),
+        Json::Num(s) => escape_into(out, s),
         Json::Str(s) => escape_into(out, s),
         Json::Arr(a) => {
             out.push('[');

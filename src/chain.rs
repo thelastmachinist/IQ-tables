@@ -4,13 +4,11 @@
 //! history and decoding each inline `db_code_in` — the same thing the gateway
 //! does, minus its cache.
 
-use crate::app::{decode_row, fetch_err, App, Load, P};
-use crate::crypto::base64_decode;
+use crate::app::{fetch_err, App, Load, P};
 use crate::host;
 use crate::iq;
 use crate::json::{self, Json};
-use crate::net::{self, DbRootInfo};
-use crate::solana::{self, b58};
+use crate::net::{self, rows_from_tx, tx_request, DbRootInfo};
 
 /// Signatures per page of table history.
 pub const SIG_PAGE: usize = 25;
@@ -65,21 +63,6 @@ fn roots_params() -> Json {
     ])
 }
 
-fn tx_request(sig: &str, id: usize) -> Json {
-    json::obj(vec![
-        ("jsonrpc", json::s("2.0")),
-        ("id", json::n(id)),
-        ("method", json::s("getTransaction")),
-        (
-            "params",
-            Json::Arr(vec![
-                json::s(sig),
-                json::obj(vec![("encoding", json::s("base64")), ("maxSupportedTransactionVersion", json::n(1)), ("commitment", json::s("confirmed"))]),
-            ]),
-        ),
-    ])
-}
-
 /// Every DbRoot in a `getProgramAccounts` result.
 pub fn roots_from(v: &Json) -> Vec<DbRootInfo> {
     let mut out: Vec<DbRootInfo> = v
@@ -93,47 +76,6 @@ pub fn roots_from(v: &Json) -> Vec<DbRootInfo> {
         })
         .collect();
     net::sort_roots(&mut out);
-    out
-}
-
-/// Rows (gateway-shaped) from one `getTransaction` result, for table `pda`.
-pub fn rows_from_tx(result: &Json, pda: &str) -> Vec<Json> {
-    let mut out = vec![];
-    if result.is_null() || !result.get("meta").get("err").is_null() {
-        return out;
-    }
-    let Some(raw) = result.get("transaction").idx(0).str().and_then(base64_decode) else { return out };
-    let Some(tx) = solana::parse_tx(&raw) else { return out };
-    let pid = iq::program_id();
-    let time = result.get("blockTime").u64();
-    for (p, accs, data) in &tx.ixs {
-        if tx.keys.get(*p) != Some(&pid) {
-            continue;
-        }
-        let Some(d) = iq::decode_db_code_in(data) else { continue };
-        // account 7 of db_code_in is the table
-        if accs.get(7).and_then(|&i| tx.keys.get(i)).map(b58).as_deref() != Some(pda) {
-            continue;
-        }
-        let mut row = if !d.on_chain_path.is_empty() {
-            // a chunked upload: a placeholder, filled in once its parts are read
-            let total = json::parse(&d.metadata).ok().and_then(|m| m.get("total_chunks").u64()).unwrap_or(0);
-            json::obj(vec![("__onChainPath", json::s(&d.on_chain_path)), ("__chunks", json::n(total)), ("__pending", Json::Bool(true))])
-        } else {
-            match iq::row_from_metadata(&d.metadata) {
-                Some(r) => r,
-                None => continue,
-            }
-        };
-        row.set("__txSignature", json::s(&tx.signature));
-        if let Some(signer) = accs.first().and_then(|&i| tx.keys.get(i)) {
-            row.set("__signer", json::s(&b58(signer)));
-        }
-        if let Some(t) = time {
-            row.set("__blockTime", json::n(t));
-        }
-        out.push(row);
-    }
     out
 }
 
@@ -176,6 +118,7 @@ impl App {
 
     fn push_rows(&mut self, pda: &str, gen: u32, rows: Vec<Json>) {
         let mut reads = vec![];
+        let official = self.official_for(pda);
         if let Some(t) = self.tv_mut(pda, gen) {
             for r in rows {
                 // a retried page must not add the same row twice
@@ -189,12 +132,13 @@ impl App {
                     let total = r.get("__chunks").u64().unwrap_or(0) as usize;
                     reads.push((sig.clone(), path, total));
                 }
-                t.decoded.push(decode_row(&r));
+                let d = crate::app::decode_for(&r, official.as_deref(), t);
+                t.decoded.push(d);
                 t.rows.push(r);
             }
         }
         for (sig, path, total) in reads {
-            let kind = if path.len() >= 80 {
+            let kind = if net::is_linked_path(&path) {
                 ChunkKind::Linked { next: path, parts: vec![] }
             } else {
                 ChunkKind::Session { session: path, sigs: vec![], parts: Default::default(), total, listed: false }
@@ -229,24 +173,14 @@ impl App {
     fn chunk_done(&mut self, c: ChunkRead) {
         let text = match &c.kind {
             ChunkKind::Linked { parts, .. } => Some(parts.concat()),
-            ChunkKind::Session { parts, total, .. } => {
-                let n = if *total > 0 { *total } else { parts.len() };
-                let ok = (0..n as u32).all(|i| parts.contains_key(&i));
-                ok.then(|| (0..n as u32).map(|i| parts[&i].as_str()).collect::<String>())
-            }
+            ChunkKind::Session { parts, total, .. } => net::join_parts(parts, *total),
         };
-        let row = text.and_then(|t| json::parse(&t).ok()).filter(|r| matches!(r, Json::Obj(_)));
+        let official = self.official_for(&c.pda);
         let mut finished = false;
         if let Some(t) = self.tv_mut(&c.pda, c.gen) {
             if let Some(i) = t.rows.iter().position(|r| r.get("__txSignature").str() == Some(c.sig.as_str()) && r.get("__pending").bool() == Some(true)) {
-                let old = t.rows[i].clone();
-                let mut row = row.unwrap_or_else(|| json::obj(vec![("__unreadable", Json::Bool(true))]));
-                for k in ["__txSignature", "__signer", "__blockTime", "__onChainPath"] {
-                    if !old.get(k).is_null() {
-                        row.set(k, old.get(k).clone());
-                    }
-                }
-                t.decoded[i] = decode_row(&row);
+                let row = net::chunked_row(text.as_deref(), &t.rows[i]);
+                t.decoded[i] = crate::app::decode_for(&row, official.as_deref(), t);
                 t.rows[i] = row;
             }
             t.chunk_waits = t.chunk_waits.saturating_sub(1);
@@ -409,33 +343,23 @@ impl App {
                     return false;
                 }
                 let r = res();
-                let pid = iq::program_id();
-                let decode = |v: &Json| -> Option<solana::ParsedTx> {
-                    let raw = v.get("transaction").idx(0).str().and_then(base64_decode)?;
-                    solana::parse_tx(&raw)
-                };
                 match (&mut c.kind, r) {
-                    (ChunkKind::Linked { next, parts }, Ok(v)) => {
-                        let found = decode(&v).and_then(|tx| {
-                            tx.ixs.iter().find_map(|(p, _, data)| (tx.keys.get(*p) == Some(&pid)).then(|| iq::decode_send_code(data)).flatten())
-                        });
-                        match found {
-                            Some((code, before)) if parts.len() < 1000 => {
-                                parts.insert(0, code);
-                                if before == "Genesis" || before.is_empty() {
-                                    self.chunk_done(c);
-                                } else {
-                                    *next = before;
-                                    self.chunk_step(c);
-                                }
-                            }
-                            _ => {
-                                parts.clear();
-                                parts.push(String::new());
+                    (ChunkKind::Linked { next, parts }, Ok(v)) => match net::linked_part(&v) {
+                        Some((code, before)) if parts.len() < 1000 => {
+                            parts.insert(0, code);
+                            if before == "Genesis" || before.is_empty() {
                                 self.chunk_done(c);
+                            } else {
+                                *next = before;
+                                self.chunk_step(c);
                             }
                         }
-                    }
+                        _ => {
+                            parts.clear();
+                            parts.push(String::new());
+                            self.chunk_done(c);
+                        }
+                    },
                     (ChunkKind::Session { sigs, listed, .. }, Ok(v)) if !*listed => {
                         *listed = true;
                         *sigs = v.arr().iter().filter(|x| x.get("err").is_null()).filter_map(|x| x.get("signature").str().map(String::from)).collect();
@@ -444,14 +368,8 @@ impl App {
                         self.chunk_step(c);
                     }
                     (ChunkKind::Session { sigs, parts, .. }, Ok(v)) => {
-                        if let Some(tx) = decode(&v) {
-                            for (p, _, data) in &tx.ixs {
-                                if tx.keys.get(*p) == Some(&pid) {
-                                    if let Some((i, chunk)) = iq::decode_post_chunk(data) {
-                                        parts.insert(i, chunk);
-                                    }
-                                }
-                            }
+                        for (i, chunk) in net::session_parts(&v) {
+                            parts.insert(i, chunk);
                         }
                         if !sigs.is_empty() {
                             sigs.remove(0);

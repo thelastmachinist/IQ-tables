@@ -1,0 +1,7 @@
+{
+  "abi": 1,
+  "about": "Which IQ Tables decoder reads each storage format. \"current\" means the newest iqt-decoder.wasm in this repository; otherwise the value is the inscription (transaction signature) of an older decoder that still reads that format. A format, once listed, is never removed.",
+  "formats": {
+    "IQT1": "current"
+  }
+}

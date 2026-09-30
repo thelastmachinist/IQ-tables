@@ -178,6 +178,13 @@ ul.commits li, ul.files li { padding: 3px 0; overflow-wrap: anywhere; }
 ul.commits li.on > .link { font-weight: 700; color: var(--ink); }
 .gitpanel code { overflow-wrap: anywhere; }
 @media (max-width: 640px) { .gitcols { grid-template-columns: 1fr; } }
+.embedpanel label.inline { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: .9rem; }
+.embedpanel label.stack { display: grid; gap: 4px; margin: 8px 0 2px; font-size: .9rem; color: var(--muted); }
+.embedpanel label.stack input { width: 100%; }
+.embedpanel h4 { margin: 14px 0 0; }
+.embedpanel textarea.snapshot { min-height: 180px; white-space: pre; }
+.embedpanel pre.code { white-space: pre; max-height: 300px; }
+.embedpanel .card.small { margin: 8px 0; }
 .cell-link { margin-top: 2px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nowrap { white-space: nowrap; }
 input.inline { padding: 3px 6px; min-width: 110px; max-width: 200px; }

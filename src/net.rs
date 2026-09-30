@@ -138,3 +138,129 @@ pub fn gateway_error(status: u32, body: &str) -> String {
     let m = v.as_ref().and_then(|v| v.get("error").str().map(String::from)).unwrap_or_else(|| body.chars().take(160).collect());
     format!("gateway {}: {}", status, m)
 }
+
+// ------------------------------------------------ rows read from Solana
+
+/// A `getTransaction` JSON-RPC request.
+pub fn tx_request(sig: &str, id: usize) -> Json {
+    json::obj(vec![
+        ("jsonrpc", json::s("2.0")),
+        ("id", json::n(id)),
+        ("method", json::s("getTransaction")),
+        (
+            "params",
+            Json::Arr(vec![
+                json::s(sig),
+                json::obj(vec![("encoding", json::s("base64")), ("maxSupportedTransactionVersion", json::n(1)), ("commitment", json::s("confirmed"))]),
+            ]),
+        ),
+    ])
+}
+
+/// A `getSignaturesForAddress` JSON-RPC request.
+pub fn sigs_request(address: &str, limit: usize, before: Option<&str>, id: usize) -> Json {
+    let mut cfg = json::obj(vec![("limit", json::n(limit)), ("commitment", json::s("confirmed"))]);
+    if let Some(b) = before {
+        cfg.set("before", json::s(b));
+    }
+    json::obj(vec![
+        ("jsonrpc", json::s("2.0")),
+        ("id", json::n(id)),
+        ("method", json::s("getSignaturesForAddress")),
+        ("params", Json::Arr(vec![json::s(address), cfg])),
+    ])
+}
+
+/// The transaction in a `getTransaction` result.
+pub fn parsed_tx(result: &Json) -> Option<crate::solana::ParsedTx> {
+    let raw = result.get("transaction").idx(0).str().and_then(base64_decode)?;
+    crate::solana::parse_tx(&raw)
+}
+
+/// Rows (gateway-shaped) from one `getTransaction` result, for table `pda`.
+/// A row sent in chunks comes back as a placeholder (`__pending`, with
+/// `__onChainPath` and `__chunks`) until its parts are read.
+pub fn rows_from_tx(result: &Json, pda: &str) -> Vec<Json> {
+    use crate::iq;
+    use crate::solana::b58;
+    let mut out = vec![];
+    if result.is_null() || !result.get("meta").get("err").is_null() {
+        return out;
+    }
+    let Some(tx) = parsed_tx(result) else { return out };
+    let pid = iq::program_id();
+    let time = result.get("blockTime").u64();
+    for (p, accs, data) in &tx.ixs {
+        if tx.keys.get(*p) != Some(&pid) {
+            continue;
+        }
+        let Some(d) = iq::decode_db_code_in(data) else { continue };
+        // account 7 of db_code_in is the table
+        if accs.get(7).and_then(|&i| tx.keys.get(i)).map(b58).as_deref() != Some(pda) {
+            continue;
+        }
+        let mut row = if !d.on_chain_path.is_empty() {
+            // a chunked upload: a placeholder, filled in once its parts are read
+            let total = json::parse(&d.metadata).ok().and_then(|m| m.get("total_chunks").u64()).unwrap_or(0);
+            json::obj(vec![("__onChainPath", json::s(&d.on_chain_path)), ("__chunks", json::n(total)), ("__pending", Json::Bool(true))])
+        } else {
+            match iq::row_from_metadata(&d.metadata) {
+                // `__…` fields are the reader's: a row can't set them itself
+                Some(Json::Obj(o)) => Json::Obj(o.into_iter().filter(|(k, _)| !k.starts_with("__")).collect()),
+                Some(r) => r,
+                None => continue,
+            }
+        };
+        row.set("__txSignature", json::s(&tx.signature));
+        if let Some(signer) = accs.first().and_then(|&i| tx.keys.get(i)) {
+            row.set("__signer", json::s(&b58(signer)));
+        }
+        if let Some(t) = time {
+            row.set("__blockTime", json::n(t));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// A chunked row's on-chain path is a session address (short) or the tail
+/// of IQ's older linked list of transactions (a signature, long).
+pub fn is_linked_path(path: &str) -> bool {
+    path.len() >= 80
+}
+
+/// The parts of a session upload carried by one transaction: (index, text).
+pub fn session_parts(result: &Json) -> Vec<(u32, String)> {
+    let pid = crate::iq::program_id();
+    let Some(tx) = parsed_tx(result) else { return vec![] };
+    tx.ixs.iter().filter(|(p, _, _)| tx.keys.get(*p) == Some(&pid)).filter_map(|(_, _, data)| crate::iq::decode_post_chunk(data)).collect()
+}
+
+/// One link of IQ's older chunk list: (text, previous signature or "Genesis").
+pub fn linked_part(result: &Json) -> Option<(String, String)> {
+    let pid = crate::iq::program_id();
+    let tx = parsed_tx(result)?;
+    tx.ixs.iter().find_map(|(p, _, data)| (tx.keys.get(*p) == Some(&pid)).then(|| crate::iq::decode_send_code(data)).flatten())
+}
+
+/// A session's text once every part up to `total` is in (None if any is missing).
+pub fn join_parts(parts: &std::collections::BTreeMap<u32, String>, total: usize) -> Option<String> {
+    let n = if total > 0 { total } else { parts.len() };
+    (0..n as u32).all(|i| parts.contains_key(&i)).then(|| (0..n as u32).map(|i| parts[&i].as_str()).collect::<String>())
+}
+
+/// The row a chunked upload holds, with the placeholder's signature, signer
+/// and time; an `__unreadable` row if its text isn't a JSON object.
+pub fn chunked_row(text: Option<&str>, placeholder: &Json) -> Json {
+    let mut row = match text.and_then(|t| json::parse(t).ok()) {
+        // `__…` fields are the reader's: the row's own data can't set them
+        Some(Json::Obj(o)) => Json::Obj(o.into_iter().filter(|(k, _)| !k.starts_with("__")).collect()),
+        _ => json::obj(vec![("__unreadable", Json::Bool(true))]),
+    };
+    for k in ["__txSignature", "__signer", "__blockTime", "__onChainPath"] {
+        if !placeholder.get(k).is_null() {
+            row.set(k, placeholder.get(k).clone());
+        }
+    }
+    row
+}

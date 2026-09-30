@@ -352,6 +352,8 @@
   document.addEventListener("mouseup", () => { dragging = null; });
 
   call(() => w.start());
+  // where this page is served from (IQ's browser: the repository it was deployed from)
+  ev("page", "", "", location.origin + location.pathname);
   ev("route", "", "", location.hash);
 })().catch((e) => {
   document.getElementById("app").innerHTML =
