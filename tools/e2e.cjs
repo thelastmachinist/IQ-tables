@@ -740,7 +740,10 @@ function gateway(url, method, body) {
     return { data, metadata: JSON.stringify(md), signature: m[1], signer: f.signer, blockTime: f.blockTime, slot: 1000 };
   }
   m = p.match(/^\/sns\/([^/]+)$/);
-  if (m) return chain.sns && chain.sns[decodeURIComponent(m[1])] ? { domain: m[1], owner: chain.sns[decodeURIComponent(m[1])], record: null } : { domain: m[1], owner: null, record: null };
+  if (m) {
+    const nm = decodeURIComponent(m[1]);
+    return { domain: nm, owner: (chain.sns || {})[nm] || null, record: (chain.snsRecords || {})[nm] || null };
+  }
   m = p.match(/^\/user\/([^/]+)\/assets$/);
   if (m) return [...(chain.assets.get(m[1]) || [])].reverse();
   m = p.match(/^\/table\/([^/]+)\/notify$/);
@@ -823,6 +826,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     if (url.startsWith("https://host.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: chain.hostPage || "<p>empty</p>" });
     // the site as IQ's browser serves it: at the address of the repository it was deployed from
     if (url.startsWith(`https://browser.iqlabs.dev/${DEC.pda}`)) return route.fulfill({ status: 200, contentType: "text/html", body: html });
+    // …and under a .sol name whose SOL record is that repository
+    if (url.startsWith("https://browser.iqlabs.dev/iqtables.sol") || url.startsWith("https://iqtables.sol.site/")) return route.fulfill({ status: 200, contentType: "text/html", body: html });
     if (url.startsWith("https://gateway.iqlabs.dev/") || url.startsWith("https://dev-gateway.iqlabs.dev/")) {
       const res = gateway(url, req.method(), req.postData());
       return route.fulfill({ status: res.error ? 404 : 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
@@ -1626,6 +1631,18 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
       await p3.waitForSelector(".embedpanel pre[data-snippet='server']", { timeout: 20000 });
       check((await p3.locator(".embedpanel input[data-arg='repo']").count()) === 0 && (await p3.locator(".embedpanel pre[data-snippet='server']").innerText()).includes(`repo: "${DEC.pda}"`), "served from IQ's browser, the dialog finds the decoder in the repository the site was deployed from");
       await p3.close();
+      chain.snsRecords = { "iqtables.sol": DEC.pda };
+      for (const site of ["https://browser.iqlabs.dev/iqtables.sol", "https://iqtables.sol.site/"]) {
+        const p5 = await ctx.newPage();
+        await p5.route("**/*", handler);
+        await p5.goto(`${site}#/t/${rootPda}/${fastPda}`);
+        await p5.waitForSelector("button[data-a='embed-open']", { timeout: 20000 });
+        await p5.click("button[data-a='embed-open']");
+        await p5.click(".embedpanel button[data-a='embed-tab'][data-arg='live']");
+        await p5.waitForSelector(".embedpanel pre[data-snippet='server']", { timeout: 20000 });
+        check((await p5.locator(".embedpanel pre[data-snippet='server']").innerText()).includes(`repo: "${DEC.pda}"`), `served under a .sol name (${site.replace("https://", "")}), the dialog finds the repository through the name's SOL record`);
+        await p5.close();
+      }
     }
 
     // the loader and decoder, outside the app (Node)

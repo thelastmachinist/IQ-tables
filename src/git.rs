@@ -67,6 +67,8 @@ pub struct Git {
     pub wanted: std::cell::RefCell<Vec<String>>,
     /// The open repository panel: (commit table, selected commit id).
     pub panel: Option<(String, Option<String>)>,
+    /// `.sol` names → their SOL record (the address a site is served from).
+    pub sns: HashMap<String, Load<Option<String>>>,
 }
 
 /// The address in an IQ browser link (`https://browser.iqlabs.dev/<address>`).
@@ -318,6 +320,13 @@ impl App {
             if !seen.insert(w.clone()) {
                 continue;
             }
+            if let Some(name) = w.strip_prefix("sns:") {
+                if !self.git.sns.contains_key(name) {
+                    self.git.sns.insert(name.to_string(), Load::Loading);
+                    self.get(&format!("/sns/{}", name), P::GitSns(name.to_string()));
+                }
+                continue;
+            }
             if let Some(tree) = w.strip_prefix("tree:") {
                 if !self.git.trees.contains_key(tree) {
                     self.git.trees.insert(tree.to_string(), Load::Loading);
@@ -387,6 +396,18 @@ impl App {
         let text = String::from_utf8_lossy(&data).into_owned();
         let http_ok = ok && (200..300).contains(&status);
         match p {
+            P::GitSns(name) => {
+                let v = if http_ok {
+                    match json::parse(&text) {
+                        // the SOL record: a bare address (anything else isn't a repository)
+                        Ok(v) => Load::Ready(v.get("record").str().map(|r| r.trim().to_string()).filter(|r| base58::decode(r).map(|b| b.len()) == Some(32))),
+                        Err(e) => Load::Err(e),
+                    }
+                } else {
+                    Load::Err(fetch_err(ok, status, &text))
+                };
+                self.git.sns.insert(name, v);
+            }
             P::GitMeta(pda) => {
                 let v = if http_ok {
                     let name = json::parse(&text).ok().and_then(|m| m.get("name").str().map(String::from)).unwrap_or_default();

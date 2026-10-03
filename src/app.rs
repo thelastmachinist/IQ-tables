@@ -191,6 +191,8 @@ pub enum P {
     GitMeta(String),
     GitRows(String),
     GitTree(String),
+    /// A `.sol` name's SOL record, through IQ's gateway (embed.rs).
+    GitSns(String),
     Ignore,
 }
 
@@ -1308,7 +1310,7 @@ impl App {
                 self.attach_async(p, ok, status, data)
             }
             P::SaveCheck { .. } => self.save_async(p, ok, status, data),
-            P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
+            P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) | P::GitSns(_) => self.git_async(p, ok, status, data),
             P::EmbedWasm(_) | P::EmbedTick(_) => self.embed_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
             P::CliRoot(_) | P::CliUser(_) => self.cli_async(p, ok, status, data),

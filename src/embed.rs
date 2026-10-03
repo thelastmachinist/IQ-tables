@@ -104,6 +104,39 @@ pub fn browser_address(url: &str) -> Option<String> {
     is_pk(first).then(|| first.to_string())
 }
 
+/// The `.sol` name this page is served under: `<name>.sol.site`, or
+/// `browser.iqlabs.dev/<name>.sol`.
+pub fn sol_name(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://").or_else(|| url.trim().strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let name = match host.strip_suffix(".sol.site") {
+        Some(n) => format!("{}.sol", n),
+        None if host == "browser.iqlabs.dev" => path.split(['/', '?', '#']).next()?.to_ascii_lowercase(),
+        None => return None,
+    };
+    let ok = name.len() > 4 && name.ends_with(".sol") && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_');
+    ok.then_some(name)
+}
+
+/// The repository a page served under a `.sol` name comes from: the name's
+/// SOL record (looked up once through IQ's gateway). None when there's no
+/// name, or it doesn't point at an address; Err while it's being looked up.
+fn sol_repo(app: &App) -> Option<Result<String, &'static str>> {
+    if app.embed.as_ref().map(|e| !e.repo.trim().is_empty()).unwrap_or(false) {
+        return None;
+    }
+    let name = sol_name(&app.page_url)?;
+    match app.git.sns.get(&name) {
+        Some(Load::Ready(Some(pda))) => Some(Ok(pda.clone())),
+        Some(Load::Ready(None)) | Some(Load::Err(_)) => None,
+        _ => {
+            app.git.wanted.borrow_mut().push(format!("sns:{}", name));
+            Some(Err("Looking up this site's .sol name…"))
+        }
+    }
+}
+
 /// The IQ git repository holding the decoder: a link pasted in the dialog,
 /// or the repository this page is served from by IQ's browser.
 pub fn decoder_repo(app: &App) -> Option<String> {
@@ -180,7 +213,11 @@ fn resolve(app: &App) -> Found {
     if app.use_rpc() {
         return Found::Bad("Live embeds find the decoder through IQ's gateway: set Settings → Read tables from → IQ gateway.".into());
     }
-    let Some(pda) = decoder_repo(app) else { return Found::NoRepo };
+    let pda = match decoder_repo(app).map(Ok).or_else(|| sol_repo(app)) {
+        Some(Ok(pda)) => pda,
+        Some(Err(reading)) => return Found::Reading(reading),
+        None => return Found::NoRepo,
+    };
     app.git.wanted.borrow_mut().push(pda.clone());
     let repo = match app.git.repos.get(&pda) {
         Some(Load::Ready(Some(r))) => r,

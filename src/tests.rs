@@ -819,6 +819,10 @@ fn records_for_embeds() {
     assert_eq!(crate::embed::browser_address(&format!("https://browser.iqlabs.dev/{}", pda)).as_deref(), Some(pda));
     assert_eq!(crate::embed::browser_address(&format!("https://browser.iqlabs.dev/{}/index.html", pda)).as_deref(), Some(pda));
     assert_eq!(crate::embed::browser_address("https://browser.iqlabs.dev/"), None);
+    assert_eq!(crate::embed::sol_name("https://iqtables.sol.site/#/t/x"), Some("iqtables.sol".into()));
+    assert_eq!(crate::embed::sol_name("https://browser.iqlabs.dev/IQTables.sol#/"), Some("iqtables.sol".into()));
+    assert_eq!(crate::embed::sol_name(&format!("https://browser.iqlabs.dev/{}", pda)), None);
+    assert_eq!(crate::embed::sol_name("https://evil.example/x.sol"), None);
     assert_eq!(crate::embed::browser_address(&format!("https://evil.example/{}", pda)), None);
     // the loader shipped in the app is the one in embed/
     assert!(crate::embed::LOADER.contains("export async function readTable"));
