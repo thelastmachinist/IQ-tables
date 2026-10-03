@@ -26,7 +26,7 @@ fn rows_out(title: &str, cols: &[&str], rows: Vec<Vec<Json>>, note: impl Into<St
     Ok(vec![Out::Rows { title: title.into(), cols: cols.iter().map(|s| s.to_string()).collect(), rows, note: note.into() }])
 }
 
-fn valid_name(what: &str, n: &str) -> R<()> {
+pub(crate) fn valid_name(what: &str, n: &str) -> R<()> {
     if n.trim().is_empty() {
         return Err(format!("A {} needs a name", what));
     }

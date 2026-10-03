@@ -222,6 +222,7 @@ impl App {
             t.load_all = false;
             t.err = Some(e);
         }
+        self.base_failed(pda);
     }
 
     /// Everything the logged-in account created, from the database list

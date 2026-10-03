@@ -572,6 +572,63 @@ fn sql_runs_against_a_draft() {
 }
 
 #[test]
+fn the_command_line_drives_the_app() {
+    use crate::app::{App, P};
+    let mut app = App::new();
+    let call = |app: &mut App, m: &str| app.cli_call(m);
+    // answer the request waiting for `want`
+    let answer = |app: &mut App, want: &dyn Fn(&P) -> bool, body: &str| {
+        let id = *app.pending.iter().find(|(_, p)| want(p)).map(|(k, _)| k).expect("a request for it");
+        app.async_done(id, true, 200, body.as_bytes().to_vec());
+    };
+    let none = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#;
+    assert!(call(&mut app, r#"{"op":"status"}"#).get("error").str().unwrap().contains("setup"));
+    let r = call(&mut app, r#"{"op":"setup","devnet":true}"#);
+    assert_eq!(r.get("rpc").str(), Some(crate::state::RPC_DEVNET));
+    assert!(r.get("wallet").is_null());
+    assert!(call(&mut app, r#"{"op":"setup","key":"not a key"}"#).get("error").str().is_some(), "a bad key is refused");
+    call(&mut app, r#"{"op":"setup","devnet":true}"#);
+    // a database is looked up on chain first; one that isn't there is new
+    assert_eq!(call(&mut app, r#"{"op":"open","db":"shop"}"#).get("wait").bool(), Some(true));
+    answer(&mut app, &|p| matches!(p, P::CliRoot(_)), none);
+    assert_eq!(call(&mut app, r#"{"op":"open","db":"shop"}"#).get("wait").bool(), Some(true), "its name check is still out");
+    answer(&mut app, &|p| matches!(p, P::NameCheck { .. }), none);
+    let r = call(&mut app, r#"{"op":"open","db":"shop"}"#);
+    assert_eq!((r.get("ready").bool(), r.get("exists").bool()), (Some(true), Some(false)));
+    // SQL runs with the table's rules; COMMIT is left to the caller
+    call(
+        &mut app,
+        r#"{"op":"sql","text":"CREATE TABLE parts (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL); INSERT INTO parts VALUES (1,'bolt'),(2,'nut'); SELECT name FROM parts ORDER BY id DESC; COMMIT"}"#,
+    );
+    let st = call(&mut app, r#"{"op":"status"}"#);
+    assert_eq!(st.get("busy").bool(), Some(false));
+    assert_eq!(st.get("commit").bool(), Some(true));
+    let res = st.get("out").arr().iter().find(|o| !o.get("csv").is_null()).cloned().unwrap();
+    assert_eq!(res.get("csv").str(), Some("name\nnut\nbolt\n"));
+    assert_eq!(res.get("json").str(), Some(r#"[{"name":"nut"},{"name":"bolt"}]"#));
+    assert!(call(&mut app, r#"{"op":"status"}"#).get("out").arr().is_empty(), "results are handed over once");
+    call(&mut app, r#"{"op":"sql","text":"INSERT INTO parts VALUES (3, NULL)"}"#);
+    let st = call(&mut app, r#"{"op":"status"}"#);
+    assert!(st.get("out").idx(0).get("message").str().unwrap().contains("name"), "{}", st);
+    assert_eq!(st.get("out").idx(0).get("ok").bool(), Some(false));
+    // rows from a file: an existing id updates its row, the rest are added
+    let r = call(&mut app, r#"{"op":"import","table":"parts","text":"id,name\n2,washer\n4,screw"}"#);
+    assert_eq!(r.get("ok").bool(), Some(true), "{}", r);
+    call(&mut app, r#"{"op":"sql","text":"SELECT id, name FROM parts ORDER BY id"}"#);
+    let st = call(&mut app, r#"{"op":"status"}"#);
+    assert_eq!(st.get("out").idx(0).get("cells").to_string(), r#"[["1","bolt"],["2","washer"],["4","screw"]]"#);
+    assert!(call(&mut app, r#"{"op":"import","table":"bins","text":"code\nA"}"#).get("error").str().unwrap().contains("--create"));
+    assert!(call(&mut app, r#"{"op":"import","table":"bins","text":"code,qty\nA,1\nB,2","create":true,"open":true}"#).get("ok").bool().unwrap());
+    assert!(call(&mut app, r#"{"op":"import","table":"_iqtables_x","text":"a\n1","create":true}"#).get("error").str().is_some());
+    let p = call(&mut app, r#"{"op":"pending"}"#);
+    assert_eq!(p.get("createDb").bool(), Some(true));
+    let names: Vec<String> = p.get("tables").arr().iter().map(|t| format!("{}:{}", t.get("name").str_or(""), t.get("inserted"))).collect();
+    assert_eq!(names, vec!["parts:3", "bins:2"], "{}", p);
+    assert!(p.get("lamports").u64().unwrap() > crate::iq::DB_ROOT_COST_ESTIMATE);
+    assert!(call(&mut app, r#"{"op":"save"}"#).get("error").str().unwrap().contains("--key"), "saving needs a key");
+}
+
+#[test]
 fn dropping_a_table_forgets_what_was_computed_for_its_position() {
     let mut app = crate::app::App::new();
     app.drafts.push(crate::state::Draft::new("k".into(), "shop".into()));

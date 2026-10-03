@@ -146,6 +146,8 @@ pub struct Run {
     /// Dropped tables whose record is written: leave the editor when done.
     pub dropped_done: Vec<String>,
     pub jobs: Vec<Job>,
+    /// Notes ever made (the log keeps the last 200).
+    pub noted: usize,
 }
 
 impl Run {
@@ -153,6 +155,7 @@ impl Run {
         matches!(self.state, RunState::Preparing | RunState::Working(_))
     }
     fn note(&mut self, ok: bool, m: impl Into<String>) {
+        self.noted += 1;
         self.log.push((ok, m.into()));
         if self.log.len() > 200 {
             self.log.remove(0);
@@ -302,6 +305,7 @@ impl App {
             contributor: false,
             dropped_done: vec![],
             jobs: vec![],
+            noted: 0,
         });
         self.prep();
     }
@@ -460,8 +464,13 @@ impl App {
                     } {
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", b58(&sess))).unwrap();
                         self.rpc("getAccountInfo", params, P::Run(RunOp::Session));
-                    } else if matches!(r.steps[r.i].kind, StepKind::Batch { .. }) {
-                        self.run_batch_start();
+                    } else if let StepKind::Batch { job } = r.steps[r.i].kind.clone() {
+                        // its parts pay the network fee each
+                        let parts = r.jobs.get(job).map(|j| j.chunks.len().saturating_sub(1)).unwrap_or(0) as u64;
+                        match self.cli_over_cap(parts * iq::TX_FEE) {
+                            Some(why) => self.fail(why),
+                            None => self.run_batch_start(),
+                        }
                     } else if matches!(r.steps[r.i].kind, StepKind::Table(_)) {
                         let root = b58(&iq::db_root_pda(self.draft_name().as_bytes()));
                         let params = json::parse(&format!("[\"{}\",{{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}}]", root)).unwrap();
@@ -518,10 +527,19 @@ impl App {
                     } else {
                         let post = val.get("accounts").idx(0).get("lamports").u64();
                         let r = self.run.as_mut().unwrap();
-                        if let (Some(post), Some(bal)) = (post, r.balance) {
-                            let cost = bal.saturating_sub(post);
-                            let i = r.i;
-                            r.steps[i].cost = Some(cost);
+                        let i = r.i;
+                        let cost = match (post, r.balance) {
+                            (Some(post), Some(bal)) => {
+                                let cost = bal.saturating_sub(post);
+                                r.steps[i].cost = Some(cost);
+                                cost
+                            }
+                            _ => guard(&r.steps[i].kind),
+                        };
+                        // a spending cap (command line, AI tools): checked before anything is sent
+                        if let Some(why) = self.cli_over_cap(cost) {
+                            self.fail(why);
+                            return true;
                         }
                         self.send_current();
                     }

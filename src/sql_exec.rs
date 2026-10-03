@@ -201,15 +201,17 @@ impl App {
                 let cols = r.names();
                 let rows = r.visible_rows();
                 let total = rows.len();
+                // the command line gets every row; the page shows the first ones
+                let show = if self.cli.is_some() { usize::MAX } else { SHOW_MAX };
                 let note = format!(
                     "{} row{}{}{}{}",
                     total,
                     if total == 1 { "" } else { "s" },
                     if ms >= 1.0 { format!(" · {:.0} ms", ms) } else { String::new() },
                     self.pending_note(key),
-                    if total > SHOW_MAX { format!(" · first {} shown", SHOW_MAX) } else { String::new() }
+                    if total > show { format!(" · first {} shown", SHOW_MAX) } else { String::new() }
                 );
-                one(Out::Rows { title, cols, rows: rows.into_iter().take(SHOW_MAX).collect(), note })
+                one(Out::Rows { title, cols, rows: rows.into_iter().take(show).collect(), note })
             }
             Stmt::Insert { table, cols, src, ignore, replace, on_dup } => {
                 self.insert(key, &table, cols, src, ignore, replace, on_dup).map(|m| vec![Out::Msg(true, m)])
@@ -237,6 +239,10 @@ impl App {
             }
             Stmt::Begin => one(Out::Msg(true, "Changes are always held until COMMIT — no need to start a transaction.".into())),
             Stmt::Commit => {
+                if let Some(c) = self.cli.as_mut() {
+                    c.commit = true;
+                    return one(Out::Msg(true, "COMMIT noted: nothing is saved until you save (the command line's --yes, or save_changes).".into()));
+                }
                 if ctx.import {
                     return one(Out::Msg(true, "COMMIT in the file ignored — press Save when you're ready.".into()));
                 }

@@ -19,6 +19,8 @@ pub mod app;
 pub mod attach;
 #[cfg(feature = "app")]
 pub mod chain;
+#[cfg(feature = "app")]
+pub mod cli;
 pub mod codec;
 #[cfg(feature = "app")]
 pub mod constraints;

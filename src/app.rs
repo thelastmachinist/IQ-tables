@@ -181,6 +181,10 @@ pub enum P {
     Up(String, crate::upload::UpOp),
     /// A decoder inscription to download (embed.rs).
     EmbedWasm(String),
+    /// The command line looking up a database by name (cli.rs).
+    CliRoot(String),
+    /// The command line checking a wallet's IQ accounts (cli.rs).
+    CliUser(String),
     /// Read an embedded table again (its view generation).
     EmbedTick(u32),
     // IQ git links (git.rs)
@@ -270,6 +274,8 @@ pub struct App {
     pub embed: Option<crate::embed::Embed>,
     /// This page's address (origin and path), from the browser.
     pub page_url: String,
+    /// Set when the command line or an AI tool drives the app (cli.rs).
+    pub cli: Option<crate::cli::Cli>,
 }
 
 thread_local! {
@@ -365,6 +371,11 @@ pub unsafe extern "C" fn on_async(id: u32, ok: u32, status: u32, p: *mut u8, l: 
     with_app(|app| app.async_done(id, ok != 0, status, data));
 }
 
+/// Run `f` on the app (None before `start`, or during another call).
+pub fn app_call<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
+}
+
 fn with_app(f: impl FnOnce(&mut App) -> bool) {
     APP.with(|a| {
         if let Ok(mut g) = a.try_borrow_mut() {
@@ -428,6 +439,7 @@ impl App {
             uploads: HashMap::new(),
             embed: None,
             page_url: String::new(),
+            cli: None,
         }
     }
 
@@ -445,10 +457,18 @@ impl App {
     }
 
     pub fn ok(&mut self, m: impl Into<String>) {
-        self.toast = Some((true, m.into()));
+        let m = m.into();
+        if let Some(c) = self.cli.as_mut() {
+            c.log.push((true, m.clone()));
+        }
+        self.toast = Some((true, m));
     }
     pub fn err(&mut self, m: impl Into<String>) {
-        self.toast = Some((false, m.into()));
+        let m = m.into();
+        if let Some(c) = self.cli.as_mut() {
+            c.log.push((false, m.clone()));
+        }
+        self.toast = Some((false, m));
     }
 
     pub fn get(&mut self, path: &str, p: P) {
@@ -1210,6 +1230,7 @@ impl App {
                         t.load_all = false;
                     }
                 }
+                self.base_failed(&pda);
                 if (again || finished) && self.stop_at_checkpoint(&pda, gen) {
                     again = false;
                     finished = true;
@@ -1290,6 +1311,7 @@ impl App {
             P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
             P::EmbedWasm(_) | P::EmbedTick(_) => self.embed_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
+            P::CliRoot(_) | P::CliUser(_) => self.cli_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
         }
     }
@@ -1481,6 +1503,13 @@ impl App {
     }
 
     pub fn import_text(&mut self, arg: &str, text: &str) {
+        self.import_rows(arg, text, true, false);
+    }
+
+    /// Rows from a CSV or JSON file into a table. With `adopt`, an empty
+    /// table that isn't saved yet takes the file's columns; with `strict`,
+    /// rows must be complete now (NOT NULL, the key) rather than at save time.
+    pub fn import_rows(&mut self, arg: &str, text: &str, adopt: bool, strict: bool) {
         let mut it = arg.splitn(2, ':');
         let (k, t) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("0").parse::<usize>().unwrap_or(0));
         let Some(i) = self.draft_idx(&k) else { return };
@@ -1517,7 +1546,7 @@ impl App {
         };
         // A fresh table adopts the file's columns; the first column is the
         // ID when its values are all there and all different.
-        if tb.created.is_none() && tb.rows.is_empty() {
+        if adopt && tb.created.is_none() && tb.rows.is_empty() {
             let mut cols: Vec<String> = header.iter().filter(|h| !h.is_empty()).cloned().collect();
             cols.dedup();
             if !cols.is_empty() && cols != tb.columns {
@@ -1576,7 +1605,7 @@ impl App {
             }
         }
         let fk = self.fk_checks();
-        if let Err(e) = self.apply_changes(&k, t, changes, &crate::constraints::Opts { strict: false, fk_checks: fk }) {
+        if let Err(e) = self.apply_changes(&k, t, changes, &crate::constraints::Opts { strict, fk_checks: fk }) {
             self.err(format!("Nothing was imported: {}", e));
             return;
         }
@@ -1735,7 +1764,8 @@ impl App {
         match self.settings.tx_format {
             state::TxFormat::Legacy => iq::INLINE_CAP_LEGACY,
             _ => {
-                if self.run.as_ref().map(|r| r.legacy).unwrap_or(false) {
+                let cli_legacy = self.cli.as_ref().map(|c| c.v1 == Some(false)).unwrap_or(false);
+                if self.run.as_ref().map(|r| r.legacy).unwrap_or(false) || cli_legacy {
                     iq::INLINE_CAP_LEGACY
                 } else {
                     iq::INLINE_CAP_V1

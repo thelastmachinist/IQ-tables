@@ -147,6 +147,18 @@ impl App {
     /// A base finished loading: adopt the table's structure (the owner's
     /// latest structure record, or the columns seen in its packs), then run
     /// a waiting SQL query.
+    /// A saved table's records couldn't be read: a statement waiting for
+    /// them says so instead of waiting forever (running it again retries).
+    pub fn base_failed(&mut self, pda: &str) {
+        let Some(e) = self.bases.get(pda).filter(|t| !t.loading).and_then(|t| t.err.clone()) else { return };
+        if self.ed.sql_wait.take().is_some() {
+            self.ed.sql_out = vec![crate::sql_exec::Out::Msg(
+                false,
+                format!("Couldn't read a table ({}) from the blockchain: {}. Run it again to retry.", crate::solana::short(pda), e),
+            )];
+        }
+    }
+
     pub fn base_loaded(&mut self, pda: &str) {
         let Some(tv) = self.bases.get(pda) else { return };
         let packs: Vec<pack::SourcePack> = tv.decoded.iter().rev().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();

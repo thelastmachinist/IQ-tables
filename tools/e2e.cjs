@@ -1731,6 +1731,154 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
       check(bad.status === 1 && bad.stderr.includes("isn't an IQ Tables pack"), "…and says so when given something else");
       const help = run([]);
       check(help.status === 2 && help.stdout.includes("encode") && help.stdout.includes("decode"), "running it bare prints how to use it");
+      const msgs = [
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1" } } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/list" },
+        { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "encode_rows", arguments: { csv: "id,name\n1,bolt\n2,nut\n" } } },
+      ];
+      const stdio = run(["mcp"], msgs.map((m) => JSON.stringify(m)).join("\n") + "\n");
+      const replies = stdio.stdout.trim().split("\n").map((l) => JSON.parse(l));
+      check(stdio.status === 0 && replies.length === 3 && replies[0].result.protocolVersion === "2024-11-05" && replies[1].result.tools.some((x) => x.name === "sql") && JSON.parse(replies[2].result.content[0].text).records === 2,
+        "`mcp` speaks the Model Context Protocol over stdin and stdout, one message per line");
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+    // ---- the app from the command line: sql, write, MCP (Node, the mock chain)
+    {
+      // the site's copy of the loader: the app (index.html) is next to it
+      const L = await import(require("url").pathToFileURL(path.join(ROOT, "site", "iqt-loader.mjs")).href);
+      const run = async (args, stdin) => {
+        const outs = [];
+        const errs = [];
+        // as `node iqt-loader.mjs` runs it: an error is printed, exit code 1
+        const code = await L.cli(args, { fetch: mf, stdout: (t) => outs.push(t), stderr: (t) => errs.push(t), ...(stdin !== undefined ? { stdin } : {}) }).catch((e) => {
+          errs.push(`${(e && e.message) || e}\n`);
+          return 1;
+        });
+        return { code, out: outs.join(""), err: errs.join("") };
+      };
+      const net = ["--rpc", "https://rpc.test/"];
+      const sends = () => [...chain.txs.keys()].length;
+      if (typeof fastPda === "string" && acct(rootPda)) {
+        const recs = JSON.parse((await L.readTable({ table: fastPda, official: fa, fetch: mf, store: null, decoder: { wasm: fs.readFileSync(path.join(ROOT, "site", "iqt-decoder.wasm")) }, format: "json", cacheMs: 0 })).data);
+        const c1 = await run(["sql", "SELECT COUNT(*) AS n FROM fasteners", "--db", "e2e-parts", ...net]);
+        check(c1.code === 0 && c1.out === `n\n${recs.length}\n`, `sql: COUNT(*) over the saved table, read by the app itself (${c1.out.trim().split("\n").pop()} rows)`);
+        const byMat = {};
+        for (const r of recs) byMat[r.material] = (byMat[r.material] || 0) + 1;
+        const want = Object.keys(byMat).sort().map((m) => ({ material: m, n: byMat[m] }));
+        const c2 = await run(["sql", "SELECT material, COUNT(*) AS n FROM fasteners GROUP BY material ORDER BY material", "--db", "e2e-parts", "--format", "json", ...net]);
+        const got = c2.code === 0 ? JSON.parse(c2.out) : null;
+        check(!!got && JSON.stringify(got.map((g) => ({ material: g.material, n: Number(g.n) }))) === JSON.stringify(want), "sql: GROUP BY gives the same counts as the decoder's records, as JSON");
+        const c3 = await run(["sql", "SELECT part_no, qty FROM fasteners ORDER BY qty DESC LIMIT 2", "--db", "e2e-parts", "--format", "table", ...net]);
+        check(c3.code === 0 && /^part_no\s+qty\n-+\s+-+\n/.test(c3.out) && c3.out.trim().split("\n").length === 4, "sql --format table: aligned columns for people");
+        down.gateway = true;
+        const outage = await run(["sql", "SELECT COUNT(*) FROM fasteners", "--db", "e2e-parts", ...net]);
+        down.gateway = false;
+        check(outage.code === 1 && /Couldn't read a table/.test(outage.err), "a table that can't be read fails the statement with the reason (no hang)");
+      }
+      // a wallet of the command line's own: a Solana key file
+      const kp = Keypair.fromSeed(Buffer.alloc(32, 21));
+      const me = kp.publicKey.toBase58();
+      credit(chain, me, 2 * LAMPORTS);
+      const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "iqt-app-"));
+      const keyFile = path.join(tmp, "wallet.json");
+      fs.writeFileSync(keyFile, JSON.stringify(Array.from(kp.secretKey)));
+      const parts = "id,name,qty\n1,Hex bolt,40\n2,Nut,15\n3,Washer,100\n";
+      fs.writeFileSync(path.join(tmp, "parts.csv"), parts);
+      const before = sends();
+      const dry = await run(["write", "cli-shop", "parts", path.join(tmp, "parts.csv"), "--create", ...net]);
+      check(dry.code === 0 && /Imported 3 rows/.test(dry.err) && /To save in cli-shop \(a new database\): parts: new table, 3 row\(s\) added/.test(dry.err) && /Not saved \(a dry run\)/.test(dry.err) && sends() === before,
+        "write without --yes: what saving would do and cost, and nothing sent");
+      const w = await run(["write", "cli-shop", "parts", path.join(tmp, "parts.csv"), "--create", "--key", keyFile, "--yes", ...net]);
+      const shopRoot = iq.contract.getDbRootPda(Buffer.from("cli-shop"), PID).toBase58();
+      const partsPda = iq.contract.getTablePda(new PublicKey(shopRoot), iq.utils.toSeedBytes("parts"), PID).toBase58();
+      const root = acct(shopRoot) && accCoder.decode("DbRoot", acct(shopRoot).data);
+      check(w.code === 0 && /Saved\. Spent/.test(w.err) && !!root && root.creator.toBase58() === me && !!acct(partsPda),
+        `write --create --key --yes: the database and table made and the rows inscribed, signed with the key file's wallet (${sends() - before} transactions)`);
+      if (w.code !== 0) console.log(w.err);
+      const dec = path.join(ROOT, "site", "iqt-decoder.wasm");
+      const back = await run(["read", partsPda, "--official", me, "--decoder", dec, ...net]);
+      check(back.code === 0 && back.out === parts, "read gives the written rows back exactly");
+      const u = await run(["sql", "UPDATE parts SET qty = qty + 1 WHERE id = 2; DELETE FROM parts WHERE id = 3; COMMIT", "--db", "cli-shop", "--key", keyFile, "--yes", ...net]);
+      const back2 = await run(["read", partsPda, "--official", me, "--decoder", dec, ...net]);
+      check(u.code === 0 && /parts: 1 changed, 1 deleted/.test(u.err) && back2.out === "id,name,qty\n1,Hex bolt,40\n2,Nut,16\n", "sql UPDATE and DELETE with --yes: only the changes are written, and read back");
+      if (u.code !== 0) console.log(u.err);
+      // the tables' rules hold on the command line too
+      const t = await run(["sql", "CREATE TABLE bins (code VARCHAR(4) PRIMARY KEY, qty INT NOT NULL CHECK (qty >= 0))", "--db", "cli-shop", "--key", keyFile, "--yes", ...net]);
+      check(t.code === 0 && /Saved/.test(t.err), "sql CREATE TABLE with types and a CHECK rule, saved");
+      const n0 = sends();
+      fs.writeFileSync(path.join(tmp, "bad.csv"), "code,qty\nA1,5\nB2,-3\n");
+      const bad = await run(["write", "cli-shop", "bins", path.join(tmp, "bad.csv"), "--key", keyFile, "--yes", ...net]);
+      check(bad.code === 1 && /qty/.test(bad.err) && sends() === n0, `a row breaking the table's CHECK rule is refused before anything is sent (${(bad.err.split("\n").find((l) => /✗|Nothing/.test(l)) || "").slice(0, 70)}…)`);
+      const piped = await run(["sql", "-", "--db", "cli-shop", ...net], "SELECT name FROM parts WHERE qty > 20;");
+      check(piped.code === 0 && piped.out === "name\nHex bolt\n", "sql reads its statements from standard input");
+      const nokey = await run(["sql", "INSERT INTO parts VALUES (9, 'Pin', 1)", "--db", "cli-shop", "--yes", ...net]);
+      check(nokey.code === 1 && /--key/.test(nokey.err), "--yes without a key: refused, nothing signed");
+      const n2 = sends();
+      const capped = await run(["sql", "INSERT INTO parts VALUES (9, 'Pin', 1)", "--db", "cli-shop", "--key", keyFile, "--yes", "--max", "0.0001", ...net]);
+      check(capped.code === 1 && /Stopped before step 1 of 1: it would cost/.test(capped.err) && sends() === n2, "--max: a step that would pass the cap isn't sent");
+      const no = await run(["sql", "INSERT INTO parts VALUES (9, 'Pin', 1)", "--db", "cli-shop", "--key", keyFile, "--yes=false", ...net]);
+      check(no.code === 0 && /a dry run/.test(no.err) && sends() === n2, "--yes=false is no");
+      const secret = "5" + "K".repeat(60);
+      const leak = await run(["sql", "SELECT 1", "--db", "cli-shop", "--key", secret, ...net]);
+      check(leak.code === 1 && /--key file/.test(leak.err) && !leak.err.includes(secret), "a key typed where its file should go is never echoed");
+      fs.writeFileSync(path.join(tmp, "more.json"), JSON.stringify({ cols: ["id", "name", "qty"], rows: [[5, "Cotter pin", 12]] }));
+      const wj = await run(["write", "cli-shop", "parts", path.join(tmp, "more.json"), ...net]);
+      check(wj.code === 0 && /parts: 1 row\(s\) added/.test(wj.err), "write takes a JSON {cols, rows} file too");
+      // MCP: an AI assistant's view of the same
+      const mcp = async (opts, msgs) => {
+        const sent = [];
+        await L.mcpServer({ decoder: { wasm: fs.readFileSync(dec) }, store: null, fetch: mf, app: { rpc: "https://rpc.test/", fetch: mf, ...opts.app }, budget: opts.budget }, {
+          lines: msgs.map((m) => JSON.stringify(m)),
+          send: (m) => sent.push(m),
+        });
+        return sent;
+      };
+      const call = (id, name, args) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+      const keyText = fs.readFileSync(keyFile, "utf8");
+      const s1 = await mcp({ app: { key: keyText }, budget: 0.05 }, [
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/list" },
+        call(3, "sql", { database: "cli-shop", query: "SELECT id, name, qty FROM parts ORDER BY id" }),
+        call(4, "write_rows", { database: "cli-shop", table: "bins", rows: [{ code: "C3", qty: 7 }] }),
+        call(5, "pending_changes", { database: "cli-shop" }),
+        call(6, "save_changes", { database: "cli-shop" }),
+        call(7, "read_table", { table: partsPda, official: me }),
+        call(8, "decode_pack", { pack: "nonsense" }),
+        { jsonrpc: "2.0", id: 9, method: "nope" },
+      ]);
+      const res = (id) => s1.find((m) => m.id === id);
+      const names = (res(2).result.tools || []).map((x) => x.name);
+      check(res(1).result.protocolVersion === "2025-06-18" && res(1).result.serverInfo.name === "iq-tables" && ["read_table", "sql", "write_rows", "pending_changes", "save_changes", "encode_rows", "decode_pack"].every((n) => names.includes(n)),
+        "MCP: initialize and tools/list (with save_changes, since the server has a key)");
+      const q = JSON.parse(res(3).result.content[0].text);
+      check(JSON.stringify(q.results[0].rows) === JSON.stringify([{ id: 1, name: "Hex bolt", qty: 40 }, { id: 2, name: "Nut", qty: 16 }]), "MCP sql: rows as JSON objects");
+      const pend = JSON.parse(res(5).result.content[0].text);
+      check(!res(4).result.isError && pend.changes === 1 && /bins: 1 row\(s\) added/.test(pend.summary), "MCP write_rows stages a row; pending_changes shows it and its cost");
+      const saved = !res(6).result.isError && JSON.parse(res(6).result.content[0].text);
+      check(!!saved && saved.saved === true && /SOL/.test(saved.budgetLeft), `MCP save_changes writes it, within the session's budget (${saved && saved.budgetLeft} left)`);
+      check(JSON.parse(res(7).result.content[0].text).length === 2 && res(8).result.isError === true && res(9).error.code === -32601, "MCP read_table and decode_pack (errors come back as tool errors), unknown methods refused");
+      const binsPda = iq.contract.getTablePda(new PublicKey(shopRoot), iq.utils.toSeedBytes("bins"), PID).toBase58();
+      const bins = await run(["read", binsPda, "--official", me, "--decoder", dec, ...net]);
+      check(bins.out === "code,qty\nC3,7\n", "…and the row is on chain");
+      const s4 = await mcp({ app: {} }, [
+        call(1, "sql", { database: "cli-shop", query: "CREATE TABLE lots (id INT PRIMARY KEY, label VARCHAR(10) NOT NULL, qty INT DEFAULT 0)" }),
+        call(2, "write_rows", { database: "cli-shop", table: "lots", rows: [{ id: 1, label: "first" }] }),
+        call(3, "write_rows", { database: "cli-shop", table: "lots", rows: [{ id: 2 }] }),
+        call(4, "sql", { database: "cli-shop", query: "SELECT id, label, qty FROM lots" }),
+      ]);
+      const lots = JSON.parse(s4[3].result.content[0].text);
+      check(!s4[1].result.isError && s4[2].result.isError === true && JSON.stringify(lots.results[0].rows) === JSON.stringify([{ id: 1, label: "first", qty: 0 }]),
+        "MCP: rows written into a table staged with CREATE TABLE keep its types, defaults and NOT NULL; a refused row leaves the table there");
+      const n1 = sends();
+      const s2 = await mcp({ app: { key: keyText }, budget: 0.0001 }, [
+        call(1, "write_rows", { database: "cli-shop", table: "bins", csv: "code,qty\nD4,1\n" }),
+        call(2, "save_changes", { database: "cli-shop" }),
+      ]);
+      check(s2[1].result.isError === true && /budget/.test(s2[1].result.content[0].text) && sends() === n1, "MCP: a save over the session's budget is refused, nothing sent");
+      const s3 = await mcp({ app: {} }, [{ jsonrpc: "2.0", id: 1, method: "tools/list" }, call(2, "sql", { database: "cli-shop", query: "SELECT COUNT(*) AS n FROM bins" })]);
+      check(!s3[0].result.tools.some((x) => x.name === "save_changes") && JSON.parse(s3[1].result.content[0].text).results[0].rows[0].n === 1, "MCP without a key: no save_changes tool, reading works");
       fs.rmSync(tmp, { recursive: true, force: true });
     }
     // following the newest decoder
