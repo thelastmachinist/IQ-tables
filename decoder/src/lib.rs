@@ -16,6 +16,9 @@
 //!
 //! * `{"op":"info"}` → `{"abi":1,"version":"…","formats":["IQT1"]}`
 //! * `{"op":"decode","payload":"IQT1…"}` → `{"ok":{"schema":…,"records":…,"meta":…}}` or `{"error":"…"}`
+//! * `{"op":"encode","csv":…|"objects":…|"cols"+"rows","id":…,"mode":…}` → `{"ok":{"row":{"id","p"},…}}`
+//!   (added in decoder 1.1; older decoders answer "unknown op")
+//! * `{"op":"unpack","payload":…,"format":"csv"|"json"}` → `{"ok":{"text":…,"records":n,…}}` (1.1)
 //! * `{"op":"read","config":{…}}` → a step
 //! * `{"op":"resume","results":[…]}` → the next step
 //!
@@ -37,6 +40,7 @@
 //! that the format registry (`iqt-formats.json`) names.
 
 pub mod reader;
+pub mod tools;
 
 use iq_tables::json::{self, Json};
 use std::cell::RefCell;
@@ -78,6 +82,8 @@ pub fn handle(msg: &str) -> String {
             json::obj(vec![("abi", json::n(ABI)), ("version", json::s(VERSION)), ("formats", Json::Arr(FORMATS.iter().map(|f| json::s(f)).collect()))])
         }
         Some("decode") => decode(&m.get("payload").str_or("")),
+        Some("encode") => tools::encode(&m),
+        Some("unpack") => tools::unpack(&m),
         Some("read") => match reader::Config::from_json(m.get("config")) {
             Ok(cfg) => {
                 let mut r = reader::Reader::new(cfg);

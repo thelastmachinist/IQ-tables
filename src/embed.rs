@@ -11,7 +11,7 @@
 //!   reads each storage format, so data in an old format stays readable
 //!   after newer decoders drop it.
 
-use crate::app::{fetch_err, App, Load, TableView, P};
+use crate::app::{fetch_err, App, Load, Mode, Route, TableView, P};
 use crate::crypto::{base58, base64_decode};
 use crate::git;
 use crate::host;
@@ -26,12 +26,53 @@ pub const DECODER_FILE: &str = "iqt-decoder.wasm";
 const SNAPSHOT_MAX: usize = 20_000;
 /// Characters of a snapshot shown in the dialog.
 const PREVIEW: usize = 12_000;
+/// Rows per page, and the shortest time between reads, in an iframe.
+const FRAME_PAGE: usize = 50;
+const MIN_EVERY: u32 = 60;
+
+/// `#/embed/[<database>/]<table>?rows=…&every=…`
+pub fn route(root: Option<&str>, pda: &str, query: &str) -> Route {
+    let mut who = Who::Official;
+    let mut every = 0;
+    for kv in query.split('&') {
+        match kv.split_once('=') {
+            Some(("rows", v)) => who = Who::parse(v).unwrap_or(Who::Official),
+            Some(("every", v)) => every = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Route::Embed { root: root.map(String::from), pda: pda.to_string(), who, every }
+}
+
+/// The address an iframe opens: this site, at the embed view of the table.
+pub fn frame_url(app: &App, tv: &TableView, who: Who, every: u32) -> String {
+    let site = if app.page_url.is_empty() { "https://browser.iqlabs.dev/".to_string() } else { app.page_url.clone() };
+    let at = match &tv.root {
+        Some(r) => format!("{}/{}", r, tv.pda),
+        None => tv.pda.clone(),
+    };
+    let mut url = format!("{}#/embed/{}?rows={}", site, at, who.as_str());
+    if every > 0 {
+        url.push_str(&format!("&every={}", every));
+    }
+    url
+}
+
+fn iframe_code(app: &App, tv: &TableView, who: Who) -> String {
+    let every = app.embed.as_ref().map(|e| e.every).unwrap_or(0);
+    format!(
+        "<iframe src=\"{}\" title=\"{}\" width=\"100%\" height=\"520\" style=\"border:0\" loading=\"lazy\"></iframe>",
+        esc(&frame_url(app, tv, who, every)),
+        esc(&name_of(tv))
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
     Snapshot,
     Live,
+    Frame,
 }
 
 #[derive(Default)]
@@ -47,6 +88,8 @@ pub struct Embed {
     /// An IQ browser link to the repository holding the decoder, when this
     /// page can't tell (it isn't running from IQ's browser).
     pub repo: String,
+    /// Iframe: seconds between reads (0: once).
+    pub every: u32,
 }
 
 fn is_pk(s: &str) -> bool {
@@ -272,7 +315,11 @@ impl App {
             "embed-close" => self.embed = None,
             "embed-tab" => {
                 if let Some(e) = self.embed.as_mut() {
-                    e.tab = if arg == "live" { Tab::Live } else { Tab::Snapshot };
+                    e.tab = match arg {
+                        "live" => Tab::Live,
+                        "frame" => Tab::Frame,
+                        _ => Tab::Snapshot,
+                    };
                 }
                 self.embed_load();
             }
@@ -283,6 +330,7 @@ impl App {
                         "format" if ["csv", "json", "html"].contains(&val) => e.format = val.to_string(),
                         "live" if ["csv", "json"].contains(&val) => e.live = val.to_string(),
                         "repo" => e.repo = val.trim().to_string(),
+                        "every" => e.every = val.parse().unwrap_or(0),
                         _ => {}
                     }
                 }
@@ -328,6 +376,11 @@ impl App {
                     self.get(&format!("/data/{}", sig), P::EmbedWasm(sig));
                 }
             }
+            "iframe" => {
+                let code = iframe_code(self, tv, who);
+                host::copy(&code);
+                self.ok("Copied");
+            }
             "server" | "web" => {
                 let found = resolve(self);
                 let text = snip_for(self, tv, &found).map(|s| {
@@ -347,7 +400,32 @@ impl App {
         }
     }
 
+    /// Open the table an iframe shows (`#/embed/…`): every row, and the rows asked for.
+    pub fn embed_open_view(&mut self) {
+        let Route::Embed { root, pda, who, every } = self.route.clone() else { return };
+        self.ensure_dbroots();
+        self.open_table(root, pda);
+        let gen = self.table.as_mut().map(|t| {
+            t.who = who;
+            t.mode = Mode::Records;
+            t.load_all = true;
+            t.full = who != Who::Official;
+            t.gen
+        });
+        if let (Some(gen), true) = (gen, every > 0) {
+            self.timer(every.max(MIN_EVERY) * 1000, P::EmbedTick(gen));
+        }
+    }
+
     pub fn embed_async(&mut self, p: P, ok: bool, status: u32, data: Vec<u8>) -> bool {
+        if let P::EmbedTick(gen) = p {
+            // still showing that table: read it again (and set the next read)
+            if matches!(self.route, Route::Embed { .. }) && self.table.as_ref().map(|t| t.gen == gen).unwrap_or(false) {
+                self.embed_open_view();
+                return true;
+            }
+            return false;
+        }
         let P::EmbedWasm(sig) = p else { return false };
         let text = String::from_utf8_lossy(&data).into_owned();
         let bytes = if ok && (200..300).contains(&status) {
@@ -396,13 +474,15 @@ pub fn panel(app: &App, h: &mut String) {
         vec![("all", "Every row (the official wallet isn't known yet)")]
     };
     h.push_str(&format!(
-        "<div class=\"row\"><div class=\"seg\" role=\"group\" aria-label=\"Kind\"><button class=\"{}\" data-a=\"embed-tab\" data-arg=\"snapshot\">Snapshot</button><button class=\"{}\" data-a=\"embed-tab\" data-arg=\"live\">Live</button></div><label class=\"inline\">Rows {}</label></div>",
+        "<div class=\"row\"><div class=\"seg\" role=\"group\" aria-label=\"Kind\"><button class=\"{}\" data-a=\"embed-tab\" data-arg=\"snapshot\">Snapshot</button><button class=\"{}\" data-a=\"embed-tab\" data-arg=\"frame\">Iframe</button><button class=\"{}\" data-a=\"embed-tab\" data-arg=\"live\">Live</button></div><label class=\"inline\">Rows {}</label></div>",
         if e.tab == Tab::Snapshot { "on" } else { "" },
+        if e.tab == Tab::Frame { "on" } else { "" },
         if e.tab == Tab::Live { "on" } else { "" },
         select("who", who.as_str(), &who_opts)
     ));
     match e.tab {
         Tab::Snapshot => snapshot_tab(app, e, tv, who, h),
+        Tab::Frame => frame_tab(app, e, tv, who, h),
         Tab::Live => live_tab(app, e, tv, who, h),
     }
     if who == Who::Official {
@@ -525,5 +605,94 @@ fn live_tab(app: &App, e: &Embed, tv: &TableView, who: Who, h: &mut String) {
     h.push_str(&format!(
         "<div class=\"row\"><button class=\"btn\" data-a=\"embed-copy\" data-arg=\"web\">Copy</button></div><p class=\"small muted\">Put <code>{}</code> on your site next to the page. Values are shown as text, never as HTML.</p>",
         LOADER_FILE
+    ));
+}
+
+fn frame_tab(app: &App, e: &Embed, tv: &TableView, who: Who, h: &mut String) {
+    h.push_str("<p class=\"small muted\">A read-only view of the table for any page that takes an iframe — Notion (<code>/embed</code>), a Squarespace or Wix code block, WordPress's Custom HTML. It reads the table each time it's shown and links back here; nothing else on the page can be reached from it.</p>");
+    h.push_str(&format!(
+        "<div class=\"row\"><label class=\"inline\">Read again {}</label></div>",
+        select("every", &e.every.to_string(), &[("0", "only when the page loads"), ("300", "every 5 minutes"), ("1800", "every 30 minutes")])
+    ));
+    let url = frame_url(app, tv, who, e.every);
+    h.push_str(&format!("<pre class=\"code\" data-snippet=\"iframe\">{}</pre>", esc(&iframe_code(app, tv, who))));
+    h.push_str(&format!(
+        "<div class=\"row\"><button class=\"btn primary\" data-a=\"embed-copy\" data-arg=\"iframe\">Copy</button><a class=\"btn\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Preview</a></div>",
+        esc(&url)
+    ));
+    h.push_str("<p class=\"small muted\">It runs IQ Tables itself (about 2 MB, which the visitor's browser keeps after the first load). If the frame stays empty, the host of this site doesn't allow framing — use the web-page code under <b>Live</b> instead.</p>");
+}
+
+/// The page inside an iframe: the table, a pager, and a link back.
+pub fn view(app: &App, h: &mut String) {
+    let Route::Embed { pda, .. } = &app.route else { return };
+    h.push_str("<main class=\"frameview\">");
+    let Some(tv) = app.table.as_ref().filter(|t| &t.pda == pda) else {
+        h.push_str("<p class=\"muted\">Loading…</p></main>");
+        return;
+    };
+    let (cols, rows) = crate::views::view_rows(tv);
+    if rows.is_empty() {
+        let msg = match &tv.err {
+            Some(e) => format!("Couldn't read this table: {}", esc(e)),
+            None if tv.loading || !tv.done => "Loading…".into(),
+            None => "No rows yet.".into(),
+        };
+        h.push_str(&format!("<p class=\"muted\">{}</p>", msg));
+    } else {
+        let pages = rows.len().div_ceil(FRAME_PAGE);
+        let page = tv.page.min(pages - 1);
+        h.push_str("<div class=\"scroll\"><table class=\"grid data\"><thead><tr>");
+        for c in &cols {
+            h.push_str(&format!("<th>{}</th>", esc(c)));
+        }
+        h.push_str("</tr></thead><tbody>");
+        for r in rows.iter().skip(page * FRAME_PAGE).take(FRAME_PAGE) {
+            h.push_str("<tr>");
+            for v in &r.vals {
+                let t = v.cell_text();
+                let shown: String = t.chars().take(200).collect();
+                let web = (t.starts_with("https://") || t.starts_with("http://")) && !t.contains(char::is_whitespace);
+                let num = matches!(v, crate::json::Json::Num(_));
+                if web {
+                    h.push_str(&format!("<td><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a></td>", esc(&t), esc(&shown)));
+                } else {
+                    h.push_str(&format!(
+                        "<td{} title=\"{}\">{}</td>",
+                        if num { " class=\"num\"" } else { "" },
+                        esc(&t.chars().take(400).collect::<String>()),
+                        esc(&shown)
+                    ));
+                }
+            }
+            h.push_str("</tr>");
+        }
+        h.push_str("</tbody></table></div><div class=\"framefoot\">");
+        h.push_str(&format!(
+            "<span class=\"small muted\">{} row{}{}</span>",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            if tv.loading { " · reading…" } else { "" }
+        ));
+        if pages > 1 {
+            if page > 0 {
+                h.push_str(&format!("<button class=\"btn\" data-a=\"tv-page\" data-arg=\"{}\">‹ Prev</button>", page - 1));
+            }
+            h.push_str(&format!("<span class=\"small\">{} / {}</span>", page + 1, pages));
+            if page + 1 < pages {
+                h.push_str(&format!("<button class=\"btn\" data-a=\"tv-page\" data-arg=\"{}\">Next ›</button>", page + 1));
+            }
+        }
+        h.push_str("</div>");
+    }
+    let at = match &tv.root {
+        Some(r) => format!("{}/{}", r, tv.pda),
+        None => tv.pda.clone(),
+    };
+    h.push_str(&format!(
+        "<p class=\"framecredit small\"><a href=\"{}#/t/{}\" target=\"_blank\" rel=\"noopener\">{} · on-chain table · IQ Tables</a></p></main>",
+        esc(&app.page_url),
+        esc(&at),
+        esc(&name_of(tv))
     ));
 }

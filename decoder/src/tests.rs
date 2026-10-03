@@ -340,3 +340,46 @@ fn other_writers_get_a_small_share() {
     assert_eq!(d.get("count").u64(), Some(6000), "the owner's big pack is read in full: {}", d.get("notes"));
     assert!(d.get("notes").idx(0).str().unwrap().contains("couldn't be read"));
 }
+
+#[test]
+fn encode_and_unpack_round_trip() {
+    let csv = "part_no,name,qty,price\nFST-1,\"Hex bolt, M8\",1200,0.18\nFST-2,Flat washer,,0.04\nFST-3,=cmd,5,1\n";
+    let e = call(json::obj(vec![("op", json::s("encode")), ("csv", json::s(csv)), ("id", json::s("part_no"))]));
+    let ok = e.get("ok");
+    assert_eq!(ok.get("records").u64(), Some(3), "{}", e);
+    assert_eq!(ok.get("idColumn").str(), Some("part_no"));
+    let row = ok.get("row");
+    let p = row.get("p").str_or("");
+    assert!(p.starts_with("IQT1"));
+    assert_eq!(row.get("id").str().map(String::from), Some(iq_tables::pack::pack_id(&p)), "the row id is the pack's content hash");
+    // the decoder (and so IQ Tables) reads it back, typed
+    let u = call(json::obj(vec![("op", json::s("unpack")), ("payload", json::s(&row.to_string())), ("format", json::s("json"))]));
+    let back = json::parse(&u.get("ok").get("text").str_or("")).unwrap();
+    assert_eq!(back.arr().len(), 3);
+    assert_eq!(back.arr()[0].get("name").str(), Some("Hex bolt, M8"));
+    assert_eq!(back.arr()[0].get("qty"), &json::n(1200), "numbers stay numbers");
+    assert!(back.arr()[1].get("qty").is_null(), "empty stays empty");
+    let c = call(json::obj(vec![("op", json::s("unpack")), ("payload", json::s(&p)), ("format", json::s("csv"))]));
+    let text = c.get("ok").get("text").str_or("");
+    assert!(text.starts_with("part_no,name,qty,price\n") && text.contains("\"Hex bolt, M8\"") && text.contains("'=cmd"), "{}", text);
+    // dense picks the shorter form: tiny data stays plain JSON, bulk data compresses
+    let tiny = call(json::parse(r#"{"op":"encode","cols":["a"],"rows":[["x"]]}"#).unwrap());
+    let both = |mode: &str| {
+        call(json::parse(&format!(r#"{{"op":"encode","cols":["a"],"rows":[["x"]],"mode":"{}"}}"#, mode)).unwrap()).get("ok").get("bytes").u64().unwrap()
+    };
+    assert_eq!(tiny.get("ok").get("bytes").u64().unwrap(), both("plain").min(both("compressed")));
+    let many: String = (0..2000).map(|i| format!("ROW-{:05},Socket head cap screw M6x1.0,{},316 stainless\n", i, i % 50)).collect();
+    let big = call(json::obj(vec![("op", json::s("encode")), ("csv", json::s(&format!("sku,desc,qty,mat\n{}", many)))]));
+    let ok = big.get("ok");
+    assert_eq!(ok.get("compressed").bool(), Some(true));
+    assert!(ok.get("bytes").u64().unwrap() * 8 < many.len() as u64, "at least 8x smaller than the CSV: {} vs {}", ok.get("bytes"), many.len());
+    // objects in, with the id chosen by name
+    let o = call(json::parse(r#"{"op":"encode","objects":[{"k":"a","v":1},{"k":"b","w":true}],"id":"k"}"#).unwrap());
+    assert_eq!(o.get("ok").get("columns").u64(), Some(3));
+    // errors say what's wrong
+    let bad = |m: &str| call(json::parse(m).unwrap()).get("error").str().map(String::from).unwrap_or_default();
+    assert!(bad(r#"{"op":"encode","cols":["a"],"rows":[[null]]}"#).contains("no value in the id column"));
+    assert!(bad(r#"{"op":"encode","cols":["a"],"rows":[]}"#).contains("no rows"));
+    assert!(bad(r#"{"op":"encode","cols":["a"],"rows":[["x"]],"id":"zz"}"#).contains("no column"));
+    assert!(bad(r#"{"op":"unpack","payload":"hello"}"#).contains("isn't an IQ Tables pack"));
+}

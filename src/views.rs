@@ -16,6 +16,11 @@ const PAGE: usize = 100;
 
 pub fn render(app: &mut App) -> String {
     let mut h = String::with_capacity(64 * 1024);
+    if matches!(app.route, Route::Embed { .. }) {
+        // inside another site's iframe: the table and nothing else
+        crate::embed::view(app, &mut h);
+        return h;
+    }
     header(app, &mut h);
     if let Some((ok, m)) = &app.toast {
         h.push_str(&format!(
@@ -36,6 +41,7 @@ pub fn render(app: &mut App) -> String {
         Route::Draft(k) => crate::views_ws::page(app, &k, &mut h),
         Route::Settings => settings(app, &mut h),
         Route::About => about(&mut h),
+        Route::Embed { .. } => {}
     }
     h.push_str("</main><footer>IQ Tables · a community portal for <a href=\"https://iqlabs.dev\" target=\"_blank\" rel=\"noopener\">IQ Labs</a> on-chain tables · written in Rust, running as WebAssembly · <a href=\"#/about\">how it works</a></footer>");
     crate::git::panel(app, &mut h);
@@ -56,6 +62,7 @@ fn header(app: &App, h: &mut String) {
         Route::Workspace | Route::Draft(_) => 2,
         Route::Settings => 3,
         Route::About => 4,
+        Route::Embed { .. } => 0,
     };
     let cur = tab(&app.route);
     let ghosts: usize = app.drafts.iter().map(|d| d.ghosts()).sum();
@@ -820,7 +827,7 @@ fn about(h: &mut String) {
 <h3>Ghost data, then inscription</h3>
 <p>Drafts live in your browser. Inscribing turns them into IQ Labs table rows on Solana with <code>db_code_in</code>, the same instruction the official SDK uses. Before each step the transaction is simulated, so errors and the exact cost show up before any SOL moves.</p>
 <h3>Using a table elsewhere</h3>
-<p><b>Embed</b> on a table's page gives a snapshot (CSV for Excel or Google Sheets, JSON, or an HTML table) or a live read: a developer keeps one small file, <code>iqt-loader.mjs</code>, which reads the table each time with the IQ Tables decoder kept on IQ git. The decoder runs sealed off — it can't reach anything on the machine running it — and every storage format stays readable: a list in the same repository says which decoder reads each one. Only the official wallet's rows are included unless you ask for others.</p>
+<p><b>Embed</b> on a table's page gives a snapshot (CSV for Excel or Google Sheets, JSON, or an HTML table), a live read, or an iframe tag. For a live read a developer keeps one small file, <code>iqt-loader.mjs</code>, which reads the table each time with the IQ Tables decoder kept on IQ git; the same file packs rows for IQ's SDK and unpacks them from the command line (<code>node iqt-loader.mjs encode rows.csv</code>). The decoder runs sealed off — it can't reach anything on the machine running it — and every storage format stays readable: a list in the same repository says which decoder reads each one. Only the official wallet's rows are included unless you ask for others.</p>
 <h3>Packing and compression</h3>
 <p>Each on-chain row holds a <em>pack</em> of many records: <code>{"id": pack-id, "p": "IQT1z…"}</code>. Records are laid out column by column, compressed with a small context-mixing compressor (order 1–5 contexts, a match model and logistic mixing — tighter than gzip or brotli on small tables), then written with a 92-character alphabet that never needs escaping inside JSON. A pack fills one transaction (up to 3,400 bytes of metadata with v1 transactions), so a single 0.001 SOL write can carry hundreds of records. Packs carry their own column list, so tables can gain columns later. Newer records replace older ones with the same id; deletions are tombstone records. Uncompressed packs (<code>IQT1j</code>) are available when you want rows searchable by the gateway.</p>
 <h3>Accounts and wallets</h3>

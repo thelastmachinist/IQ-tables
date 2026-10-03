@@ -42,7 +42,11 @@ impl<T> Load<T> {
 pub enum Route {
     Databases,
     Db(String),
-    Table { root: Option<String>, pda: String, record: Option<String> },
+    Table {
+        root: Option<String>,
+        pda: String,
+        record: Option<String>,
+    },
     Search(String),
     Mine,
     Account,
@@ -50,6 +54,13 @@ pub enum Route {
     Draft(String),
     Settings,
     About,
+    /// A bare, read-only table for other sites' iframes (embed.rs).
+    Embed {
+        root: Option<String>,
+        pda: String,
+        who: Who,
+        every: u32,
+    },
 }
 
 pub use crate::records::Who;
@@ -179,6 +190,8 @@ pub enum P {
     CrowdDlNext,
     /// A decoder inscription to download (embed.rs).
     EmbedWasm(String),
+    /// Read an embedded table again (its view generation).
+    EmbedTick(u32),
     // IQ git links (git.rs)
     GitMeta(String),
     GitRows(String),
@@ -534,6 +547,7 @@ impl App {
 
     fn route(&mut self, hash: &str) {
         let h = hash.trim_start_matches('#');
+        let (h, query) = h.split_once('?').unwrap_or((h, ""));
         let parts: Vec<&str> = h.split('/').filter(|s| !s.is_empty()).collect();
         if self.keep_toast {
             self.keep_toast = false;
@@ -579,6 +593,8 @@ impl App {
             }
             ["settings"] => Route::Settings,
             ["about"] => Route::About,
+            ["embed", root, pda] => crate::embed::route(Some(root), pda, query),
+            ["embed", pda] => crate::embed::route(None, pda, query),
             _ => Route::Databases,
         };
         match self.route.clone() {
@@ -607,6 +623,7 @@ impl App {
                 self.fetch_all_balances();
             }
             Route::Account => self.fetch_all_balances(),
+            Route::Embed { .. } => self.embed_open_view(),
             Route::Draft(key) => {
                 if let Some(i) = self.draft_idx(&key) {
                     if let Some(w) = self.drafts[i].wallet.clone() {
@@ -650,7 +667,7 @@ impl App {
         None
     }
 
-    fn open_table(&mut self, root: Option<String>, pda: String) {
+    pub fn open_table(&mut self, root: Option<String>, pda: String) {
         self.open_table_with(root, pda, false);
     }
 
@@ -1299,7 +1316,7 @@ impl App {
             }
             P::SaveCheck { .. } => self.save_async(p, ok, status, data),
             P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
-            P::EmbedWasm(_) => self.embed_async(p, ok, status, data),
+            P::EmbedWasm(_) | P::EmbedTick(_) => self.embed_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
             P::CrowdHash(..) | P::CrowdPiece(_) | P::CrowdDl(..) | P::CrowdDlNext => self.crowd_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),

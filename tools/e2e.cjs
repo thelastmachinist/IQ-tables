@@ -819,6 +819,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const req = route.request();
     const url = req.url();
     if (url.startsWith("https://iq.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: html });
+    // someone else's site with an iframe of a table
+    if (url.startsWith("https://host.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: chain.hostPage || "<p>empty</p>" });
     // the site as IQ's browser serves it: at the address of the repository it was deployed from
     if (url.startsWith(`https://browser.iqlabs.dev/${DEC.pda}`)) return route.fulfill({ status: 200, contentType: "text/html", body: html });
     if (url.startsWith("https://files.test/")) {
@@ -1664,7 +1666,36 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const [wd] = await Promise.all([page.waitForEvent("download"), page.click(".embedpanel button[data-a='embed-dl'][data-arg='decoder']")]);
     check(wd.suggestedFilename() === `iqt-decoder-${decSig.slice(0, 8)}.wasm` && fs.readFileSync(await wd.path()).equals(DEC.wasm), "Download the decoder file: the deployed decoder, byte for byte");
     await shot("09c-embed-live");
+    // the iframe: code to paste, and the bare view it shows
+    await page.click(".embedpanel button[data-a='embed-tab'][data-arg='frame']");
+    const frameCode = () => page.locator(".embedpanel pre[data-snippet='iframe']").innerText();
+    check((await frameCode()).includes(`src="https://iq.test/#/embed/${rootPda}/${fastPda}?rows=official"`), "Iframe: code pointing at this site's bare view of the table");
+    await page.selectOption(".embedpanel select[data-arg='every']", "300");
+    check((await frameCode()).includes("?rows=official&amp;every=300") || (await frameCode()).includes("?rows=official&every=300"), "…optionally read again every 5 minutes");
     await page.click(".embedpanel button[data-a='embed-close']");
+    await page.goto(`https://iq.test/#/embed/${rootPda}/${fastPda}?rows=official`);
+    await page.waitForFunction(() => /600 rows/.test(document.getElementById("app").innerText), null, { timeout: 30000 });
+    const fv = await page.evaluate(() => ({ header: document.querySelectorAll("header").length, rows: document.querySelectorAll(".frameview tbody tr").length, pager: document.querySelector(".framefoot").innerText, credit: document.querySelector(".framecredit a").getAttribute("href") }));
+    check(fv.header === 0 && fv.rows === 50 && /1 \/ 12/.test(fv.pager) && fv.credit === `https://iq.test/#/t/${rootPda}/${fastPda}`, "the bare view: no header, 50 rows a page of 600, a link back to the table");
+    await page.click(".framefoot button[data-arg='1']");
+    check(/2 \/ 12/.test(await page.locator(".framefoot").innerText()), "…with paging");
+    await shot("09d-embed-view");
+    await page.goto(`https://iq.test/#/embed/${rootPda}/${fastPda}?rows=all`);
+    await page.waitForFunction(() => /601 rows/.test(document.getElementById("app").innerText), null, { timeout: 30000 });
+    check(true, "rows=all shows everyone's rows (601)");
+    {
+      const p4 = await ctx.newPage();
+      await p4.route("**/*", handler);
+      chain.hostPage = `<!doctype html><h1>My parts site</h1><iframe id="f" src="https://iq.test/#/embed/${rootPda}/${fastPda}?rows=official" width="800" height="520" style="border:0"></iframe>`;
+      await p4.goto("https://host.test/");
+      const frame = p4.frameLocator("#f");
+      await frame.locator(".framefoot").waitFor({ timeout: 30000 });
+      const inFrame = await frame.locator(".frameview tbody tr").count();
+      check(inFrame === 50 && (await frame.locator(".framefoot").innerText()).includes("600 rows"), "…and it works inside another site's iframe");
+      await p4.close();
+    }
+    await page.goto(`https://iq.test/#/t/${rootPda}/${fastPda}`);
+    await page.waitForFunction(() => /Official\s*600/.test(document.getElementById("app").innerText), null, { timeout: 20000 });
     // served by IQ's browser, the page knows its own repository (another tab: this one stays signed in)
     {
       const p3 = await ctx.newPage();
@@ -1755,6 +1786,34 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
       return out;
     }, [loaderSrc, { table: fastPda, official: fa, decoder: { repo: DEC.pda, owner: DEC.owner } }]);
     check(rendered.rows === 600 && rendered.cols > 1 && rendered.stored >= 2, `In a web page: renderTable draws the 600 rows; the decoder is kept in localStorage (${rendered.stored} entries)`);
+    // the command line: in-process for reads (through the mock), as a program for encode/decode
+    {
+      const outs = [];
+      const errs = [];
+      const io = { fetch: mf, stdout: (t) => outs.push(t), stderr: (t) => errs.push(t) };
+      const code = await L.cli(["read", fastPda, "--official", fa, "--decoder", path.join(ROOT, "site", "iqt-decoder.wasm")], io);
+      check(code === 0 && outs.join("") === snap.text && errs.join("").includes("600 row(s)"), "Command line: `read` prints the same CSV as the snapshot");
+      const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "iqt-cli-"));
+      fs.copyFileSync(path.join(ROOT, "site", "iqt-loader.mjs"), path.join(tmp, "iqt-loader.mjs"));
+      fs.copyFileSync(path.join(ROOT, "site", "iqt-decoder.wasm"), path.join(tmp, "iqt-decoder.wasm"));
+      const run = (args, input) => require("child_process").spawnSync(process.execPath, [path.join(tmp, "iqt-loader.mjs"), ...args], { cwd: tmp, input, encoding: "utf8" });
+      fs.writeFileSync(path.join(tmp, "parts.csv"), snap.text);
+      const enc = run(["encode", "parts.csv", "--out", "row.json"]);
+      const row = JSON.parse(fs.readFileSync(path.join(tmp, "row.json"), "utf8"));
+      check(enc.status === 0 && row.p.startsWith("IQT1z") && row.p.length * 3 < snap.text.length && /600 record\(s\)/.test(enc.stderr), `\`encode\` packs the 600-row CSV into one row (${snap.text.length} → ${row.p.length} bytes), using the decoder next to it`);
+      const dec = run(["decode", "row.json", "--format", "csv"]);
+      check(dec.status === 0 && dec.stdout === snap.text, "`decode` gives the same CSV back");
+      const piped = run(["encode", "-", "--mode", "plain"], snap.text);
+      check(piped.status === 0 && JSON.parse(piped.stdout).p.startsWith("IQT1j"), "…from standard input, and plain (readable) when asked");
+      const onChain = (chain.rows.get(fastPda) || []).find((r) => r.__signer === fa && typeof r.p === "string" && r.p.startsWith("IQT1"));
+      const fromChain = run(["decode", JSON.stringify({ id: onChain.id, p: onChain.p })]);
+      check(fromChain.status === 0 && JSON.parse(fromChain.stdout).length > 0, `\`decode\` reads a pack straight from the table (${JSON.parse(fromChain.stdout).length} records)`);
+      const bad = run(["decode", "nonsense"]);
+      check(bad.status === 1 && bad.stderr.includes("isn't an IQ Tables pack"), "…and says so when given something else");
+      const help = run([]);
+      check(help.status === 2 && help.stdout.includes("encode") && help.stdout.includes("decode"), "running it bare prints how to use it");
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
     // following the newest decoder
     const other = new PublicKey(Buffer.alloc(32, 22)).toBase58();
     repoCommit(DEC, "not the owner", { ...DEC.files(), "iqt-decoder.wasm": fakeDecoder({ error: "impostor" }) }, other);

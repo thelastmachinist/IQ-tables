@@ -407,22 +407,31 @@ function context(opts) {
 
 // ----------------------------------------------------------------- public
 
-async function run(opts) {
+// Options this file handles itself; everything else goes to the decoder as
+// is, so options that newer decoders add work without a new loader.
+const LOADER_OPTS = new Set(["fetch", "store", "decoder", "cacheMs", "every", "className"]);
+
+// What the decoder is told: the options it reads, normalized.
+function readConfig(opts) {
+  const config = {};
+  for (const [k, v] of Object.entries(opts)) {
+    if (!LOADER_OPTS.has(k) && v !== undefined && typeof v !== "function") config[k] = v;
+  }
+  return Object.assign(config, {
+    rows: opts.rows || "official",
+    format: opts.format || "rows",
+    gateway: String(opts.gateway || GATEWAY).replace(/\/+$/, ""),
+    rpc: opts.rpc ? RPC_STANDIN : undefined,
+    source: opts.source || "auto",
+    fresh: !!opts.fresh,
+  });
+}
+
+async function run(opts, config) {
   const ctx = context(opts);
   const dec = await mainDecoder(ctx);
   ctx.running = dec.ref;
   const call = open(dec.module);
-  const config = {
-    table: opts.table,
-    official: opts.official,
-    rows: opts.rows || "official",
-    format: opts.format || "rows",
-    gateway: ctx.gw,
-    rpc: ctx.rpc ? RPC_STANDIN : undefined,
-    source: opts.source || "auto",
-    fresh: !!opts.fresh,
-    maxRows: opts.maxRows,
-  };
   let step = call({ op: "read", config });
   for (let i = 0; i < MAX_STEPS; i++) {
     if (step.done) return { ...step.done, decoderRef: dec.ref };
@@ -445,13 +454,14 @@ export async function readTable(opts) {
   if (!opts || !opts.table) throw new Error("IQ Tables: readTable needs a table address");
   const d = opts.decoder || {};
   if (d.wasm && typeof d.wasm === "object" && !local.has(d.wasm)) local.set(d.wasm, { id: ++localIds, module: await compile(d.wasm) });
-  const key = JSON.stringify([opts.table, opts.official, opts.rows, opts.format, opts.gateway, opts.rpc, opts.source, opts.fresh, opts.maxRows, d.repo, d.owner, d.pin, d.wasm ? local.get(d.wasm).id : 0]);
+  const config = readConfig(opts);
+  const key = JSON.stringify([config, opts.rpc, d.repo, d.owner, d.pin, d.wasm ? local.get(d.wasm).id : 0]);
   const cacheMs = opts.cacheMs ?? 60000;
   const now = Date.now();
   if (results.size > 64) for (const [k, v] of results) if (now - v.at >= v.ms) results.delete(k);
   const hit = results.get(key);
   if (hit && cacheMs > 0 && now - hit.at < cacheMs) return hit.value;
-  const value = run(opts);
+  const value = run(opts, config);
   if (cacheMs > 0) results.set(key, { at: now, ms: cacheMs, value });
   try {
     return await value;
@@ -459,6 +469,34 @@ export async function readTable(opts) {
     if (results.get(key)?.value === value) results.delete(key);
     throw e;
   }
+}
+
+// One call to the decoder that isn't a read (encode, unpack, info).
+async function tool(opts, msg) {
+  const dec = await mainDecoder(context(opts));
+  const r = open(dec.module)(msg);
+  if (r.error) throw new Error(`IQ Tables: ${r.error === "unknown op" ? `this decoder (${dec.ref}) is too old for ${msg.op}` : r.error}`);
+  return r.ok;
+}
+
+// Pack rows into one IQ Tables row, as densely as the format allows.
+// `data`: CSV text, an array of objects, or { cols, rows }. Options: `id`
+// (the id column's name or number; default the first), `mode` ("dense",
+// "compressed" or "plain"), plus the decoder options.
+// Resolves to { row: { id, p }, records, columns, idColumn, bytes, raw, compressed, duplicateIds }.
+export async function encodeRows(data, opts = {}) {
+  const msg = { op: "encode", id: opts.id, mode: opts.mode || "dense" };
+  if (typeof data === "string") msg.csv = data;
+  else if (Array.isArray(data)) msg.objects = data;
+  else if (data && Array.isArray(data.cols)) Object.assign(msg, { cols: data.cols, rows: data.rows || [] });
+  else throw new Error("IQ Tables: encodeRows takes CSV text, an array of objects, or { cols, rows }");
+  return tool(opts, msg);
+}
+
+// Unpack one IQ Tables pack (its payload, or the whole { id, p } row) into
+// text: `format` "json" (default) or "csv". Resolves to { text, records, deleted, structure }.
+export async function decodePack(pack, opts = {}) {
+  return tool(opts, { op: "unpack", payload: typeof pack === "string" ? pack : pack, format: opts.format || "json" });
 }
 
 // Which decoder a configuration would use: { ref, abi, version, formats }.
@@ -501,4 +539,163 @@ export async function renderTable(el, opts = {}) {
   }
   if (opts.every > 0) setInterval(() => draw().catch((e) => console.warn(e)), Math.max(opts.every, 10000));
   return first;
+}
+
+// ------------------------------------------------------------ command line
+
+const USAGE = `IQ Tables from the command line (Node 18+, Deno or Bun):
+
+  node iqt-loader.mjs read <table> --official <wallet> [--rows official|all|unofficial]
+                           [--format csv|json|html|rows] [--rpc <url>] [--fresh] [--out <file>]
+      Read a table: its records as CSV (default), JSON or an HTML table.
+
+  node iqt-loader.mjs encode <file.csv | file.json | -> [--id <column>] [--mode dense|compressed|plain] [--out <file>]
+      Pack rows into one IQ Tables row ({"id","p"}), as densely as the format allows.
+      JSON input: an array of objects, or {"cols": [...], "rows": [[...]]}. The id
+      column defaults to the first. Write it to a table with columns id, p with
+      IQ's SDK: writer.writeRow(connection, signer, "<database>", "<table>", rowJson).
+
+  node iqt-loader.mjs decode <payload | row JSON | file | -> [--format json|csv] [--out <file>]
+      Unpack one IQ Tables row into its records.
+
+  node iqt-loader.mjs info
+      Which decoder is used.
+
+The decoder: iqt-decoder.wasm next to this file (where \`iqgit clone\` puts it),
+or --decoder <file.wasm>, --pin <inscription>, or --repo <address> --owner <wallet>.
+--gateway <url> reads through another gateway. "-" reads from standard input.
+`;
+
+function parseArgs(argv) {
+  const pos = [];
+  const flags = {};
+  const bare = new Set(["help", "fresh"]);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h") flags.help = true;
+    else if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq > 0) flags[a.slice(2, eq)] = a.slice(eq + 1);
+      else if (bare.has(a.slice(2))) flags[a.slice(2)] = true;
+      else flags[a.slice(2)] = argv[++i];
+    } else pos.push(a);
+  }
+  return { pos, flags };
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const c of process.stdin) chunks.push(typeof c === "string" ? new TextEncoder().encode(c) : c);
+  const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let at = 0;
+  for (const c of chunks) {
+    all.set(c, at);
+    at += c.length;
+  }
+  return new TextDecoder().decode(all);
+}
+
+// Run a command (`argv` without "node" and the file). `io` can replace
+// fetch, fs, stdout and stderr (for tests). Resolves to an exit code.
+export async function cli(argv, io = {}) {
+  const fsName = "node:fs";
+  const fs = io.fs || (await import(fsName));
+  const out = io.stdout || ((t) => process.stdout.write(t));
+  const err = io.stderr || ((t) => process.stderr.write(t));
+  const { pos, flags } = parseArgs(argv);
+  const cmd = pos[0];
+  if (!cmd || flags.help || cmd === "help") {
+    out(USAGE);
+    return cmd || flags.help ? 0 : 2;
+  }
+  const decoder = {};
+  if (flags.decoder) decoder.wasm = fs.readFileSync(flags.decoder);
+  if (flags.pin) decoder.pin = flags.pin;
+  if (flags.repo) decoder.repo = flags.repo;
+  if (flags.owner) decoder.owner = flags.owner;
+  if (!decoder.wasm && !decoder.pin && !decoder.repo) {
+    // the decoder that `iqgit clone` leaves next to this file
+    try {
+      decoder.wasm = fs.readFileSync(new URL("./iqt-decoder.wasm", import.meta.url));
+    } catch (_) { /* none here */ }
+  }
+  const base = { decoder, gateway: flags.gateway, store: null, ...(io.fetch ? { fetch: io.fetch } : {}) };
+  const source = async (arg) => {
+    if (arg === undefined || arg === "-") return readStdin();
+    return fs.existsSync(arg) ? fs.readFileSync(arg, "utf8") : null;
+  };
+  const write = (t) => {
+    if (flags.out) fs.writeFileSync(flags.out, t);
+    else out(t.endsWith("\n") ? t : t + "\n");
+  };
+  switch (cmd) {
+    case "read": {
+      if (!pos[1]) throw new Error("read needs a table address");
+      const r = await readTable({
+        ...base,
+        table: pos[1],
+        official: flags.official,
+        rows: flags.rows,
+        format: flags.format || "csv",
+        rpc: flags.rpc,
+        source: flags.source,
+        fresh: !!flags.fresh,
+        maxRows: flags["max-rows"] ? Number(flags["max-rows"]) : undefined,
+        cacheMs: 0,
+      });
+      write(r.data ?? JSON.stringify({ cols: r.cols, rows: r.rows }));
+      err(`${r.count} row(s) from ${r.source === "gateway" ? "IQ's gateway" : "Solana"}${r.notes.length ? "\n" + r.notes.join("\n") : ""}\n`);
+      return 0;
+    }
+    case "encode": {
+      const text = await source(pos[1]);
+      if (text == null) throw new Error(`no such file: ${pos[1]}`);
+      const t = text.trim();
+      const data = t.startsWith("[") || t.startsWith("{") ? JSON.parse(t) : text;
+      const r = await encodeRows(data, { ...base, id: flags.id, mode: flags.mode });
+      write(JSON.stringify(r.row));
+      err(
+        `${r.records} record(s), ${r.columns} column(s), id column "${r.idColumn}": ${r.bytes} bytes ` +
+          `(${r.compressed ? "compressed" : "plain"}; ${r.raw} bytes unpacked)` +
+          (r.duplicateIds ? `\n${r.duplicateIds} row(s) repeat an id: the later one wins when read` : "") +
+          "\n",
+      );
+      return 0;
+    }
+    case "decode": {
+      const arg = pos[1];
+      const inline = arg && arg !== "-" && !fs.existsSync(arg);
+      const text = inline ? arg : await source(arg);
+      const r = await decodePack(text.trim(), { ...base, format: flags.format || "json" });
+      write(r.text);
+      err(r.structure ? "a table-structure record\n" : `${r.records} record(s)${r.deleted && r.deleted.length ? `, ${r.deleted.length} deleted` : ""}\n`);
+      return 0;
+    }
+    case "info":
+      out(JSON.stringify(await decoderInfo(base)) + "\n");
+      return 0;
+    default:
+      err(`unknown command: ${cmd}\n\n${USAGE}`);
+      return 2;
+  }
+}
+
+// Run as a program: `node iqt-loader.mjs …` (not when imported).
+if (typeof process !== "undefined" && Array.isArray(process.argv) && process.argv[1] && typeof document === "undefined") {
+  let main = import.meta.main === true;
+  if (!main) {
+    try {
+      const urlName = "node:url";
+      const fsName = "node:fs";
+      const { pathToFileURL } = await import(urlName);
+      const { realpathSync } = await import(fsName);
+      main = pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+    } catch (_) { /* not Node-like */ }
+  }
+  if (main) {
+    process.exitCode = await cli(process.argv.slice(2)).catch((e) => {
+      process.stderr.write(`${(e && e.message) || e}\n`);
+      return 1;
+    });
+  }
 }
