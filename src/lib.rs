@@ -22,8 +22,6 @@ pub mod chain;
 pub mod codec;
 #[cfg(feature = "app")]
 pub mod constraints;
-#[cfg(feature = "app")]
-pub mod crowd;
 pub mod crypto;
 pub mod dates;
 #[cfg(feature = "app")]

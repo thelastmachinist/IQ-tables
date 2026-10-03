@@ -795,8 +795,6 @@ pub struct Doc {
     /// A checkpoint: these packs (written just before this record) hold the
     /// whole table; history before them can be skipped.
     pub snap: Vec<String>,
-    /// A crowdfunded file's manifest (crowd.rs): readers keep the first one.
-    pub crowd: Option<Json>,
 }
 
 impl Doc {
@@ -861,9 +859,6 @@ impl Doc {
         if !self.snap.is_empty() {
             o.set("snap", Json::Arr(self.snap.iter().map(|s| json::s(s)).collect()));
         }
-        if let Some(c) = &self.crowd {
-            o.set("crowd", c.clone());
-        }
         o
     }
 
@@ -899,16 +894,7 @@ impl Doc {
             ai_next: v.get("ai").u64().unwrap_or(0),
         };
         let pk = v.get("pk").str().map(String::from).or_else(|| cols.first().map(|c| c.1.key.clone())).unwrap_or_default();
-        let crowd = Some(v.get("crowd").clone()).filter(|c| !c.is_null());
-        Some(Doc {
-            cols,
-            pk,
-            keys,
-            clear: v.get("clr").u64().unwrap_or(0) != 0,
-            dropped: v.get("drop").u64().unwrap_or(0) != 0,
-            snap: strs(v.get("snap")),
-            crowd,
-        })
+        Some(Doc { cols, pk, keys, clear: v.get("clr").u64().unwrap_or(0) != 0, dropped: v.get("drop").u64().unwrap_or(0) != 0, snap: strs(v.get("snap")) })
     }
 
     /// Nothing beyond plain, untyped columns: no record needed on chain.
@@ -916,7 +902,6 @@ impl Doc {
         !self.clear
             && !self.dropped
             && self.snap.is_empty()
-            && self.crowd.is_none()
             && self.keys == TableKeys::default()
             && self.cols.iter().all(|(n, m)| *m == ColMeta::plain(n))
             && self.cols.first().map(|c| c.1.key == self.pk).unwrap_or(true)

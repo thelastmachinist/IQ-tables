@@ -698,13 +698,6 @@ fn review_hardening() {
     // sizes past 4 GB
     assert_eq!(crate::ui::bytes(8u64 << 30), "8.00 GB");
     assert_eq!(crate::ui::bytes(1536usize), "1.5 KB");
-    // a manifest from the chain: only web sources, only pieces a browser can hold
-    let m = |source: &str, piece: u64| {
-        json::parse(&format!(r#"{{"size":10,"sha256":"{h}","piece":{piece},"hashes":["{h}"],"source":"{source}"}}"#, h = "a".repeat(64))).unwrap()
-    };
-    assert_eq!(crate::crowd::Manifest::from_json(&m("javascript:alert(1)", 1 << 20)).unwrap().source, "");
-    assert_eq!(crate::crowd::Manifest::from_json(&m("https://x.example/f", 1 << 20)).unwrap().source, "https://x.example/f");
-    assert!(crate::crowd::Manifest::from_json(&m("", 1 << 30)).is_none(), "1 GB pieces are refused");
 }
 
 #[test]

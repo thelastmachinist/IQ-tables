@@ -163,12 +163,6 @@ body.dropping::after { content: "Drop account or key files to log in"; position:
 .link.file { text-align: left; }
 .link.git { text-align: left; }
 table.data td .link.git { display: inline-block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
-.crowd .hash { overflow-wrap: anywhere; }
-.pieces { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0 12px; }
-.pieces i { width: 12px; height: 12px; border-radius: 3px; background: var(--soft); border: 1px solid var(--line); }
-.pieces i.on { background: var(--good); border-color: var(--good); }
-.pieces i.up { background: var(--accent); border-color: var(--accent); animation: pulse 1s ease-in-out infinite alternate; }
-@keyframes pulse { from { opacity: .45; } to { opacity: 1; } }
 p.ok { color: var(--good); }
 .link.git .muted { font-size: .9em; }
 .gitcols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }

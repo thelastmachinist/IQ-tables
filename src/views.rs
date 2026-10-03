@@ -611,7 +611,6 @@ fn table(app: &App, h: &mut String) {
         None => h.push_str("<div><span>Official wallet</span><span class=\"muted\">unknown (database not in the list yet)</span></div>"),
     }
     h.push_str("</div>");
-    crate::crowd::card(app, h);
 
     let (cols, rows) = view_rows(tv);
     // counts for the filter chips
@@ -834,8 +833,6 @@ fn about(h: &mut String) {
 <p>Your wallet is your account. Drop its key file anywhere on the page (a Solana key file like <code>id.json</code>) or paste the secret key — no browser extension, no name or email. The key stays in the tab's memory and every transaction is signed right there; nothing is stored, and closing the tab signs you out. No wallet yet? <em>Make a new wallet</em> downloads its key as a Solana key file. Extra wallets are derived from your key (<code>SHA-256("iq-tables/account/v1/wallet" ‖ master ‖ index)</code>, with the master itself from your key), so the same key always brings them back. Optionally, your keys can be downloaded as one file encrypted with the IQ SDK's <code>passwordEncrypt</code> scheme (PBKDF2-SHA256 × 250,000 → AES-256-GCM), which the SDK's <code>passwordDecrypt</code> opens too. A database belongs to the wallet that creates it: its address is the <em>official</em> signer and a public donation address. Rows written by anyone else show as <em>unofficial</em>.</p>
 <h3>Links and files</h3>
 <p>Cells can link anywhere: <code>iq://table/&lt;table&gt;/&lt;record&gt;</code> and <code>iq://db/&lt;database&gt;</code> open in the explorer, web links and <code>.sol</code> names open in a new tab (<code>.sol</code> through IQ's browser), <code>iq://tx/&lt;signature&gt;</code> opens an inscription, and an IQ git repository's browser link shows the project's newest commit. Attaching a file inscribes it with <code>user_inventory_code_in</code>, exactly like the SDK's <code>codeIn</code> (text as text, binary as base64) — in parallel parts with IQ's chunked upload when it's bigger than one transaction — and IQ's gateway serves it back at <code>/data</code>, <code>/img</code> and <code>/view</code>.</p>
-<h3>Big files, together</h3>
-<p>A crowdfunded upload publishes a big file's fingerprints (a SHA-256 per piece) in a table anyone can add to. Anyone can upload pieces from their own balance; downloads check every piece and the whole file against the first fingerprints published, so it doesn't matter who uploaded what.</p>
 <h3>Written in Rust</h3>
 <p>Everything — SHA-2, Keccak, Ed25519, PBKDF2, AES-GCM, Base58, Solana transaction encoding (legacy and v1), the IQ program's instructions, JSON, compression, QR codes, the UI — is dependency-free Rust compiled to WebAssembly. A small JavaScript file only connects it to the page, the network and your files.</p>
 </div>"#);

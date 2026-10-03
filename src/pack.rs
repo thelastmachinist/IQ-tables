@@ -603,13 +603,3 @@ pub fn checkpoint_covers(newest_first: &[SourcePack], official: &dyn Fn(&str) ->
     }
     false
 }
-
-/// A crowdfunded upload's table (its manifest is a structure record with
-/// `crowd`; registrations have columns piece, sha256, tx). Such a table is
-/// read whole: its oldest record is what counts, and anyone may add rows.
-pub fn looks_crowd(packs: &[&SourcePack]) -> bool {
-    packs.iter().any(|p| match &p.meta {
-        Some(m) => !m.get("crowd").is_null(),
-        None => ["piece", "sha256", "tx"].iter().all(|k| p.schema.cols.iter().any(|c| c == k)),
-    })
-}

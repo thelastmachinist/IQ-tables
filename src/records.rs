@@ -55,7 +55,7 @@ pub fn decode_row(r: &Json) -> Option<Result<SourcePack, String>> {
 /// Unpacked size of one pack from someone other than the table's owner, and
 /// of all of them in one read. Anyone can write to a table and unpacking is
 /// slow, so without these a few forged rows could stall everyone reading it.
-/// (Community rows, crowdfunded registrations included, are small.)
+/// (Community rows are small.)
 pub const OTHERS_PACK_MAX: u64 = 64 << 10;
 pub const OTHERS_READ_MAX: u64 = 4 << 20;
 

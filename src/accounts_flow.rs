@@ -109,18 +109,14 @@ impl App {
             }
             (_, "save-account") => self.save_account(),
             (_, "logout") => {
-                let working = self.run.as_ref().map(|r| r.busy()).unwrap_or(false)
-                    || self.attach_status.is_some()
-                    || self.crowd.work.as_ref().map(|w| !w.finished).unwrap_or(false)
-                    || self.uploads.values().any(|b| !b.idle());
+                let working = self.run.as_ref().map(|r| r.busy()).unwrap_or(false) || self.attach_status.is_some() || self.uploads.values().any(|b| !b.idle());
                 if working {
                     self.err("Wait for the save or upload to finish (or stop it) before signing out.");
                 } else {
                     // everything holding a key goes: the account, a stopped
-                    // save and its parts, crowdfunding work
+                    // save and its parts
                     self.run = None;
                     self.uploads.clear();
-                    self.crowd.work = None;
                     self.panel.clear();
                     self.send_review = None;
                     self.account = None;

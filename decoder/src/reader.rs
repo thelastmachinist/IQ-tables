@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use iq_tables::crypto::base58;
 use iq_tables::json::{self, Json};
 use iq_tables::net;
-use iq_tables::pack::{self, SourcePack};
+use iq_tables::pack::SourcePack;
 use iq_tables::records::{self, Source, Who};
 
 /// Gateway rows per request (its maximum).
@@ -280,7 +280,6 @@ pub struct Reader {
     ckpt: Option<(usize, Vec<String>)>,
     ckpt_seen: std::collections::HashSet<String>,
     ckpt_scan: usize,
-    crowd: bool,
     /// What the last step is waiting for.
     pending: Option<Out>,
     /// A step to send again after a wait (rate limits).
@@ -340,7 +339,6 @@ impl Reader {
             ckpt: None,
             ckpt_seen: Default::default(),
             ckpt_scan: 0,
-            crowd: false,
             pending: None,
             again: None,
             notes: vec![],
@@ -485,7 +483,6 @@ impl Reader {
             self.ckpt = None;
             self.ckpt_seen.clear();
             self.ckpt_scan = 0;
-            self.crowd = false;
             return self.rpc_first();
         }
         Step::Error(format!("IQ's gateway couldn't answer: {}", why))
@@ -530,10 +527,6 @@ impl Reader {
             if p.signer != owner {
                 continue;
             }
-            // a crowdfunded upload is read whole
-            if pack::looks_crowd(&[p]) {
-                self.crowd = true;
-            }
             match (&p.meta, &self.ckpt) {
                 (Some(m), None) => {
                     if let Some(d) = iq_tables::schema::Doc::from_json(m).filter(|d| !d.snap.is_empty()) {
@@ -547,7 +540,7 @@ impl Reader {
             }
         }
         self.ckpt_scan = self.decoded.len();
-        !self.crowd && self.ckpt.as_ref().map(|(_, snap)| snap.iter().all(|id| self.ckpt_seen.contains(id))).unwrap_or(false)
+        self.ckpt.as_ref().map(|(_, snap)| snap.iter().all(|id| self.ckpt_seen.contains(id))).unwrap_or(false)
     }
 
     // ------------------------------------------------------------ Solana

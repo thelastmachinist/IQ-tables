@@ -409,7 +409,6 @@ fn structure_records_on_chain() {
                 clear,
                 dropped: false,
                 snap: vec![],
-                crowd: None,
             }
             .to_json(),
         ),
@@ -562,7 +561,6 @@ fn checkpoints_and_chunked_writes() {
                 clear: false,
                 dropped: false,
                 snap: snap.into_iter().map(String::from).collect(),
-                crowd: None,
             }
             .to_json(),
         ),
@@ -652,87 +650,7 @@ fn checkpoints_and_chunked_writes() {
 }
 
 #[test]
-fn crowdfunded_manifest_and_pieces() {
-    use crate::crowd::{self, Manifest};
-    use crate::json::{self, Json};
-    use crate::pack::SourcePack;
-    let data: Vec<u8> = (0..2_300_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
-    let piece = crowd::piece_size(data.len() as u64);
-    assert_eq!(piece, crowd::SMALL_PIECE);
-    assert_eq!(crowd::piece_size(17 << 20), crowd::BIG_PIECE);
-    let hashes: Vec<String> = data.chunks(piece as usize).map(crowd::sha256_hex).collect();
-    let m = Manifest {
-        name: "homebrew.nes".into(),
-        size: data.len() as u64,
-        ftype: "application/octet-stream".into(),
-        sha256: crowd::sha256_hex(&data),
-        piece,
-        hashes: hashes.clone(),
-        source: "https://files.example/homebrew.nes".into(),
-        note: "public domain".into(),
-    };
-    assert_eq!(m.count(), 3);
-    assert_eq!(m.range(2), (2 * piece, data.len() as u64 - 2 * piece));
-    assert_eq!(Manifest::from_json(&json::parse(&m.to_json().to_string()).unwrap()), Some(m.clone()));
-    // a manifest whose piece list doesn't fit its size isn't one
-    let mut bad = m.to_json();
-    bad.set("size", json::n(10u64 << 20));
-    assert_eq!(Manifest::from_json(&bad), None);
-    // the table's history: the organizer's manifest, a later different one
-    // (ignored), a stranger's manifest (ignored), registrations from anyone
-    let org = "Org1111111111111111111111111111111111111111";
-    let meta = |m: &Manifest| {
-        let mut d = json::parse(r#"{"v":1,"c":[{"n":"id","k":"id"}],"pk":"id"}"#).unwrap();
-        d.set("crowd", m.to_json());
-        d
-    };
-    let structure = |signer: &str, m: &Manifest, t: i64| SourcePack {
-        id: format!("~s{}", t),
-        tx: format!("tx{}", t),
-        signer: signer.into(),
-        time: Some(t),
-        schema: crate::pack::Schema { cols: vec!["id".into()], id: 0 },
-        recs: vec![],
-        meta: Some(meta(m)),
-    };
-    let reg = |signer: &str, i: usize, sha: &str, tx: &str, t: i64| {
-        let (schema, recs, meta) = crate::pack::decode_any(&crowd::registration_payload(i, sha, tx)).unwrap();
-        assert!(meta.is_none());
-        SourcePack { id: format!("r{}", t), tx: format!("reg{}", t), signer: signer.into(), time: Some(t), schema, recs, meta }
-    };
-    let mut other = m.clone();
-    other.sha256 = "0".repeat(64);
-    let txa = "5".repeat(88);
-    let txb = "4".repeat(88);
-    let packs = vec![
-        structure("Stranger11111111111111111111111111111111111", &other, 1),
-        structure(org, &m, 2),
-        reg("Alice1111111111111111111111111111111111111111", 0, &hashes[0], &txa, 3),
-        reg("Bob11111111111111111111111111111111111111111", 1, &"f".repeat(64), &txb, 4),
-        reg("Bob11111111111111111111111111111111111111111", 2, &hashes[2], &txb, 5),
-        structure(org, &other, 6),
-    ];
-    let s = crowd::scan(&packs, &|x| x == org).unwrap();
-    assert_eq!(s.manifest, m, "the organizer's first manifest wins");
-    assert!(s.changed);
-    assert_eq!(s.regs.len(), 3);
-    let c = s.candidates(&[], &[]);
-    assert_eq!(c.iter().map(|x| x.len()).collect::<Vec<_>>(), vec![1, 0, 1], "a registration with the wrong hash doesn't count");
-    assert_eq!(c[0][0].tx, txa);
-    let extra = crowd::Reg { piece: 1, sha256: hashes[1].clone(), tx: "3".repeat(88), signer: "me".into(), time: None };
-    assert_eq!(s.candidates(std::slice::from_ref(&extra), &[]).iter().filter(|x| !x.is_empty()).count(), 3);
-    assert_eq!(s.candidates(&[extra], std::slice::from_ref(&txa)).iter().filter(|x| !x.is_empty()).count(), 2, "a copy found not to match counts as missing");
-    assert!(crowd::looks_crowd(&packs.iter().collect::<Vec<_>>()));
-    assert!(crowd::scan(&packs, &|x| x == "nobody").is_none());
-    // a 1 MB piece: a session write (0.005 + deposit + a network fee per part) plus its row
-    let cost = crowd::piece_cost(1 << 20, false);
-    let parts = ((1u64 << 20).div_ceil(3) * 4).div_ceil(3600);
-    assert_eq!(
-        cost,
-        crate::iq::FEE_SESSION_WRITE + crate::iq::SESSION_RENT_ESTIMATE + (parts + 1) * crate::iq::TX_FEE + crate::iq::FEE_DIRECT_WRITE + crate::iq::TX_FEE
-    );
-    assert!(crowd::piece_cost(100, false) < 3_000_000, "a tiny piece is a direct write");
-    let _ = Json::Null;
+fn upload_profiles() {
     // IQ's upload profiles
     assert_eq!(crate::upload::profile("medium").parallel, 5);
     assert_eq!(crate::upload::profile("nonsense").name, crate::upload::DEFAULT_PROFILE);

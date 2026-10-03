@@ -130,8 +130,6 @@ pub struct DraftTable {
     /// A checkpoint (OPTIMIZE TABLE) is waiting to be saved: the whole table
     /// is rewritten so readers can skip its history.
     pub checkpoint: bool,
-    /// A crowdfunded file's manifest (crowd.rs), written with the structure.
-    pub crowd: Option<Json>,
     /// Display name and writer list as last seen on chain (to spot renames
     /// and privilege changes waiting to be saved).
     pub chain_title: Option<String>,
@@ -229,7 +227,6 @@ impl DraftTable {
             clear: self.clear,
             dropped: self.dropped,
             snap: vec![],
-            crowd: self.crowd.clone(),
         }
     }
     /// The structure without the one-off events, as text (for comparing).
@@ -265,9 +262,6 @@ impl DraftTable {
         self.meta = d.cols.iter().map(|(_, m)| m.clone()).collect();
         self.id_col = d.pos(&d.pk).unwrap_or(0);
         self.keys = d.keys.clone();
-        if d.crowd.is_some() {
-            self.crowd = d.crowd.clone();
-        }
     }
 }
 
@@ -380,9 +374,6 @@ pub fn drafts_to_json(ds: &[Draft]) -> Json {
                                     if t.checkpoint {
                                         o.set("checkpoint", Json::Bool(true));
                                     }
-                                    if let Some(c) = &t.crowd {
-                                        o.set("crowd", c.clone());
-                                    }
                                     o
                                 })
                                 .collect(),
@@ -434,7 +425,6 @@ pub fn drafts_from_json(v: &Json) -> Vec<Draft> {
                             _ => None,
                         },
                         checkpoint: t.get("checkpoint").bool().unwrap_or(false),
-                        crowd: Some(t.get("crowd").clone()).filter(|c| !c.is_null()),
                         ..Default::default()
                     };
                     if tb.title.is_empty() {

@@ -10,12 +10,6 @@
   const dec = new TextDecoder();
   let w = null; // wasm exports
   let staged = null;
-  // Files chosen for crowdfunded uploads stay here (they can be gigabytes);
-  // the app reads them a piece at a time. Downloads are assembled from
-  // pieces the same way.
-  const kept = new Map();
-  let keptId = 0;
-  const blobs = new Map();
   let rendering = false;
   let scrollSel = false;
   // Calls into the wasm never nest: an event raised while the app is busy
@@ -143,33 +137,6 @@
         try { navigator.clipboard.writeText(s).catch(fallback); } catch (_) { fallback(); }
       },
       timer: (id, ms) => setTimeout(() => done(id, true, 0, ""), ms),
-      file_read: (id, fid, start, len) => {
-        const f = kept.get(fid);
-        if (!f) return done(id, false, 0, "that file is no longer open in this tab");
-        f.slice(start, start + len).arrayBuffer()
-          .then((ab) => done(id, true, 200, new Uint8Array(ab)))
-          .catch((e) => done(id, false, 0, errText(e)));
-      },
-      fetch_bytes: (id, up, ul, start, len) => {
-        const init = len > 0 ? { headers: { range: `bytes=${start}-${start + len - 1}` } } : {};
-        fetch(str(up, ul), init)
-          .then(async (r) => done(id, true, r.status, new Uint8Array(await r.arrayBuffer())))
-          .catch((e) => done(id, false, 0, errText(e)));
-      },
-      blob_part: (bid, p, l) => {
-        if (!blobs.has(bid)) blobs.set(bid, []);
-        blobs.get(bid).push(new Blob([bytes(p, l)]));
-      },
-      blob_save: (bid, np, nl, mp, ml) => {
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(new Blob(blobs.get(bid) || [], { type: str(mp, ml) }));
-        a.download = str(np, nl);
-        blobs.delete(bid);
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000);
-      },
-      blob_drop: (bid) => { blobs.delete(bid); },
       set_hash: (p, l) => {
         const h = str(p, l);
         if (location.hash !== h) location.hash = h;
@@ -245,13 +212,6 @@
       for (const f of t.files) f.text().then((txt) => ev("file", t.dataset.file, t.dataset.arg || f.name, txt));
       t.value = "";
     }
-    if (t.dataset.filekeep && t.files && t.files[0]) {
-      const f = t.files[0];
-      const fid = ++keptId;
-      kept.set(fid, f);
-      ev("file", t.dataset.filekeep, t.dataset.arg, JSON.stringify({ fid, name: f.name, type: f.type || "application/octet-stream", size: f.size }));
-      t.value = "";
-    }
     if (t.dataset.fileb64 && t.files && t.files[0]) {
       const f = t.files[0];
       f.arrayBuffer().then((ab) => ev("file", t.dataset.fileb64, t.dataset.arg,
@@ -294,7 +254,7 @@
     e.preventDefault();
     dragDepth = 0;
     document.body.classList.remove("dropping");
-    if (e.target.closest && e.target.closest("[data-fileb64],[data-filekeep]")) return;
+    if (e.target.closest && e.target.closest("[data-fileb64]")) return;
     for (const f of e.dataTransfer.files) {
       if (f.size > 2 * 1024 * 1024) { ev("file", "drop-too-big", f.name, ""); continue; }
       f.text().then((txt) => ev("file", "drop-file", f.name, txt));

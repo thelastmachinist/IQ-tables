@@ -179,15 +179,6 @@ pub enum P {
     Files(String),
     /// Parallel upload parts (upload.rs), by batch key.
     Up(String, crate::upload::UpOp),
-    // crowdfunded uploads (crowd.rs)
-    /// Piece `i` of the organizer's file `fid`, to fingerprint.
-    CrowdHash(u32, usize),
-    /// A piece to upload, read from the contributor's file or the source.
-    CrowdPiece(usize),
-    /// A piece of a download: (piece, candidate).
-    CrowdDl(usize, usize),
-    /// Read the current piece of the download again (after a pause).
-    CrowdDlNext,
     /// A decoder inscription to download (embed.rs).
     EmbedWasm(String),
     /// Read an embedded table again (its view generation).
@@ -275,8 +266,6 @@ pub struct App {
     pub git: crate::git::Git,
     /// Upload sessions whose parts are being sent in parallel ("run", "attach").
     pub uploads: HashMap<String, crate::upload::Batch>,
-    /// Crowdfunded uploads (crowd.rs).
-    pub crowd: crate::crowd::Crowd,
     /// The open "use this table elsewhere" dialog (embed.rs).
     pub embed: Option<crate::embed::Embed>,
     /// This page's address (origin and path), from the browser.
@@ -437,7 +426,6 @@ impl App {
             panel: String::new(),
             git: Default::default(),
             uploads: HashMap::new(),
-            crowd: Default::default(),
             embed: None,
             page_url: String::new(),
         }
@@ -800,10 +788,6 @@ impl App {
             return false;
         }
         let packs: Vec<pack::SourcePack> = t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).cloned().collect();
-        // a crowdfunded table is always read to its start: its first manifest is what counts
-        if crate::crowd::looks_crowd(&packs.iter().collect::<Vec<_>>()) {
-            return false;
-        }
         if !pack::checkpoint_covers(&packs, &|s| s == owner) {
             return false;
         }
@@ -1017,7 +1001,6 @@ impl App {
             (_, a) if a.starts_with("embed-") => {
                 self.embed_event(a, arg, val);
             }
-            (k, a) if a.starts_with("crowd-") && self.crowd_event(k, a, arg, val) => {}
             (_, "viewer-download") => self.viewer_download(),
             (_, "attach-col") => {
                 let mut it = arg.splitn(2, ':');
@@ -1213,14 +1196,6 @@ impl App {
                                 let n = rows.len();
                                 t.rows.extend(rows);
                                 t.cursor = v.get("nextCursor").str().map(String::from);
-                                // a crowdfunded table is read whole (its manifest is its oldest record)
-                                if !t.load_all
-                                    && crate::crowd::looks_crowd(&t.decoded.iter().filter_map(|d| d.as_ref().and_then(|r| r.as_ref().ok())).collect::<Vec<_>>())
-                                {
-                                    t.load_all = true;
-                                    // its rows come from everyone who uploads a piece
-                                    t.who = Who::All;
-                                }
                                 if n == 0 || t.cursor.is_none() {
                                     t.done = true;
                                     t.load_all = false;
@@ -1289,10 +1264,7 @@ impl App {
                 if !v.get("err").is_null() {
                     self.after_failed(&after, format!("{} failed on chain: {}", what, v.get("err")));
                 } else if conf == "confirmed" || conf == "finalized" {
-                    // crowdfunded pieces report progress on their own card
-                    if !matches!(&after, After::Attach(j) if j.crowd.is_some()) {
-                        self.ok(format!("{} confirmed", what));
-                    }
+                    self.ok(format!("{} confirmed", what));
                     self.fetch_all_balances();
                     self.after_confirm(after, &sig);
                 } else if host::now_ms() - since < 90_000.0 {
@@ -1318,7 +1290,6 @@ impl App {
             P::GitMeta(_) | P::GitRows(_) | P::GitTree(_) => self.git_async(p, ok, status, data),
             P::EmbedWasm(_) | P::EmbedTick(_) => self.embed_async(p, ok, status, data),
             P::Up(key, op) => self.up_async(key, op, ok, status, data),
-            P::CrowdHash(..) | P::CrowdPiece(_) | P::CrowdDl(..) | P::CrowdDlNext => self.crowd_async(p, ok, status, data),
             other => self.account_async(other, ok, status, data),
         }
     }

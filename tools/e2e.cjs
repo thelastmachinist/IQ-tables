@@ -823,18 +823,6 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     if (url.startsWith("https://host.test/")) return route.fulfill({ status: 200, contentType: "text/html", body: chain.hostPage || "<p>empty</p>" });
     // the site as IQ's browser serves it: at the address of the repository it was deployed from
     if (url.startsWith(`https://browser.iqlabs.dev/${DEC.pda}`)) return route.fulfill({ status: 200, contentType: "text/html", body: html });
-    if (url.startsWith("https://files.test/")) {
-      // an ordinary web server holding a file, with byte ranges and CORS
-      const f = chain.webFiles && chain.webFiles[new URL(url).pathname];
-      const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "range" };
-      if (req.method() === "OPTIONS") return route.fulfill({ status: 204, headers: cors });
-      if (!f) return route.fulfill({ status: 404, headers: cors, body: "not found" });
-      const m = /bytes=(\d+)-(\d+)/.exec(req.headers()["range"] || "");
-      chain.rangeReads = (chain.rangeReads || 0) + (m ? 1 : 0);
-      if (!m) return route.fulfill({ status: 200, headers: cors, contentType: "application/octet-stream", body: f });
-      const a = Number(m[1]), b = Math.min(Number(m[2]), f.length - 1);
-      return route.fulfill({ status: 206, headers: { ...cors, "content-range": `bytes ${a}-${b}/${f.length}` }, contentType: "application/octet-stream", body: f.subarray(a, b + 1) });
-    }
     if (url.startsWith("https://gateway.iqlabs.dev/") || url.startsWith("https://dev-gateway.iqlabs.dev/")) {
       const res = gateway(url, req.method(), req.postData());
       return route.fulfill({ status: res.error ? 404 : 200, contentType: "application/json", headers: { "access-control-allow-origin": "*" }, body: JSON.stringify(res) });
@@ -1548,77 +1536,6 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     void c2;
   }
 
-  console.log("Crowdfunded upload");
-  {
-    const nodeSha = (b) => require("crypto").createHash("sha256").update(b).digest("hex");
-    await page.goto("https://iq.test/#/account");
-    await page.click("button[data-a='panel'][data-arg='add']");
-    const mainAddr = (await page.locator(".panel .addrbox .mono").innerText()).trim();
-    await page.click("button[data-a='panel'][data-arg='add']"); // close it again
-    credit(chain, mainAddr, 2 * LAMPORTS);
-    const rom = Buffer.alloc(2_300_000);
-    { let z = 424242; for (let i = 0; i < rom.length; i++) { z = (z * 1103515245 + 12345) & 0x7fffffff; rom[i] = (z >> 16) & 255; } }
-    const PIECE = 1 << 20;
-    const pieceHashes = [0, 1, 2].map((i) => nodeSha(rom.subarray(i * PIECE, Math.min(rom.length, (i + 1) * PIECE))));
-    chain.webFiles = { "/homebrew.nes": rom };
-    await page.goto("https://iq.test/#/ws");
-    await page.fill("#newdb", "rom-archive");
-    await page.press("#newdb", "Enter");
-    await page.waitForFunction(() => (JSON.parse(localStorage.getItem("iqtables:v1:drafts")) || []).some((d) => d.name === "rom-archive"));
-    const ck = (await page.evaluate(() => JSON.parse(localStorage.getItem("iqtables:v1:drafts")))).find((d) => d.name === "rom-archive").key;
-    await page.goto(`https://iq.test/#/ws/${ck}`);
-    await page.waitForSelector("input[data-filekeep='crowd-new']", { state: "attached", timeout: 20000 });
-    await page.setInputFiles("input[data-filekeep='crowd-new']", { name: "homebrew.nes", mimeType: "application/octet-stream", buffer: rom });
-    await waitText("Fingerprint ready");
-    check((await text()).includes(nodeSha(rom)), "the organizer's browser fingerprints the file piece by piece (SHA-256 of the whole file shown)");
-    await page.fill("#crowd-source", "https://files.test/homebrew.nes");
-    await page.fill("#crowd-note", "Public-domain homebrew test ROM");
-    await page.click("button[data-a='crowd-create']");
-    await waitText("is ready");
-    await page.click("button[data-a='ed-tab'][data-arg='save']");
-    await page.click(`button[data-a='inscribe'][data-arg='${ck}']`);
-    await waitText("Saved ✓", 60000);
-    const croot = iq.contract.getDbRootPda(Buffer.from("rom-archive"), PID).toBase58();
-    const cpda = iq.contract.getTablePda(new PublicKey(croot), iq.utils.toSeedBytes("homebrew"), PID).toBase58();
-    const ctab = acct(cpda) && accCoder.decode("Table", acct(cpda).data);
-    check(!!ctab && ctab.writers.length === 0, "the project's table is open: anyone may add rows");
-    const srec = (chain.rows.get(cpda) || []).find((r) => /^IQT1s/.test(r.p));
-    const man = srec && JSON.parse(srec.p.slice(5)).crowd;
-    check(!!man && man.sha256 === nodeSha(rom) && JSON.stringify(man.hashes) === JSON.stringify(pieceHashes) && man.size === rom.length, "its structure record carries the manifest: size, SHA-256 and one SHA-256 per 1 MB piece");
-    await page.goto(`https://iq.test/#/t/${croot}/${cpda}`);
-    await waitText("0 of 3 pieces");
-    await shot("09-crowd-empty");
-    // a contributor with the file on their computer uploads one piece
-    const filesBefore = chain.files.size;
-    await page.setInputFiles("input[data-filekeep='crowd-have']", { name: "homebrew.nes", mimeType: "application/octet-stream", buffer: rom });
-    await page.selectOption("select[data-arg='crowd:count']", "1");
-    await page.click("button[data-a='crowd-go'][data-arg='file']");
-    await waitText("You uploaded 1 piece", 120000);
-    const regs = () => (chain.rows.get(cpda) || []).filter((r) => /^IQT1j/.test(r.p)).map((r) => ({ ...JSON.parse(r.p.slice(5)), signer: r.__signer }));
-    const r1 = regs();
-    const pieceFile = [...chain.files.entries()].slice(filesBefore).map(([sig, f]) => ({ sig, md: JSON.parse(f.metadata) })).find((f) => /piece \d of 3/.test(f.md.filename));
-    check(r1.length === 1 && r1[0].signer === mainAddr && !!pieceFile && r1[0].r[0][3] === pieceFile.sig && nodeSha(Buffer.from(pieceFile.md.data, "base64")) === r1[0].r[0][2], `one piece uploaded as an IQ file from the contributor's own wallet (${pieceFile && pieceFile.md.filename}) and recorded in the table`);
-    await waitText("1 of 3 pieces");
-    // the rest straight from the organizer's web server
-    await page.selectOption("select[data-arg='crowd:count']", "all");
-    await page.click("button[data-a='crowd-go'][data-arg='url']");
-    await waitText("You uploaded 2 pieces", 180000);
-    await waitText("3 of 3 pieces");
-    check((chain.rangeReads || 0) >= 2 && regs().length === 3, `the other pieces were read from the web server a range at a time (${chain.rangeReads} range reads) and recorded`);
-    // someone records a piece that isn't what it claims (a different file, the right hash)
-    const junkSig = [...chain.files.keys()][0];
-    const fakeP = "IQT1j" + JSON.stringify({ c: ["id", "piece", "sha256", "tx"], i: 0, r: [[`0.${junkSig.slice(0, 10)}`, 0, pieceHashes[0], junkSig]] });
-    chain.rows.get(cpda).splice(1, 0, { id: "fakepack", p: fakeP, __txSignature: fakeSig(), __signer: new PublicKey(Buffer.alloc(32, 13)).toBase58(), __blockTime: 1 });
-    await page.click("button[data-a='tv-refresh']");
-    await waitText("3 of 3 pieces");
-    await shot("09b-crowd-full");
-    const [dl] = await Promise.all([page.waitForEvent("download", { timeout: 60000 }), page.click("button[data-a='crowd-dl']")]);
-    const got = fs.readFileSync(await dl.path());
-    check(dl.suggestedFilename() === "homebrew.nes" && got.equals(rom), `the download is the organizer's file byte for byte (${got.length} bytes)`);
-    await waitText("didn't match was skipped");
-    check(true, "a recorded piece whose bytes don't match its fingerprint was skipped");
-  }
-
   console.log("Embeds: snapshots, and live reads with the decoder");
   {
     // the official wallet: the database's creator
@@ -1631,6 +1548,8 @@ const u32le = (i) => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; 
     const panel = () => page.locator(".embedpanel").innerText();
     const snap = await download(() => page.click(".embedpanel button[data-a='embed-dl'][data-arg='snapshot']"));
     await page.click(".embedpanel button[data-a='embed-close']");
+    // (an earlier section left this table's filter on unofficial rows; revisiting keeps it)
+    await page.click("button[data-a='tv-who'][data-arg='official']");
     const tvCsv = await download(() => page.click("button[data-a='tv-export'][data-arg='csv']"));
     await page.click("button[data-a='embed-open']");
     await page.waitForSelector(".embedpanel textarea.snapshot", { timeout: 30000 });
